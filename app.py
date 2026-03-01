@@ -54,7 +54,7 @@ def _init_state():
         "exc_store": ExceptionStore(),
         "output_wide": None,
         "validation_df": None,
-        "split_level": "Brand",
+        "split_level": "Sub Brand",
         "basis_source": "Consumption",
         "basis_mode": "last_3",
         "basis_months_selected": [],
@@ -330,22 +330,34 @@ def step3_filters():
         st.session_state.sheets[st.session_state.sheet_map["SAS"]] = sas_df
         st.session_state.bb_id_col = "BB_ID"
 
-    # ---- Filters ----
-    st.subheader("Filter Data")
-    filters = st.session_state.filters.copy()
-    filter_cols = st.columns(len(LOGICAL_HIER))
-    for i, lh in enumerate(LOGICAL_HIER):
-        col_actual = sas_cmap.get(lh)
-        if not col_actual or col_actual not in sas_df.columns:
-            filter_cols[i].caption(f"*{lh}* not mapped")
-            continue
-        all_vals = sorted(sas_df[col_actual].dropna().unique().astype(str).tolist())
-        prev = filters.get(lh, [])
-        sel = filter_cols[i].multiselect(lh, all_vals, default=prev, key=f"filter_{lh}")
-        filters[lh] = sel
-    st.session_state.filters = filters
+    # ---- Month Selection ----
+    st.subheader("Forecast Months")
+    all_sas_months = sas_cmap.get("_months", detect_month_columns(sas_df))
+    prev_months = st.session_state.sas_months_selected or all_sas_months
+    sas_months = st.multiselect(
+        "Select which SAS months to split:",
+        all_sas_months,
+        default=[m for m in prev_months if m in all_sas_months],
+        key="sas_months_step3",
+    )
+    st.session_state.sas_months_selected = sas_months
 
-    # ---- Diagnose SKU data availability before proceeding ----
+    # ---- Building Block list ----
+    st.subheader("Building Blocks")
+    hier_actual = [sas_cmap.get(h) for h in LOGICAL_HIER if sas_cmap.get(h) and sas_cmap.get(h) in sas_df.columns]
+    month_cols_in_data = [m for m in sas_months if m in sas_df.columns]
+    display_cols = hier_actual + month_cols_in_data
+    if display_cols:
+        bb_table = sas_df[display_cols].drop_duplicates().reset_index(drop=True)
+        if month_cols_in_data:
+            bb_table = bb_table.copy()
+            bb_table["Total"] = bb_table[month_cols_in_data].apply(pd.to_numeric, errors="coerce").sum(axis=1)
+        st.dataframe(bb_table, use_container_width=True, height=min(400, 40 + len(bb_table) * 35))
+        st.caption(f"**{len(bb_table)}** Building Blocks")
+    else:
+        st.info("No hierarchy columns mapped — configure hierarchy columns in Step 2 to see Building Blocks here.")
+
+    # ---- Diagnose SKU data availability ----
     sku_merged = _sku_merged()
     sku_problem = None
     if sku_merged is None:
@@ -380,30 +392,13 @@ def step3_filters():
 
     if sku_problem:
         st.error(sku_problem)
+    else:
+        st.info(f"**{len(sas_df)}** Building Blocks | **{len(sku_merged)}** SKU rows available")
 
-    # Apply filters
-    sas_filtered = sas_df.copy()
-    sku_filtered = (sku_merged if sku_merged is not None else pd.DataFrame()).copy()
-
-    for lh, vals in filters.items():
-        if not vals:
-            continue
-        col_sas = sas_cmap.get(lh)
-        if col_sas and col_sas in sas_filtered.columns:
-            sas_filtered = sas_filtered[sas_filtered[col_sas].astype(str).isin(vals)]
-        for role in SKU_SHEETS:
-            rcmap = st.session_state.col_maps.get(role, {})
-            col_sku = rcmap.get(lh)
-            if col_sku and col_sku in sku_filtered.columns:
-                sku_filtered = sku_filtered[sku_filtered[col_sku].astype(str).isin(vals)]
-                break
-
-    st.info(f"**{len(sas_filtered)}** Building Blocks | **{len(sku_filtered)}** SKU rows after filters")
-
-    # ---- Split Level ----
-    st.subheader("Split Level")
+    # ---- Split Granularity ----
+    st.subheader("Split Granularity")
     split_level = st.radio(
-        "Split SAS Building Blocks at:",
+        "Split each Building Block at:",
         list(SPLIT_KEYS.keys()),
         index=list(SPLIT_KEYS.keys()).index(st.session_state.split_level),
         horizontal=True,
@@ -412,10 +407,10 @@ def step3_filters():
     match_desc = " + ".join(SPLIT_KEYS[split_level])
     st.caption(f"Match keys: **{match_desc}**")
 
-    if st.button("Apply Filters & Split Level →", type="primary", disabled=bool(sku_problem)):
+    if st.button("Confirm Months & Split Level →", type="primary", disabled=bool(sku_problem)):
         st.session_state.split_level = split_level
-        sas_out = sas_filtered.reset_index(drop=True)
-        sku_out = sku_filtered.reset_index(drop=True)
+        sas_out = sas_df.reset_index(drop=True)
+        sku_out = sku_merged.reset_index(drop=True)
         st.session_state.sas_df_filtered = sas_out
         st.session_state.sku_df_filtered = sku_out
 
@@ -572,20 +567,6 @@ def step4_salience():
                     sku_val = row.get(sku_col_sal, "")
                     st.session_state.sal_overrides[(g_key, sku_val)] = float(edited.iloc[idx_row]["salience"])
                 st.success("Overrides saved. Click 'Compute Historical Salience' again to refresh.")
-
-    # ── SAS month selection ───────────────────────────────────────────────────
-    st.subheader("SAS Month Selection")
-    sas_df = st.session_state.sas_df_filtered
-    if sas_df is not None:
-        sas_cmap = st.session_state.col_maps.get("SAS", {})
-        sas_months_all = sas_cmap.get("_months", detect_month_columns(sas_df))
-        sas_months_sel = st.multiselect(
-            "SAS months to split (default: all)",
-            sas_months_all,
-            default=st.session_state.sas_months_selected or sas_months_all,
-            key="sas_months_sel",
-        )
-        st.session_state.sas_months_selected = sas_months_sel
 
     if st.button("Confirm Salience →", type="primary", disabled=(sal_df is None)):
         st.session_state.step = max(st.session_state.step, 5)
