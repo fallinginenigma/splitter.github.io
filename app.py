@@ -494,7 +494,7 @@ def step4_salience():
                         sku_work = sku_filtered.copy()
                         sku_work["_basis_val"] = np.nan
 
-                    basis_series = sku_work.get("_basis_val", pd.Series(np.nan, index=sku_work.index))
+                    basis_series = sku_work["_basis_val"] if "_basis_val" in sku_work.columns else pd.Series(np.nan, index=sku_work.index)
 
                     new_sal, blocking = compute_salience(
                         sku_df=sku_work,
