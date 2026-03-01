@@ -345,10 +345,45 @@ def step3_filters():
         filters[lh] = sel
     st.session_state.filters = filters
 
+    # ---- Diagnose SKU data availability before proceeding ----
+    sku_merged = _sku_merged()
+    sku_problem = None
+    if sku_merged is None:
+        sku_sheets_mapped = [r for r in SKU_SHEETS if r in st.session_state.sheet_map]
+        if not sku_sheets_mapped:
+            sku_problem = (
+                "No SKU sheets are mapped. Go back to **Step 1** and map at least one of: "
+                "Shipments, Consumption, Retailing, or Statistical Forecast."
+            )
+        else:
+            no_sku_col = [r for r in sku_sheets_mapped if not st.session_state.col_maps.get(r, {}).get("SKU")]
+            no_hier = [
+                r for r in sku_sheets_mapped
+                if st.session_state.col_maps.get(r, {}).get("SKU")
+                and not any(st.session_state.col_maps.get(r, {}).get(h) for h in LOGICAL_HIER)
+            ]
+            if no_sku_col:
+                sku_problem = (
+                    f"The **SKU column** is not mapped for: {', '.join(no_sku_col)}. "
+                    "Go back to **Step 2** and select the SKU column for those sheets."
+                )
+            elif no_hier:
+                sku_problem = (
+                    f"No hierarchy columns are mapped for: {', '.join(no_hier)}. "
+                    "Go back to **Step 2** and map at least one hierarchy column."
+                )
+            else:
+                sku_problem = (
+                    "Could not load SKU data from mapped sheets. "
+                    "Check that the SKU column and at least one hierarchy column are set in **Step 2**."
+                )
+
+    if sku_problem:
+        st.error(sku_problem)
+
     # Apply filters
     sas_filtered = sas_df.copy()
-    sku_merged = _sku_merged() or pd.DataFrame()
-    sku_filtered = sku_merged.copy()
+    sku_filtered = (sku_merged if sku_merged is not None else pd.DataFrame()).copy()
 
     for lh, vals in filters.items():
         if not vals:
@@ -356,7 +391,6 @@ def step3_filters():
         col_sas = sas_cmap.get(lh)
         if col_sas and col_sas in sas_filtered.columns:
             sas_filtered = sas_filtered[sas_filtered[col_sas].astype(str).isin(vals)]
-        # Apply to sku_filtered using any available role's col map
         for role in SKU_SHEETS:
             rcmap = st.session_state.col_maps.get(role, {})
             col_sku = rcmap.get(lh)
@@ -378,7 +412,7 @@ def step3_filters():
     match_desc = " + ".join(SPLIT_KEYS[split_level])
     st.caption(f"Match keys: **{match_desc}**")
 
-    if st.button("Apply Filters & Split Level →", type="primary"):
+    if st.button("Apply Filters & Split Level →", type="primary", disabled=bool(sku_problem)):
         st.session_state.split_level = split_level
         sas_out = sas_filtered.reset_index(drop=True)
         sku_out = sku_filtered.reset_index(drop=True)
