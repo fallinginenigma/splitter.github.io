@@ -18,6 +18,7 @@ from bop_splitter.loader import (
 from bop_splitter.salience import (
     compute_basis,
     compute_salience,
+    compute_equal_salience,
     normalize_salience,
     HIERARCHY_LEVELS,
     SPLIT_KEYS,
@@ -379,8 +380,21 @@ def step3_filters():
 
     if st.button("Apply Filters & Split Level →", type="primary"):
         st.session_state.split_level = split_level
-        st.session_state.sas_df_filtered = sas_filtered.reset_index(drop=True)
-        st.session_state.sku_df_filtered = sku_filtered.reset_index(drop=True)
+        sas_out = sas_filtered.reset_index(drop=True)
+        sku_out = sku_filtered.reset_index(drop=True)
+        st.session_state.sas_df_filtered = sas_out
+        st.session_state.sku_df_filtered = sku_out
+
+        # Auto-compute equal (1/N) salience so Step 4 starts pre-populated
+        hcm = hier_col_map_from_state()
+        sal_df, _ = compute_equal_salience(
+            sku_out,
+            split_level,
+            hcm.get("SKU", "SKU"),
+            hcm,
+            st.session_state.exc_store.global_exclusions,
+        )
+        st.session_state.salience_df = sal_df
         st.session_state.step = max(st.session_state.step, 4)
         st.rerun()
 
@@ -389,149 +403,126 @@ def step3_filters():
 # STEP 4 – Basis & Salience
 # ──────────────────────────────────────────────────────────────────────────────
 def step4_salience():
-    st.header("Step 4 — Basis & Salience")
+    st.header("Step 4 — Review & Refine Salience")
 
-    BASIS_SOURCES = [r for r in SKU_SHEETS if r in st.session_state.sheet_map]
-    if not BASIS_SOURCES:
-        st.error("No SKU sheets mapped. Go back to Step 1.")
+    sku_filtered = st.session_state.sku_df_filtered
+    if sku_filtered is None or sku_filtered.empty:
+        st.error("No filtered SKU data — complete Step 3 first.")
         return
-
-    col1, col2 = st.columns(2)
-
-    basis_source = col1.selectbox(
-        "Basis Source Sheet",
-        BASIS_SOURCES,
-        index=BASIS_SOURCES.index(st.session_state.basis_source) if st.session_state.basis_source in BASIS_SOURCES else 0,
-        key="basis_source_sel",
-    )
-
-    basis_mode_options = {
-        "last_3": "Past 3 months avg",
-        "last_6": "Past 6 months avg",
-        "last_9": "Past 9 months avg",
-        "last_12": "Past 12 months avg",
-        "selected": "Selected specific months",
-    }
-    basis_mode = col2.selectbox(
-        "Window",
-        list(basis_mode_options.keys()),
-        format_func=lambda k: basis_mode_options[k],
-        index=list(basis_mode_options.keys()).index(st.session_state.basis_mode),
-        key="basis_mode_sel",
-    )
-
-    basis_months_selected = []
-    if basis_mode == "selected":
-        basis_df = _get_df(basis_source)
-        cmap = st.session_state.col_maps.get(basis_source, {})
-        avail_months = cmap.get("_months", detect_month_columns(basis_df) if basis_df is not None else [])
-        basis_months_selected = st.multiselect("Select months for basis", avail_months, default=st.session_state.basis_months_selected, key="basis_months_sel")
-
-    # ---- Compute ----
-    if st.button("Compute Salience", type="primary"):
-        basis_df_raw = _get_df(basis_source)
-        if basis_df_raw is None:
-            st.error("Basis source sheet not found.")
-            return
-        sku_filtered = st.session_state.sku_df_filtered
-        if sku_filtered is None or sku_filtered.empty:
-            st.error("No filtered SKU data. Complete Step 3 first.")
-            return
-
-        cmap = st.session_state.col_maps.get(basis_source, {})
-        month_cols = cmap.get("_months", detect_month_columns(basis_df_raw))
-        sku_col_actual = cmap.get("SKU")
-
-        # Merge basis values onto sku_filtered by SKU
-        basis_df_slim = basis_df_raw.copy()
-        basis_vals = compute_basis(basis_df_slim, month_cols, basis_mode, basis_months_selected)
-        basis_df_slim["_basis_val"] = basis_vals
-
-        # Map SKU col from basis source to sku_filtered
-        # Use Consumption/Shipments/Retailing SKU col
-        sku_basis_col = cmap.get("SKU")
-        hier_logical_list = LOGICAL_HIER
-
-        # Determine which hier cols are actually available
-        hier_col_map = {}
-        for lh in LOGICAL_HIER:
-            for role in [basis_source] + SKU_SHEETS:
-                rc = st.session_state.col_maps.get(role, {}).get(lh)
-                if rc:
-                    hier_col_map[lh] = rc
-                    break
-        # Also include SKU
-        for role in SKU_SHEETS:
-            sc = st.session_state.col_maps.get(role, {}).get("SKU")
-            if sc:
-                hier_col_map["SKU"] = sc
-                break
-
-        split_level = st.session_state.split_level
-        exc_store = st.session_state.exc_store
-
-        # Merge basis onto sku_filtered
-        # sku_filtered may come from merged sku sheets
-        # We need _basis on the sku_filtered rows
-        # Strategy: join basis_df_slim on sku col + hier cols
-
-        merge_keys = [v for k, v in hier_col_map.items() if k != "SKU" and v in sku_filtered.columns and v in basis_df_slim.columns]
-        sku_key_sku = hier_col_map.get("SKU")
-        if sku_key_sku and sku_key_sku in sku_filtered.columns and sku_key_sku in basis_df_slim.columns:
-            merge_keys = merge_keys + [sku_key_sku]
-
-        if merge_keys and sku_basis_col:
-            basis_slim = basis_df_slim[merge_keys + ["_basis_val"]].drop_duplicates(subset=merge_keys)
-            sku_with_basis = sku_filtered.merge(basis_slim, on=merge_keys, how="left")
-        else:
-            sku_with_basis = sku_filtered.copy()
-            sku_with_basis["_basis_val"] = np.nan
-
-        basis_series = sku_with_basis["_basis_val"] if "_basis_val" in sku_with_basis.columns else pd.Series(np.nan, index=sku_with_basis.index)
-
-        # Rename _basis_val back to a temp col expected by compute_salience
-        sku_work = sku_with_basis.copy()
-
-        sal_df, blocking = compute_salience(
-            sku_df=sku_work,
-            basis=basis_series,
-            split_level=split_level,
-            sku_col=hier_col_map.get("SKU", "SKU"),
-            hier_col_map=hier_col_map,
-            global_exclusions=exc_store.global_exclusions,
-            overrides=st.session_state.sal_overrides,
-        )
-
-        st.session_state.salience_df = sal_df
-        st.session_state.blocking_groups = blocking
-        st.session_state.basis_source = basis_source
-        st.session_state.basis_mode = basis_mode
-        st.session_state.basis_months_selected = basis_months_selected
 
     sal_df = st.session_state.salience_df
+    hcm = hier_col_map_from_state()
+    split_level = st.session_state.split_level
+    exc_store = st.session_state.exc_store
+
+    # ── Auto salience status ──────────────────────────────────────────────────
+    st.info(
+        f"**Equal split applied automatically** — each Building Block's value is divided equally "
+        f"among the SKUs that match its **{split_level}** criteria "
+        f"({' + '.join(SPLIT_KEYS[split_level])})."
+    )
+
+    if sal_df is not None and not sal_df.empty:
+        st.subheader(f"Current Salience Table — {len(sal_df)} rows")
+        st.dataframe(sal_df, use_container_width=True, height=300)
+
+    # ── Optional: override with historical basis ───────────────────────────────
+    BASIS_SOURCES = [r for r in SKU_SHEETS if r in st.session_state.sheet_map]
+    if BASIS_SOURCES:
+        with st.expander("Override with Historical Basis (optional)", expanded=False):
+            st.caption(
+                "Use actual sales data to weight SKUs by their historical share instead of an equal split."
+            )
+            col1, col2 = st.columns(2)
+
+            basis_source = col1.selectbox(
+                "Basis Source Sheet",
+                BASIS_SOURCES,
+                index=BASIS_SOURCES.index(st.session_state.basis_source) if st.session_state.basis_source in BASIS_SOURCES else 0,
+                key="basis_source_sel",
+            )
+
+            basis_mode_options = {
+                "last_3": "Past 3 months avg",
+                "last_6": "Past 6 months avg",
+                "last_9": "Past 9 months avg",
+                "last_12": "Past 12 months avg",
+                "selected": "Selected specific months",
+            }
+            basis_mode = col2.selectbox(
+                "Window",
+                list(basis_mode_options.keys()),
+                format_func=lambda k: basis_mode_options[k],
+                index=list(basis_mode_options.keys()).index(st.session_state.basis_mode),
+                key="basis_mode_sel",
+            )
+
+            basis_months_selected = []
+            if basis_mode == "selected":
+                basis_df_tmp = _get_df(basis_source)
+                cmap_tmp = st.session_state.col_maps.get(basis_source, {})
+                avail_months = cmap_tmp.get("_months", detect_month_columns(basis_df_tmp) if basis_df_tmp is not None else [])
+                basis_months_selected = st.multiselect(
+                    "Select months for basis", avail_months,
+                    default=st.session_state.basis_months_selected, key="basis_months_sel",
+                )
+
+            if st.button("Compute Historical Salience", type="secondary"):
+                basis_df_raw = _get_df(basis_source)
+                if basis_df_raw is None:
+                    st.error("Basis source sheet not found.")
+                else:
+                    cmap = st.session_state.col_maps.get(basis_source, {})
+                    month_cols = cmap.get("_months", detect_month_columns(basis_df_raw))
+
+                    basis_df_slim = basis_df_raw.copy()
+                    basis_vals = compute_basis(basis_df_slim, month_cols, basis_mode, basis_months_selected)
+                    basis_df_slim["_basis_val"] = basis_vals
+
+                    merge_keys = [
+                        v for k, v in hcm.items()
+                        if k != "SKU" and v in sku_filtered.columns and v in basis_df_slim.columns
+                    ]
+                    sku_key_col = hcm.get("SKU")
+                    if sku_key_col and sku_key_col in sku_filtered.columns and sku_key_col in basis_df_slim.columns:
+                        merge_keys = merge_keys + [sku_key_col]
+
+                    if merge_keys:
+                        basis_slim = basis_df_slim[merge_keys + ["_basis_val"]].drop_duplicates(subset=merge_keys)
+                        sku_work = sku_filtered.merge(basis_slim, on=merge_keys, how="left")
+                    else:
+                        sku_work = sku_filtered.copy()
+                        sku_work["_basis_val"] = np.nan
+
+                    basis_series = sku_work.get("_basis_val", pd.Series(np.nan, index=sku_work.index))
+
+                    new_sal, blocking = compute_salience(
+                        sku_df=sku_work,
+                        basis=basis_series,
+                        split_level=split_level,
+                        sku_col=hcm.get("SKU", "SKU"),
+                        hier_col_map=hcm,
+                        global_exclusions=exc_store.global_exclusions,
+                        overrides=st.session_state.sal_overrides,
+                    )
+                    st.session_state.salience_df = new_sal
+                    st.session_state.blocking_groups = blocking
+                    st.session_state.basis_source = basis_source
+                    st.session_state.basis_mode = basis_mode
+                    st.session_state.basis_months_selected = basis_months_selected
+                    st.rerun()
+
+    # ── Blocked groups (only relevant after historical basis) ─────────────────
     blocking = st.session_state.blocking_groups
-
-    if sal_df is None:
-        st.info("Click **Compute Salience** to proceed.")
-        return
-
-    # ---- Show salience table ----
-    st.subheader(f"Salience Table — {len(sal_df)} rows")
-    st.dataframe(sal_df, use_container_width=True, height=300)
-
-    # ---- Blocking groups ----
-    if blocking:
-        st.error(f"⚠️ **{len(blocking)} blocked group(s)** with zero/missing basis. Action required:")
+    if sal_df is not None and blocking:
+        st.error(f"⚠️ **{len(blocking)} blocked group(s)** with zero/missing basis — override required:")
         for i, bg in enumerate(blocking):
             with st.expander(f"Blocked group {i+1}: {bg['group']}"):
                 st.write(f"Reason: {bg['reason']} | SKUs: {bg['n_skus']}")
 
-        st.subheader("Override Salience for Blocked Groups")
-        st.caption("Enter manual salience values below (they must sum to 1 per group after normalizing).")
-
         override_rows = sal_df[sal_df["flag"] == "blocked"].copy()
         if not override_rows.empty:
-            _sku_col_for_edit = hier_col_map_from_state().get("SKU", "SKU")
+            sku_col_sal = hcm.get("SKU", "SKU")
             _ctx_cols = [c for c in override_rows.columns if c not in ("basis", "flag")]
             edited = st.data_editor(
                 override_rows[_ctx_cols].assign(salience=override_rows["salience"].fillna(0.0)),
@@ -541,33 +532,14 @@ def step4_salience():
                 disabled=[c for c in _ctx_cols if c != "salience"],
             )
             if st.button("Apply Overrides"):
-                _sku_col_in_sal = hier_col_map_from_state().get("SKU", "SKU")
-                _group_cols = [c for c in override_rows.columns if c not in (_sku_col_in_sal, "basis", "salience", "flag")]
-                for idx_row, (orig_idx, row) in enumerate(override_rows.iterrows()):
+                _group_cols = [c for c in override_rows.columns if c not in (sku_col_sal, "basis", "salience", "flag")]
+                for idx_row, (_, row) in enumerate(override_rows.iterrows()):
                     g_key = tuple(row[c] for c in _group_cols if c in row.index)
-                    sku_val = row.get(_sku_col_in_sal, "")
-                    new_sal = edited.iloc[idx_row]["salience"]
-                    st.session_state.sal_overrides[(g_key, sku_val)] = float(new_sal)
-                st.success("Overrides saved. Click Compute Salience again to refresh.")
+                    sku_val = row.get(sku_col_sal, "")
+                    st.session_state.sal_overrides[(g_key, sku_val)] = float(edited.iloc[idx_row]["salience"])
+                st.success("Overrides saved. Click 'Compute Historical Salience' again to refresh.")
 
-    # Normalize button
-    if sal_df is not None and not sal_df.empty:
-        if st.button("Normalize Salience to 1.0 per Group"):
-            group_cols = [c for c in sal_df.columns if c not in ("basis", "salience", "flag", hier_col_map_from_state().get("SKU", "SKU"))]
-            st.session_state.salience_df = normalize_salience(sal_df, group_cols, hier_col_map_from_state().get("SKU", "SKU"))
-            st.rerun()
-
-    # Check all groups resolved
-    still_blocked = [r for r in (blocking or []) if not any(
-        not pd.isna(v) for _, row in sal_df[sal_df["flag"].isin(["manual_override"])].iterrows()
-        for v in [row.get("salience")]
-    )]
-    n_blocked = len(sal_df[sal_df["flag"] == "blocked"])
-
-    if n_blocked > 0:
-        st.warning(f"{n_blocked} salience row(s) still blocked. Override or proceed if acceptable.")
-
-    # SAS months selection
+    # ── SAS month selection ───────────────────────────────────────────────────
     st.subheader("SAS Month Selection")
     sas_df = st.session_state.sas_df_filtered
     if sas_df is not None:

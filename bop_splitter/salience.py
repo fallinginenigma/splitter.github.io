@@ -118,6 +118,46 @@ def compute_salience(
     return salience_df, blocking_groups
 
 
+def compute_equal_salience(
+    sku_df: pd.DataFrame,
+    split_level: str,
+    sku_col: str,
+    hier_col_map: dict[str, str],
+    global_exclusions: set[str] | None = None,
+) -> tuple[pd.DataFrame, list[dict]]:
+    """
+    Compute equal (1/N) salience weights per split group.
+
+    Each SKU within a group receives 1 / (number of SKUs in that group).
+    Returns the same schema as compute_salience so callers are interchangeable.
+    """
+    global_exclusions = global_exclusions or set()
+    group_keys_logical = [k for k in SPLIT_KEYS[split_level] if k != "SKU"]
+    group_keys = [hier_col_map.get(k, k) for k in group_keys_logical]
+    sku_mapped = hier_col_map.get("SKU", sku_col)
+
+    working = sku_df.copy()
+    if sku_mapped in working.columns:
+        working = working[~working[sku_mapped].isin(global_exclusions)].copy()
+
+    rows = []
+    valid_group_keys = [k for k in group_keys if k in working.columns]
+    if not valid_group_keys or working.empty:
+        return pd.DataFrame(), []
+
+    for group_vals, grp in working.groupby(valid_group_keys, sort=False, dropna=False):
+        if not isinstance(group_vals, tuple):
+            group_vals = (group_vals,)
+        group_id = dict(zip(valid_group_keys, group_vals))
+        n = len(grp)
+        sal = 1.0 / n if n > 0 else 0.0
+        for _, row in grp.iterrows():
+            sku_val = row.get(sku_mapped, "") if sku_mapped in grp.columns else ""
+            rows.append({**group_id, sku_mapped: sku_val, "basis": 1.0, "salience": sal, "flag": "equal"})
+
+    return pd.DataFrame(rows), []
+
+
 def normalize_salience(salience_df: pd.DataFrame, group_keys: list[str], sku_col: str) -> pd.DataFrame:
     """Force salience within each group to sum to 1."""
     df = salience_df.copy()
