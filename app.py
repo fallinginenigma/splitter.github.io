@@ -61,6 +61,8 @@ def _init_state():
         "sas_months_selected": [],
         "filters": {},
         "step": 1,
+        "max_step": 1,
+        "_loaded_file_id": None,
         "bb_id_col": None,
         "run_settings": {},
     }
@@ -88,7 +90,7 @@ with st.sidebar:
     st.caption("Building Block → SKU Forecast Splitter")
     st.divider()
     for i, label in enumerate(STEPS, 1):
-        icon = "✅" if st.session_state.step > i else ("▶️" if st.session_state.step == i else "⬜")
+        icon = "▶️" if i == st.session_state.step else ("✅" if i <= st.session_state.max_step else "⬜")
         st.markdown(f"{icon} {label}")
     st.divider()
     if st.button("↺ Reset All", use_container_width=True):
@@ -169,18 +171,24 @@ def step1_upload():
         type=["xlsx", "xlsm", "xlsb"],
         key="file_uploader",
     )
-    if not uploaded:
+    if uploaded:
+        file_id = (uploaded.name, uploaded.size)
+        if st.session_state.get("_loaded_file_id") != file_id or not st.session_state.sheets:
+            with st.spinner("Reading workbook…"):
+                try:
+                    sheets = load_excel(uploaded)
+                except Exception as e:
+                    st.error(f"Failed to read file: {e}")
+                    return
+            st.session_state.sheets = sheets
+            st.session_state["_loaded_file_id"] = file_id
+    elif st.session_state.sheets:
+        pass  # navigated back — use previously loaded data
+    else:
         st.info("Please upload an Excel file to begin.")
         return
 
-    with st.spinner("Reading workbook…"):
-        try:
-            sheets = load_excel(uploaded)
-        except Exception as e:
-            st.error(f"Failed to read file: {e}")
-            return
-
-    st.session_state.sheets = sheets
+    sheets = st.session_state.sheets
     st.success(f"Loaded **{len(sheets)}** sheets: {', '.join(sheets.keys())}")
 
     st.subheader("Map Sheets to Roles")
@@ -217,6 +225,7 @@ def step1_upload():
             return
         st.session_state.sheet_map = new_map
         st.session_state.step = max(st.session_state.step, 2)
+        st.session_state.max_step = max(st.session_state.max_step, 2)
         st.rerun()
 
 
@@ -298,6 +307,7 @@ def step2_columns():
         if not any(sas_cmap.get(h) for h in LOGICAL_HIER):
             st.warning("No hierarchy columns mapped for SAS — results may be poor.")
         st.session_state.step = max(st.session_state.step, 3)
+        st.session_state.max_step = max(st.session_state.max_step, 3)
         st.rerun()
 
 
@@ -425,6 +435,7 @@ def step3_filters():
         )
         st.session_state.salience_df = sal_df
         st.session_state.step = max(st.session_state.step, 4)
+        st.session_state.max_step = max(st.session_state.max_step, 4)
         st.rerun()
 
 
@@ -570,6 +581,7 @@ def step4_salience():
 
     if st.button("Confirm Salience →", type="primary", disabled=(sal_df is None)):
         st.session_state.step = max(st.session_state.step, 5)
+        st.session_state.max_step = max(st.session_state.max_step, 5)
         st.rerun()
 
 
@@ -703,6 +715,7 @@ def step5_exceptions():
 
     if st.button("Proceed to Split →", type="primary"):
         st.session_state.step = max(st.session_state.step, 6)
+        st.session_state.max_step = max(st.session_state.max_step, 6)
         st.rerun()
 
 
@@ -721,7 +734,7 @@ def step6_run():
     if st.session_state.salience_df is None:
         issues.append("Salience not computed — complete Step 4")
     if not st.session_state.sas_months_selected:
-        issues.append("No SAS months selected — complete Step 4")
+        issues.append("No SAS months selected — complete Step 3")
 
     if issues:
         for iss in issues:
@@ -791,6 +804,7 @@ def step6_run():
             st.success("No validation issues.")
 
         st.session_state.step = max(st.session_state.step, 7)
+        st.session_state.max_step = max(st.session_state.max_step, 7)
 
     # Preview if already run
     if st.session_state.output_wide is not None:
@@ -799,6 +813,7 @@ def step6_run():
 
         if st.button("Proceed to Download →", type="primary"):
             st.session_state.step = max(st.session_state.step, 7)
+            st.session_state.max_step = max(st.session_state.max_step, 7)
             st.rerun()
 
 
@@ -871,8 +886,8 @@ def main():
     with st.sidebar:
         st.divider()
         st.subheader("Jump to Step")
-        max_step = st.session_state.step
-        jump = st.radio("", STEPS[:max_step], index=min(max_step - 1, len(STEPS) - 1), label_visibility="collapsed")
+        max_step = st.session_state.max_step
+        jump = st.radio("", STEPS[:max_step], index=min(step - 1, max_step - 1), label_visibility="collapsed")
         if jump:
             target = STEPS.index(jump) + 1
             if target != step:
