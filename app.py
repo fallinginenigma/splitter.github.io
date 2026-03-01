@@ -15,6 +15,7 @@ from bop_splitter.loader import (
     detect_month_columns,
     detect_hierarchy_columns,
 )
+from bop_splitter.databricks_loader import fetch_table as fetch_databricks_table, test_connection as test_databricks_connection
 from bop_splitter.salience import (
     compute_basis,
     compute_salience,
@@ -63,6 +64,12 @@ def _init_state():
         "step": 1,
         "max_step": 1,
         "_loaded_file_id": None,
+        "data_source": "none",       # "none" | "excel" | "databricks"
+        "db_host": "",
+        "db_http_path": "",
+        "db_token": "",
+        "db_tables": {},             # role -> fully-qualified table name
+        "db_row_limit": 100_000,
         "bb_id_col": None,
         "run_settings": {},
     }
@@ -162,71 +169,209 @@ def _sku_merged() -> pd.DataFrame | None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# STEP 1 – Upload & Sheet Mapping
+# STEP 1 – Upload & Sheet Mapping  (Excel OR Azure Databricks)
 # ──────────────────────────────────────────────────────────────────────────────
 def step1_upload():
-    st.header("Step 1 — Upload File & Map Sheets")
-    uploaded = st.file_uploader(
-        "Upload Excel file (.xlsx, .xlsm, .xlsb)",
-        type=["xlsx", "xlsm", "xlsb"],
-        key="file_uploader",
-    )
-    if uploaded:
-        file_id = (uploaded.name, uploaded.size)
-        if st.session_state.get("_loaded_file_id") != file_id or not st.session_state.sheets:
-            with st.spinner("Reading workbook…"):
-                try:
-                    sheets = load_excel(uploaded)
-                except Exception as e:
-                    st.error(f"Failed to read file: {e}")
+    st.header("Step 1 — Load Data")
+
+    # ── Already-loaded summary (navigated back) ────────────────────────────────
+    if st.session_state.sheets and st.session_state.sheet_map:
+        src = st.session_state.data_source
+        src_label = {"excel": "Excel file", "databricks": "Azure Databricks"}.get(src, "file")
+        total_rows = sum(len(v) for v in st.session_state.sheets.values())
+        st.success(
+            f"**{src_label}** data already loaded — "
+            f"{', '.join(st.session_state.sheets.keys())} "
+            f"({total_rows:,} rows total). "
+            "Use the button below to continue, or load new data."
+        )
+        if st.button("Continue with current data →", type="primary"):
+            st.session_state.step = max(st.session_state.step, 2)
+            st.session_state.max_step = max(st.session_state.max_step, 2)
+            st.rerun()
+        st.divider()
+
+    # ── Load options ───────────────────────────────────────────────────────────
+    tab_excel, tab_db = st.tabs(["📂 Upload Excel", "🔗 Azure Databricks"])
+
+    # ── TAB 1: Excel upload ────────────────────────────────────────────────────
+    with tab_excel:
+        uploaded = st.file_uploader(
+            "Upload Excel file (.xlsx, .xlsm, .xlsb)",
+            type=["xlsx", "xlsm", "xlsb"],
+            key="file_uploader",
+        )
+        if uploaded:
+            file_id = (uploaded.name, uploaded.size)
+            if st.session_state.get("_loaded_file_id") != file_id or not st.session_state.sheets:
+                with st.spinner("Reading workbook…"):
+                    try:
+                        sheets = load_excel(uploaded)
+                    except Exception as e:
+                        st.error(f"Failed to read file: {e}")
+                        return
+                st.session_state.sheets = sheets
+                st.session_state["_loaded_file_id"] = file_id
+                st.session_state.data_source = "excel"
+        elif st.session_state.data_source == "excel" and st.session_state.sheets:
+            pass  # navigated back — use previously loaded Excel data
+        elif not st.session_state.sheets:
+            st.info("Upload an Excel workbook containing your BOP and SKU data.")
+            return  # nothing to show below
+
+        if st.session_state.data_source in ("excel", "none") or st.session_state.sheets:
+            sheets = st.session_state.sheets
+            if not sheets:
+                return
+            st.success(f"Loaded **{len(sheets)}** sheet(s): {', '.join(sheets.keys())}")
+
+            st.subheader("Map Sheets to Roles")
+            sheet_names = list(sheets.keys())
+            none_opt = ["— none —"] + sheet_names
+            guesses = {
+                "Shipments": _guess_sheet(sheet_names, ["ship"]),
+                "Consumption": _guess_sheet(sheet_names, ["cons", "offtake"]),
+                "Retailing": _guess_sheet(sheet_names, ["retail", "sell"]),
+                "Statistical Forecast": _guess_sheet(sheet_names, ["stat", "forecast", "fcst"]),
+                "SAS": _guess_sheet(sheet_names, ["sas", "block", "bb"]),
+            }
+
+            new_map = {}
+            cols = st.columns(3)
+            for i, role in enumerate(LOGICAL_SHEETS):
+                guess = st.session_state.sheet_map.get(role) or guesses.get(role) or "— none —"
+                idx = none_opt.index(guess) if guess in none_opt else 0
+                sel = cols[i % 3].selectbox(f"**{role}**", none_opt, index=idx, key=f"sheet_map_{role}")
+                if sel != "— none —":
+                    new_map[role] = sel
+
+            if new_map:
+                preview_role = st.selectbox("Preview sheet", list(new_map.keys()), key="preview_role")
+                if preview_role:
+                    st.dataframe(sheets[new_map[preview_role]].head(5), use_container_width=True)
+
+            if st.button("Confirm Sheet Mapping →", type="primary", disabled=len(new_map) == 0):
+                if "SAS" not in new_map:
+                    st.error("SAS sheet is required.")
                     return
-            st.session_state.sheets = sheets
-            st.session_state["_loaded_file_id"] = file_id
-    elif st.session_state.sheets:
-        pass  # navigated back — use previously loaded data
-    else:
-        st.info("Please upload an Excel file to begin.")
-        return
+                st.session_state.sheet_map = new_map
+                st.session_state.data_source = "excel"
+                st.session_state.step = max(st.session_state.step, 2)
+                st.session_state.max_step = max(st.session_state.max_step, 2)
+                st.rerun()
 
-    sheets = st.session_state.sheets
-    st.success(f"Loaded **{len(sheets)}** sheets: {', '.join(sheets.keys())}")
+    # ── TAB 2: Azure Databricks ────────────────────────────────────────────────
+    with tab_db:
+        st.subheader("Azure Databricks Connection")
+        st.caption(
+            "Connect to a Databricks SQL Warehouse and pull tables directly. "
+            "Requires `databricks-sql-connector` (`pip install databricks-sql-connector`)."
+        )
 
-    st.subheader("Map Sheets to Roles")
-    sheet_names = list(sheets.keys())
-    none_opt = ["— none —"] + sheet_names
+        col1, col2 = st.columns(2)
+        db_host = col1.text_input(
+            "Server Hostname",
+            value=st.session_state.db_host,
+            placeholder="adb-xxxxxxxxxxxx.azuredatabricks.net",
+            key="db_host_input",
+        )
+        db_http = col2.text_input(
+            "HTTP Path",
+            value=st.session_state.db_http_path,
+            placeholder="/sql/1.0/warehouses/xxxxxxxxxxxxxxxx",
+            key="db_http_input",
+        )
+        db_token = st.text_input(
+            "Access Token (PAT)",
+            value=st.session_state.db_token,
+            type="password",
+            placeholder="dapi…",
+            key="db_token_input",
+            help="Personal Access Token from your Databricks workspace → User Settings → Access Tokens.",
+        )
 
-    guesses = {
-        "Shipments": _guess_sheet(sheet_names, ["ship"]),
-        "Consumption": _guess_sheet(sheet_names, ["cons", "offtake"]),
-        "Retailing": _guess_sheet(sheet_names, ["retail", "sell"]),
-        "Statistical Forecast": _guess_sheet(sheet_names, ["stat", "forecast", "fcst"]),
-        "SAS": _guess_sheet(sheet_names, ["sas", "block", "bb"]),
-    }
+        ctest_col, _ = st.columns([1, 3])
+        if ctest_col.button("Test Connection", key="db_test_btn"):
+            if not db_host or not db_http or not db_token:
+                st.warning("Fill in all three connection fields first.")
+            else:
+                with st.spinner("Testing…"):
+                    ok, msg = test_databricks_connection(db_host, db_http, db_token)
+                if ok:
+                    st.success(f"✅ {msg}")
+                else:
+                    st.error(f"Connection failed: {msg}")
 
-    new_map = {}
-    cols = st.columns(3)
-    for i, role in enumerate(LOGICAL_SHEETS):
-        guess = st.session_state.sheet_map.get(role) or guesses.get(role) or "— none —"
-        idx = none_opt.index(guess) if guess in none_opt else 0
-        sel = cols[i % 3].selectbox(f"**{role}**", none_opt, index=idx, key=f"sheet_map_{role}")
-        if sel != "— none —":
-            new_map[role] = sel
+        st.divider()
+        st.subheader("Map Roles to Databricks Tables")
+        st.caption(
+            "Enter fully-qualified table names (e.g. `catalog.schema.table_name`). "
+            "**SAS / Building Blocks** is required; the others are optional."
+        )
 
-    # Preview selected sheets
-    if new_map:
-        preview_role = st.selectbox("Preview sheet", list(new_map.keys()), key="preview_role")
-        if preview_role:
-            preview_df = sheets[new_map[preview_role]]
-            st.dataframe(preview_df.head(5), use_container_width=True)
+        db_tables_input = {}
+        for role in LOGICAL_SHEETS:
+            required_tag = " *(required)*" if role == "SAS" else " *(optional)*"
+            db_tables_input[role] = st.text_input(
+                f"{role}{required_tag}",
+                value=st.session_state.db_tables.get(role, ""),
+                placeholder="catalog.schema.table_name",
+                key=f"db_table_{role}",
+            )
 
-    if st.button("Confirm Sheet Mapping →", type="primary", disabled=len(new_map) == 0):
-        if "SAS" not in new_map:
-            st.error("SAS sheet is required.")
-            return
-        st.session_state.sheet_map = new_map
-        st.session_state.step = max(st.session_state.step, 2)
-        st.session_state.max_step = max(st.session_state.max_step, 2)
-        st.rerun()
+        row_limit = st.number_input(
+            "Row limit per table",
+            min_value=1_000,
+            max_value=2_000_000,
+            value=st.session_state.db_row_limit,
+            step=10_000,
+            key="db_row_limit_input",
+            help="Fetches at most this many rows from each table.",
+        )
+
+        if st.button("Load from Databricks →", type="primary", key="db_load_btn"):
+            if not db_host or not db_http or not db_token:
+                st.error("Server hostname, HTTP path and access token are all required.")
+            elif not db_tables_input.get("SAS", "").strip():
+                st.error("The **SAS (Building Blocks)** table name is required.")
+            else:
+                # Save connection settings
+                st.session_state.db_host = db_host
+                st.session_state.db_http_path = db_http
+                st.session_state.db_token = db_token
+                st.session_state.db_tables = db_tables_input
+                st.session_state.db_row_limit = int(row_limit)
+
+                loaded_sheets: dict[str, pd.DataFrame] = {}
+                has_error = False
+
+                for role, tbl in db_tables_input.items():
+                    if not tbl.strip():
+                        continue
+                    with st.spinner(f"Fetching **{role}** from `{tbl}`…"):
+                        try:
+                            df = fetch_databricks_table(
+                                db_host, db_http, db_token, tbl.strip(), int(row_limit)
+                            )
+                            loaded_sheets[role] = df
+                            st.success(f"✓ **{role}**: {len(df):,} rows loaded")
+                        except ImportError as exc:
+                            st.error(str(exc))
+                            has_error = True
+                            break
+                        except Exception as exc:
+                            st.error(f"Failed to load **{role}** from `{tbl}`: {exc}")
+                            has_error = True
+
+                if not has_error and loaded_sheets:
+                    # Store data and auto-map roles (role name = "sheet" name)
+                    st.session_state.sheets = loaded_sheets
+                    st.session_state.sheet_map = {r: r for r in loaded_sheets}
+                    st.session_state["_loaded_file_id"] = None
+                    st.session_state.data_source = "databricks"
+                    st.session_state.step = max(st.session_state.step, 2)
+                    st.session_state.max_step = max(st.session_state.max_step, 2)
+                    st.rerun()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
