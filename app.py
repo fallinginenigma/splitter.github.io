@@ -15,6 +15,7 @@ from bop_splitter.loader import (
     detect_month_columns,
     detect_hierarchy_columns,
 )
+from bop_splitter.databricks_loader import fetch_table as fetch_databricks_table, test_connection as test_databricks_connection
 from bop_splitter.salience import (
     compute_basis,
     compute_salience,
@@ -54,13 +55,21 @@ def _init_state():
         "exc_store": ExceptionStore(),
         "output_wide": None,
         "validation_df": None,
-        "split_level": "Brand",
+        "split_level": "Sub Brand",
         "basis_source": "Consumption",
         "basis_mode": "last_3",
         "basis_months_selected": [],
         "sas_months_selected": [],
         "filters": {},
         "step": 1,
+        "max_step": 1,
+        "_loaded_file_id": None,
+        "data_source": "none",       # "none" | "excel" | "databricks"
+        "db_host": "",
+        "db_http_path": "",
+        "db_token": "",
+        "db_tables": {},             # role -> fully-qualified table name
+        "db_row_limit": 100_000,
         "bb_id_col": None,
         "run_settings": {},
     }
@@ -88,7 +97,7 @@ with st.sidebar:
     st.caption("Building Block → SKU Forecast Splitter")
     st.divider()
     for i, label in enumerate(STEPS, 1):
-        icon = "✅" if st.session_state.step > i else ("▶️" if st.session_state.step == i else "⬜")
+        icon = "▶️" if i == st.session_state.step else ("✅" if i <= st.session_state.max_step else "⬜")
         st.markdown(f"{icon} {label}")
     st.divider()
     if st.button("↺ Reset All", use_container_width=True):
@@ -160,64 +169,209 @@ def _sku_merged() -> pd.DataFrame | None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# STEP 1 – Upload & Sheet Mapping
+# STEP 1 – Upload & Sheet Mapping  (Excel OR Azure Databricks)
 # ──────────────────────────────────────────────────────────────────────────────
 def step1_upload():
-    st.header("Step 1 — Upload File & Map Sheets")
-    uploaded = st.file_uploader(
-        "Upload Excel file (.xlsx, .xlsm, .xlsb)",
-        type=["xlsx", "xlsm", "xlsb"],
-        key="file_uploader",
-    )
-    if not uploaded:
-        st.info("Please upload an Excel file to begin.")
-        return
+    st.header("Step 1 — Load Data")
 
-    with st.spinner("Reading workbook…"):
-        try:
-            sheets = load_excel(uploaded)
-        except Exception as e:
-            st.error(f"Failed to read file: {e}")
-            return
+    # ── Already-loaded summary (navigated back) ────────────────────────────────
+    if st.session_state.sheets and st.session_state.sheet_map:
+        src = st.session_state.data_source
+        src_label = {"excel": "Excel file", "databricks": "Azure Databricks"}.get(src, "file")
+        total_rows = sum(len(v) for v in st.session_state.sheets.values())
+        st.success(
+            f"**{src_label}** data already loaded — "
+            f"{', '.join(st.session_state.sheets.keys())} "
+            f"({total_rows:,} rows total). "
+            "Use the button below to continue, or load new data."
+        )
+        if st.button("Continue with current data →", type="primary"):
+            st.session_state.step = max(st.session_state.step, 2)
+            st.session_state.max_step = max(st.session_state.max_step, 2)
+            st.rerun()
+        st.divider()
 
-    st.session_state.sheets = sheets
-    st.success(f"Loaded **{len(sheets)}** sheets: {', '.join(sheets.keys())}")
+    # ── Load options ───────────────────────────────────────────────────────────
+    tab_excel, tab_db = st.tabs(["📂 Upload Excel", "🔗 Azure Databricks"])
 
-    st.subheader("Map Sheets to Roles")
-    sheet_names = list(sheets.keys())
-    none_opt = ["— none —"] + sheet_names
+    # ── TAB 1: Excel upload ────────────────────────────────────────────────────
+    with tab_excel:
+        uploaded = st.file_uploader(
+            "Upload Excel file (.xlsx, .xlsm, .xlsb)",
+            type=["xlsx", "xlsm", "xlsb"],
+            key="file_uploader",
+        )
+        if uploaded:
+            file_id = (uploaded.name, uploaded.size)
+            if st.session_state.get("_loaded_file_id") != file_id or not st.session_state.sheets:
+                with st.spinner("Reading workbook…"):
+                    try:
+                        sheets = load_excel(uploaded)
+                    except Exception as e:
+                        st.error(f"Failed to read file: {e}")
+                        return
+                st.session_state.sheets = sheets
+                st.session_state["_loaded_file_id"] = file_id
+                st.session_state.data_source = "excel"
+        elif st.session_state.data_source == "excel" and st.session_state.sheets:
+            pass  # navigated back — use previously loaded Excel data
+        elif not st.session_state.sheets:
+            st.info("Upload an Excel workbook containing your BOP and SKU data.")
+            return  # nothing to show below
 
-    guesses = {
-        "Shipments": _guess_sheet(sheet_names, ["ship"]),
-        "Consumption": _guess_sheet(sheet_names, ["cons", "offtake"]),
-        "Retailing": _guess_sheet(sheet_names, ["retail", "sell"]),
-        "Statistical Forecast": _guess_sheet(sheet_names, ["stat", "forecast", "fcst"]),
-        "SAS": _guess_sheet(sheet_names, ["sas", "block", "bb"]),
-    }
+        if st.session_state.data_source in ("excel", "none") or st.session_state.sheets:
+            sheets = st.session_state.sheets
+            if not sheets:
+                return
+            st.success(f"Loaded **{len(sheets)}** sheet(s): {', '.join(sheets.keys())}")
 
-    new_map = {}
-    cols = st.columns(3)
-    for i, role in enumerate(LOGICAL_SHEETS):
-        guess = st.session_state.sheet_map.get(role) or guesses.get(role) or "— none —"
-        idx = none_opt.index(guess) if guess in none_opt else 0
-        sel = cols[i % 3].selectbox(f"**{role}**", none_opt, index=idx, key=f"sheet_map_{role}")
-        if sel != "— none —":
-            new_map[role] = sel
+            st.subheader("Map Sheets to Roles")
+            sheet_names = list(sheets.keys())
+            none_opt = ["— none —"] + sheet_names
+            guesses = {
+                "Shipments": _guess_sheet(sheet_names, ["ship"]),
+                "Consumption": _guess_sheet(sheet_names, ["cons", "offtake"]),
+                "Retailing": _guess_sheet(sheet_names, ["retail", "sell"]),
+                "Statistical Forecast": _guess_sheet(sheet_names, ["stat", "forecast", "fcst"]),
+                "SAS": _guess_sheet(sheet_names, ["sas", "block", "bb"]),
+            }
 
-    # Preview selected sheets
-    if new_map:
-        preview_role = st.selectbox("Preview sheet", list(new_map.keys()), key="preview_role")
-        if preview_role:
-            preview_df = sheets[new_map[preview_role]]
-            st.dataframe(preview_df.head(5), use_container_width=True)
+            new_map = {}
+            cols = st.columns(3)
+            for i, role in enumerate(LOGICAL_SHEETS):
+                guess = st.session_state.sheet_map.get(role) or guesses.get(role) or "— none —"
+                idx = none_opt.index(guess) if guess in none_opt else 0
+                sel = cols[i % 3].selectbox(f"**{role}**", none_opt, index=idx, key=f"sheet_map_{role}")
+                if sel != "— none —":
+                    new_map[role] = sel
 
-    if st.button("Confirm Sheet Mapping →", type="primary", disabled=len(new_map) == 0):
-        if "SAS" not in new_map:
-            st.error("SAS sheet is required.")
-            return
-        st.session_state.sheet_map = new_map
-        st.session_state.step = max(st.session_state.step, 2)
-        st.rerun()
+            if new_map:
+                preview_role = st.selectbox("Preview sheet", list(new_map.keys()), key="preview_role")
+                if preview_role:
+                    st.dataframe(sheets[new_map[preview_role]].head(5), use_container_width=True)
+
+            if st.button("Confirm Sheet Mapping →", type="primary", disabled=len(new_map) == 0):
+                if "SAS" not in new_map:
+                    st.error("SAS sheet is required.")
+                    return
+                st.session_state.sheet_map = new_map
+                st.session_state.data_source = "excel"
+                st.session_state.step = max(st.session_state.step, 2)
+                st.session_state.max_step = max(st.session_state.max_step, 2)
+                st.rerun()
+
+    # ── TAB 2: Azure Databricks ────────────────────────────────────────────────
+    with tab_db:
+        st.subheader("Azure Databricks Connection")
+        st.caption(
+            "Connect to a Databricks SQL Warehouse and pull tables directly. "
+            "Requires `databricks-sql-connector` (`pip install databricks-sql-connector`)."
+        )
+
+        col1, col2 = st.columns(2)
+        db_host = col1.text_input(
+            "Server Hostname",
+            value=st.session_state.db_host,
+            placeholder="adb-xxxxxxxxxxxx.azuredatabricks.net",
+            key="db_host_input",
+        )
+        db_http = col2.text_input(
+            "HTTP Path",
+            value=st.session_state.db_http_path,
+            placeholder="/sql/1.0/warehouses/xxxxxxxxxxxxxxxx",
+            key="db_http_input",
+        )
+        db_token = st.text_input(
+            "Access Token (PAT)",
+            value=st.session_state.db_token,
+            type="password",
+            placeholder="dapi…",
+            key="db_token_input",
+            help="Personal Access Token from your Databricks workspace → User Settings → Access Tokens.",
+        )
+
+        ctest_col, _ = st.columns([1, 3])
+        if ctest_col.button("Test Connection", key="db_test_btn"):
+            if not db_host or not db_http or not db_token:
+                st.warning("Fill in all three connection fields first.")
+            else:
+                with st.spinner("Testing…"):
+                    ok, msg = test_databricks_connection(db_host, db_http, db_token)
+                if ok:
+                    st.success(f"✅ {msg}")
+                else:
+                    st.error(f"Connection failed: {msg}")
+
+        st.divider()
+        st.subheader("Map Roles to Databricks Tables")
+        st.caption(
+            "Enter fully-qualified table names (e.g. `catalog.schema.table_name`). "
+            "**SAS / Building Blocks** is required; the others are optional."
+        )
+
+        db_tables_input = {}
+        for role in LOGICAL_SHEETS:
+            required_tag = " *(required)*" if role == "SAS" else " *(optional)*"
+            db_tables_input[role] = st.text_input(
+                f"{role}{required_tag}",
+                value=st.session_state.db_tables.get(role, ""),
+                placeholder="catalog.schema.table_name",
+                key=f"db_table_{role}",
+            )
+
+        row_limit = st.number_input(
+            "Row limit per table",
+            min_value=1_000,
+            max_value=2_000_000,
+            value=st.session_state.db_row_limit,
+            step=10_000,
+            key="db_row_limit_input",
+            help="Fetches at most this many rows from each table.",
+        )
+
+        if st.button("Load from Databricks →", type="primary", key="db_load_btn"):
+            if not db_host or not db_http or not db_token:
+                st.error("Server hostname, HTTP path and access token are all required.")
+            elif not db_tables_input.get("SAS", "").strip():
+                st.error("The **SAS (Building Blocks)** table name is required.")
+            else:
+                # Save connection settings
+                st.session_state.db_host = db_host
+                st.session_state.db_http_path = db_http
+                st.session_state.db_token = db_token
+                st.session_state.db_tables = db_tables_input
+                st.session_state.db_row_limit = int(row_limit)
+
+                loaded_sheets: dict[str, pd.DataFrame] = {}
+                has_error = False
+
+                for role, tbl in db_tables_input.items():
+                    if not tbl.strip():
+                        continue
+                    with st.spinner(f"Fetching **{role}** from `{tbl}`…"):
+                        try:
+                            df = fetch_databricks_table(
+                                db_host, db_http, db_token, tbl.strip(), int(row_limit)
+                            )
+                            loaded_sheets[role] = df
+                            st.success(f"✓ **{role}**: {len(df):,} rows loaded")
+                        except ImportError as exc:
+                            st.error(str(exc))
+                            has_error = True
+                            break
+                        except Exception as exc:
+                            st.error(f"Failed to load **{role}** from `{tbl}`: {exc}")
+                            has_error = True
+
+                if not has_error and loaded_sheets:
+                    # Store data and auto-map roles (role name = "sheet" name)
+                    st.session_state.sheets = loaded_sheets
+                    st.session_state.sheet_map = {r: r for r in loaded_sheets}
+                    st.session_state["_loaded_file_id"] = None
+                    st.session_state.data_source = "databricks"
+                    st.session_state.step = max(st.session_state.step, 2)
+                    st.session_state.max_step = max(st.session_state.max_step, 2)
+                    st.rerun()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -298,6 +452,7 @@ def step2_columns():
         if not any(sas_cmap.get(h) for h in LOGICAL_HIER):
             st.warning("No hierarchy columns mapped for SAS — results may be poor.")
         st.session_state.step = max(st.session_state.step, 3)
+        st.session_state.max_step = max(st.session_state.max_step, 3)
         st.rerun()
 
 
@@ -330,22 +485,34 @@ def step3_filters():
         st.session_state.sheets[st.session_state.sheet_map["SAS"]] = sas_df
         st.session_state.bb_id_col = "BB_ID"
 
-    # ---- Filters ----
-    st.subheader("Filter Data")
-    filters = st.session_state.filters.copy()
-    filter_cols = st.columns(len(LOGICAL_HIER))
-    for i, lh in enumerate(LOGICAL_HIER):
-        col_actual = sas_cmap.get(lh)
-        if not col_actual or col_actual not in sas_df.columns:
-            filter_cols[i].caption(f"*{lh}* not mapped")
-            continue
-        all_vals = sorted(sas_df[col_actual].dropna().unique().astype(str).tolist())
-        prev = filters.get(lh, [])
-        sel = filter_cols[i].multiselect(lh, all_vals, default=prev, key=f"filter_{lh}")
-        filters[lh] = sel
-    st.session_state.filters = filters
+    # ---- Month Selection ----
+    st.subheader("Forecast Months")
+    all_sas_months = sas_cmap.get("_months", detect_month_columns(sas_df))
+    prev_months = st.session_state.sas_months_selected or all_sas_months
+    sas_months = st.multiselect(
+        "Select which SAS months to split:",
+        all_sas_months,
+        default=[m for m in prev_months if m in all_sas_months],
+        key="sas_months_step3",
+    )
+    st.session_state.sas_months_selected = sas_months
 
-    # ---- Diagnose SKU data availability before proceeding ----
+    # ---- Building Block list ----
+    st.subheader("Building Blocks")
+    hier_actual = [sas_cmap.get(h) for h in LOGICAL_HIER if sas_cmap.get(h) and sas_cmap.get(h) in sas_df.columns]
+    month_cols_in_data = [m for m in sas_months if m in sas_df.columns]
+    display_cols = hier_actual + month_cols_in_data
+    if display_cols:
+        bb_table = sas_df[display_cols].drop_duplicates().reset_index(drop=True)
+        if month_cols_in_data:
+            bb_table = bb_table.copy()
+            bb_table["Total"] = bb_table[month_cols_in_data].apply(pd.to_numeric, errors="coerce").sum(axis=1)
+        st.dataframe(bb_table, use_container_width=True, height=min(400, 40 + len(bb_table) * 35))
+        st.caption(f"**{len(bb_table)}** Building Blocks")
+    else:
+        st.info("No hierarchy columns mapped — configure hierarchy columns in Step 2 to see Building Blocks here.")
+
+    # ---- Diagnose SKU data availability ----
     sku_merged = _sku_merged()
     sku_problem = None
     if sku_merged is None:
@@ -380,30 +547,13 @@ def step3_filters():
 
     if sku_problem:
         st.error(sku_problem)
+    else:
+        st.info(f"**{len(sas_df)}** Building Blocks | **{len(sku_merged)}** SKU rows available")
 
-    # Apply filters
-    sas_filtered = sas_df.copy()
-    sku_filtered = (sku_merged if sku_merged is not None else pd.DataFrame()).copy()
-
-    for lh, vals in filters.items():
-        if not vals:
-            continue
-        col_sas = sas_cmap.get(lh)
-        if col_sas and col_sas in sas_filtered.columns:
-            sas_filtered = sas_filtered[sas_filtered[col_sas].astype(str).isin(vals)]
-        for role in SKU_SHEETS:
-            rcmap = st.session_state.col_maps.get(role, {})
-            col_sku = rcmap.get(lh)
-            if col_sku and col_sku in sku_filtered.columns:
-                sku_filtered = sku_filtered[sku_filtered[col_sku].astype(str).isin(vals)]
-                break
-
-    st.info(f"**{len(sas_filtered)}** Building Blocks | **{len(sku_filtered)}** SKU rows after filters")
-
-    # ---- Split Level ----
-    st.subheader("Split Level")
+    # ---- Split Granularity ----
+    st.subheader("Split Granularity")
     split_level = st.radio(
-        "Split SAS Building Blocks at:",
+        "Split each Building Block at:",
         list(SPLIT_KEYS.keys()),
         index=list(SPLIT_KEYS.keys()).index(st.session_state.split_level),
         horizontal=True,
@@ -412,10 +562,10 @@ def step3_filters():
     match_desc = " + ".join(SPLIT_KEYS[split_level])
     st.caption(f"Match keys: **{match_desc}**")
 
-    if st.button("Apply Filters & Split Level →", type="primary", disabled=bool(sku_problem)):
+    if st.button("Confirm Months & Split Level →", type="primary", disabled=bool(sku_problem)):
         st.session_state.split_level = split_level
-        sas_out = sas_filtered.reset_index(drop=True)
-        sku_out = sku_filtered.reset_index(drop=True)
+        sas_out = sas_df.reset_index(drop=True)
+        sku_out = sku_merged.reset_index(drop=True)
         st.session_state.sas_df_filtered = sas_out
         st.session_state.sku_df_filtered = sku_out
 
@@ -430,6 +580,7 @@ def step3_filters():
         )
         st.session_state.salience_df = sal_df
         st.session_state.step = max(st.session_state.step, 4)
+        st.session_state.max_step = max(st.session_state.max_step, 4)
         st.rerun()
 
 
@@ -573,22 +724,9 @@ def step4_salience():
                     st.session_state.sal_overrides[(g_key, sku_val)] = float(edited.iloc[idx_row]["salience"])
                 st.success("Overrides saved. Click 'Compute Historical Salience' again to refresh.")
 
-    # ── SAS month selection ───────────────────────────────────────────────────
-    st.subheader("SAS Month Selection")
-    sas_df = st.session_state.sas_df_filtered
-    if sas_df is not None:
-        sas_cmap = st.session_state.col_maps.get("SAS", {})
-        sas_months_all = sas_cmap.get("_months", detect_month_columns(sas_df))
-        sas_months_sel = st.multiselect(
-            "SAS months to split (default: all)",
-            sas_months_all,
-            default=st.session_state.sas_months_selected or sas_months_all,
-            key="sas_months_sel",
-        )
-        st.session_state.sas_months_selected = sas_months_sel
-
     if st.button("Confirm Salience →", type="primary", disabled=(sal_df is None)):
         st.session_state.step = max(st.session_state.step, 5)
+        st.session_state.max_step = max(st.session_state.max_step, 5)
         st.rerun()
 
 
@@ -722,6 +860,7 @@ def step5_exceptions():
 
     if st.button("Proceed to Split →", type="primary"):
         st.session_state.step = max(st.session_state.step, 6)
+        st.session_state.max_step = max(st.session_state.max_step, 6)
         st.rerun()
 
 
@@ -740,7 +879,7 @@ def step6_run():
     if st.session_state.salience_df is None:
         issues.append("Salience not computed — complete Step 4")
     if not st.session_state.sas_months_selected:
-        issues.append("No SAS months selected — complete Step 4")
+        issues.append("No SAS months selected — complete Step 3")
 
     if issues:
         for iss in issues:
@@ -810,6 +949,7 @@ def step6_run():
             st.success("No validation issues.")
 
         st.session_state.step = max(st.session_state.step, 7)
+        st.session_state.max_step = max(st.session_state.max_step, 7)
 
     # Preview if already run
     if st.session_state.output_wide is not None:
@@ -818,6 +958,7 @@ def step6_run():
 
         if st.button("Proceed to Download →", type="primary"):
             st.session_state.step = max(st.session_state.step, 7)
+            st.session_state.max_step = max(st.session_state.max_step, 7)
             st.rerun()
 
 
@@ -890,8 +1031,8 @@ def main():
     with st.sidebar:
         st.divider()
         st.subheader("Jump to Step")
-        max_step = st.session_state.step
-        jump = st.radio("", STEPS[:max_step], index=min(max_step - 1, len(STEPS) - 1), label_visibility="collapsed")
+        max_step = st.session_state.max_step
+        jump = st.radio("", STEPS[:max_step], index=min(step - 1, max_step - 1), label_visibility="collapsed")
         if jump:
             target = STEPS.index(jump) + 1
             if target != step:

@@ -4,3 +4,6 @@ openpyxl>=3.1.0
 pyxlsb>=1.0.10
 xlsxwriter>=3.1.0
 numpy>=1.24.0
+
+# Optional – required only for Azure Databricks connectivity (Step 1 → Databricks tab)
+# databricks-sql-connector>=3.0.0
