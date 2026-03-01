@@ -885,10 +885,10 @@ def main():
         st.divider()
         st.subheader("Jump to Step")
         max_step = st.session_state.step
-        jump = st.radio("", STEPS[:max_step], index=min(max_step - 1, len(STEPS) - 1), label_visibility="collapsed", key="jump_nav")
+        jump = st.radio("", STEPS[:max_step], index=min(max_step - 1, len(STEPS) - 1), label_visibility="collapsed")
         if jump:
             target = STEPS.index(jump) + 1
-            if target != st.session_state.step:
+            if target != step:
                 st.session_state.step = target
                 st.rerun()
 
