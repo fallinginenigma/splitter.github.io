@@ -16,6 +16,8 @@ MONTH_PATTERN = re.compile(
 def load_excel(file_obj) -> dict[str, pd.DataFrame]:
     """Load all sheets from an uploaded Excel file (.xlsx/.xlsm/.xlsb)."""
     name = getattr(file_obj, "name", "")
+    if hasattr(file_obj, "seek"):
+        file_obj.seek(0)
     data = file_obj.read() if hasattr(file_obj, "read") else file_obj
     buf = io.BytesIO(data)
 
