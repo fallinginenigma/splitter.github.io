@@ -21,6 +21,7 @@ from bop_splitter.loader import (
     SAS_HIERARCHY_MAP,
     MONTHLY_HIERARCHY_MAP,
     MONTHLY_SKU_COL,
+    MONTHLY_SFU_VERSION_COL,
 )
 from bop_splitter.databricks_loader import fetch_table as fetch_databricks_table, test_connection as test_databricks_connection
 from bop_splitter.salience import (
@@ -737,6 +738,90 @@ def _guess_col(cols: list[str], *keywords: str) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# SKU aggregate helper (BOP only)
+# ──────────────────────────────────────────────────────────────────────────────
+def _compute_sku_aggregates() -> pd.DataFrame | None:
+    """Return a per-SFU_SFU Version summary table with three aggregate columns:
+
+    * **Shipments (last 12 months)** — sum of the 12 most-recent past month
+      columns in the Shipments measure DataFrame.
+    * **Stat Forecast (future months)** — sum of all future month columns in the
+      Statistical Forecast measure DataFrame.
+    * **Final Fcst to Finance (future months)** — same for Final Fcst to Finance.
+
+    "Past" = month whose first day < the first day of the current calendar month.
+    "Future" = month whose first day >= the first day of the current calendar month.
+
+    Returns None if no BOP data or if SFU_SFU Version column is not found.
+    """
+    if not st.session_state.get("_is_bop"):
+        return None
+
+    # ── Classify month columns as past / future ────────────────────────────────
+    current_month_start = pd.Timestamp.now().normalize().replace(day=1)
+
+    # Pull month list from whichever measure sheet is available first
+    all_month_cols: list[str] = []
+    for measure in MONTHLY_MEASURES:
+        if measure in st.session_state.sheets:
+            all_month_cols = detect_month_columns(st.session_state.sheets[measure])
+            break
+
+    if not all_month_cols:
+        return None
+
+    past_months, future_months = [], []
+    for col in all_month_cols:
+        try:
+            ts = pd.to_datetime(col, format="%b-%y")
+            (past_months if ts < current_month_start else future_months).append(col)
+        except Exception:
+            pass
+
+    last_12 = past_months[-12:] if past_months else []
+
+    # ── Groupby key: hierarchy + SFU_SFU Version + APO Product ────────────────
+    # Use the first available measure sheet to discover columns
+    sample_df = st.session_state.sheets.get(MONTHLY_MEASURES[0], pd.DataFrame())
+    hier_cols = [c for c in ["Ctry", "SMO Category", "Brand", "Sub Brand", "Form"]
+                 if c in sample_df.columns]
+
+    measure_months = {
+        "Shipments":              last_12,
+        "Statistical Forecast":   future_months,
+        "Final Fcst to Finance":  future_months,
+    }
+
+    result: pd.DataFrame | None = None
+
+    for measure, month_subset in measure_months.items():
+        if measure not in st.session_state.sheets:
+            continue
+        df = st.session_state.sheets[measure]
+        if MONTHLY_SFU_VERSION_COL not in df.columns:
+            continue
+
+        available = [m for m in month_subset if m in df.columns]
+        if not available:
+            continue
+
+        group_cols = [c for c in hier_cols + [MONTHLY_SKU_COL, MONTHLY_SFU_VERSION_COL]
+                      if c in df.columns]
+        if not group_cols:
+            continue
+
+        numeric = df[available].apply(pd.to_numeric, errors="coerce")
+        agg_series = numeric.sum(axis=1)
+        tmp = df[group_cols].copy()
+        tmp[measure] = agg_series.values
+        agg = tmp.groupby(group_cols, dropna=False)[measure].sum().reset_index()
+
+        result = agg if result is None else result.merge(agg, on=group_cols, how="outer")
+
+    return result if result is not None and not result.empty else None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # STEP 3 – Filters & Split Level
 # ──────────────────────────────────────────────────────────────────────────────
 def step3_filters():
@@ -783,6 +868,39 @@ def step3_filters():
         st.caption(f"**{len(bb_table)}** Building Blocks")
     else:
         st.info("No hierarchy columns mapped — configure hierarchy columns in Step 2 to see Building Blocks here.")
+
+    # ---- SKU Actuals & Forecasts (BOP only) ----
+    if st.session_state.get("_is_bop"):
+        st.subheader("SKU Actuals & Forecasts")
+        current_month_start = pd.Timestamp.now().normalize().replace(day=1)
+        st.caption(
+            f"Grouped by hierarchy + SFU_SFU Version + APO Product. "
+            f"Shipments = last 12 months before **{current_month_start.strftime('%b-%Y')}**; "
+            f"forecasts = **{current_month_start.strftime('%b-%Y')}** onward."
+        )
+        with st.spinner("Aggregating…"):
+            sku_agg = _compute_sku_aggregates()
+
+        if sku_agg is not None:
+            # Rename aggregate columns for display
+            display_col_map = {
+                "Shipments":             "Shipments — last 12 months",
+                "Statistical Forecast":  "Stat Forecast — future months",
+                "Final Fcst to Finance": "Final Fcst to Finance — future months",
+            }
+            display_df = sku_agg.rename(columns=display_col_map)
+            st.dataframe(
+                display_df,
+                use_container_width=True,
+                height=min(500, 60 + len(display_df) * 35),
+            )
+            st.caption(f"**{len(display_df):,}** rows")
+        else:
+            st.info(
+                f"SKU aggregate data unavailable — verify that the "
+                f"**{MONTHLY_SFU_VERSION_COL}** column exists in the Monthly sheet "
+                f"and that at least one measure was loaded."
+            )
 
     # ---- Diagnose SKU data availability ----
     sku_merged = _sku_merged()
