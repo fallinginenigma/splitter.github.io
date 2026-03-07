@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import json
 import re
 from copy import deepcopy
 
@@ -14,6 +15,12 @@ from bop_splitter.loader import (
     load_excel,
     detect_month_columns,
     detect_hierarchy_columns,
+    detect_bop_col_maps,
+    MONTHLY_MEASURES,
+    MONTHLY_MEASURE_COL,
+    SAS_HIERARCHY_MAP,
+    MONTHLY_HIERARCHY_MAP,
+    MONTHLY_SKU_COL,
 )
 from bop_splitter.databricks_loader import fetch_table as fetch_databricks_table, test_connection as test_databricks_connection
 from bop_splitter.salience import (
@@ -65,6 +72,7 @@ def _init_state():
         "max_step": 1,
         "_loaded_file_id": None,
         "data_source": "none",       # "none" | "excel" | "databricks"
+        "_is_bop": False,            # True when standard SAP BEx BOP export detected
         "db_host": "",
         "db_http_path": "",
         "db_token": "",
@@ -108,8 +116,15 @@ with st.sidebar:
 # ──────────────────────────────────────────────────────────────────────────────
 # Helper utilities
 # ──────────────────────────────────────────────────────────────────────────────
-LOGICAL_SHEETS = ["Shipments", "Consumption", "Retailing", "Statistical Forecast", "SAS"]
-SKU_SHEETS = ["Shipments", "Consumption", "Retailing", "Statistical Forecast"]
+LOGICAL_SHEETS = [
+    "Shipments", "Consumption", "Retailing", "Statistical Forecast",
+    "Final Fcst to Finance",   # BOP: derived from Monthly sheet
+    "SAS",
+]
+SKU_SHEETS = [
+    "Shipments", "Consumption", "Retailing", "Statistical Forecast",
+    "Final Fcst to Finance",   # BOP: derived from Monthly sheet
+]
 LOGICAL_HIER = HIERARCHY_LEVELS  # Ctry, SMO Category, Brand, Sub Brand, Form
 ALL_LOGICAL = LOGICAL_HIER + ["SKU"]
 
@@ -169,6 +184,65 @@ def _sku_merged() -> pd.DataFrame | None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# BOP-format helpers
+# ──────────────────────────────────────────────────────────────────────────────
+def _is_bop_sheets(sheets: dict) -> bool:
+    """True when *sheets* came from a standard SAP BEx BOP export
+    (loader already derived per-measure DataFrames from the Monthly tab)."""
+    return "SAS" in sheets and any(m in sheets for m in MONTHLY_MEASURES)
+
+
+def _show_bop_load_summary(sheets: dict) -> None:
+    """Render a compact, read-only summary of auto-detected BOP content."""
+    sas_df = sheets.get("SAS", pd.DataFrame())
+    sas_months = detect_month_columns(sas_df)
+
+    st.success("✅ **SAP BEx BOP export detected** — sheets and columns have been auto-mapped.")
+
+    # Metrics row
+    m_cols = st.columns(4)
+    m_cols[0].metric("Building Blocks", f"{len(sas_df):,}")
+    m_cols[0].caption(
+        f"{len(sas_months)} months: "
+        + (f"{sas_months[0]} → {sas_months[-1]}" if sas_months else "none found")
+    )
+    for i, measure in enumerate(MONTHLY_MEASURES, 1):
+        if measure in sheets:
+            mdf = sheets[measure]
+            n_sku = mdf[MONTHLY_SKU_COL].nunique() if MONTHLY_SKU_COL in mdf.columns else "?"
+            m_cols[min(i, 3)].metric(measure, f"{len(mdf):,} rows")
+            m_cols[min(i, 3)].caption(f"{n_sku:,} unique SKUs")
+
+    # Hierarchy mapping table
+    with st.expander("Auto-mapped columns (click to review)", expanded=True):
+        mapping_rows = [
+            {
+                "Logical Level": lv,
+                "SAS column": SAS_HIERARCHY_MAP[lv],
+                "Monthly column → renamed to SAS name": MONTHLY_HIERARCHY_MAP[lv],
+            }
+            for lv in SAS_HIERARCHY_MAP
+        ]
+        mapping_rows.append({
+            "Logical Level": "SKU",
+            "SAS column": "Specific SKU (optional — pinned BBs only)",
+            "Monthly column → renamed to SAS name": MONTHLY_SKU_COL + " (APO Product)",
+        })
+        st.dataframe(pd.DataFrame(mapping_rows), use_container_width=True, hide_index=True)
+
+    # SAS preview
+    if not sas_df.empty:
+        with st.expander("Preview SAS (Building Blocks) — first 5 rows"):
+            st.dataframe(sas_df.head(5), use_container_width=True)
+
+    # Monthly preview per measure
+    for measure in MONTHLY_MEASURES:
+        if measure in sheets:
+            with st.expander(f"Preview Monthly · {measure} — first 5 rows"):
+                st.dataframe(sheets[measure].head(5), use_container_width=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # STEP 1 – Upload & Sheet Mapping  (Excel OR Azure Databricks)
 # ──────────────────────────────────────────────────────────────────────────────
 def step1_upload():
@@ -210,55 +284,70 @@ def step1_upload():
                     except Exception as e:
                         st.error(f"Failed to read file: {e}")
                         return
+                is_bop = _is_bop_sheets(sheets)
                 st.session_state.sheets = sheets
                 st.session_state["_loaded_file_id"] = file_id
                 st.session_state.data_source = "excel"
+                st.session_state["_is_bop"] = is_bop
+                if is_bop:
+                    auto_map, auto_cmaps = detect_bop_col_maps(sheets)
+                    st.session_state.sheet_map = auto_map
+                    st.session_state.col_maps = auto_cmaps
         elif st.session_state.data_source == "excel" and st.session_state.sheets:
             pass  # navigated back — use previously loaded Excel data
         elif not st.session_state.sheets:
             st.info("Upload an Excel workbook containing your BOP and SKU data.")
             return  # nothing to show below
 
-        if st.session_state.data_source in ("excel", "none") or st.session_state.sheets:
-            sheets = st.session_state.sheets
-            if not sheets:
-                return
-            st.success(f"Loaded **{len(sheets)}** sheet(s): {', '.join(sheets.keys())}")
+        sheets = st.session_state.sheets
+        if not sheets:
+            return
 
-            st.subheader("Map Sheets to Roles")
-            sheet_names = list(sheets.keys())
-            none_opt = ["— none —"] + sheet_names
-            guesses = {
-                "Shipments": _guess_sheet(sheet_names, ["ship"]),
-                "Consumption": _guess_sheet(sheet_names, ["cons", "offtake"]),
-                "Retailing": _guess_sheet(sheet_names, ["retail", "sell"]),
-                "Statistical Forecast": _guess_sheet(sheet_names, ["stat", "forecast", "fcst"]),
-                "SAS": _guess_sheet(sheet_names, ["sas", "block", "bb"]),
-            }
-
-            new_map = {}
-            cols = st.columns(3)
-            for i, role in enumerate(LOGICAL_SHEETS):
-                guess = st.session_state.sheet_map.get(role) or guesses.get(role) or "— none —"
-                idx = none_opt.index(guess) if guess in none_opt else 0
-                sel = cols[i % 3].selectbox(f"**{role}**", none_opt, index=idx, key=f"sheet_map_{role}")
-                if sel != "— none —":
-                    new_map[role] = sel
-
-            if new_map:
-                preview_role = st.selectbox("Preview sheet", list(new_map.keys()), key="preview_role")
-                if preview_role:
-                    st.dataframe(sheets[new_map[preview_role]].head(5), use_container_width=True)
-
-            if st.button("Confirm Sheet Mapping →", type="primary", disabled=len(new_map) == 0):
-                if "SAS" not in new_map:
-                    st.error("SAS sheet is required.")
-                    return
-                st.session_state.sheet_map = new_map
-                st.session_state.data_source = "excel"
+        # ── BOP fast path: everything auto-mapped, no manual selection needed ──
+        if st.session_state.get("_is_bop"):
+            _show_bop_load_summary(sheets)
+            if st.button("Proceed to Column Mapping →", type="primary"):
                 st.session_state.step = max(st.session_state.step, 2)
                 st.session_state.max_step = max(st.session_state.max_step, 2)
                 st.rerun()
+            return
+
+        # ── Generic path: manual sheet-to-role mapping ─────────────────────────
+        st.success(f"Loaded **{len(sheets)}** sheet(s): {', '.join(sheets.keys())}")
+        st.subheader("Map Sheets to Roles")
+        sheet_names = list(sheets.keys())
+        none_opt = ["— none —"] + sheet_names
+        guesses = {
+            "Shipments": _guess_sheet(sheet_names, ["ship"]),
+            "Consumption": _guess_sheet(sheet_names, ["cons", "offtake"]),
+            "Retailing": _guess_sheet(sheet_names, ["retail", "sell"]),
+            "Statistical Forecast": _guess_sheet(sheet_names, ["stat", "forecast", "fcst"]),
+            "SAS": _guess_sheet(sheet_names, ["sas", "block", "bb"]),
+        }
+
+        new_map = {}
+        cols = st.columns(3)
+        for i, role in enumerate(LOGICAL_SHEETS):
+            guess = st.session_state.sheet_map.get(role) or guesses.get(role) or "— none —"
+            idx = none_opt.index(guess) if guess in none_opt else 0
+            sel = cols[i % 3].selectbox(f"**{role}**", none_opt, index=idx, key=f"sheet_map_{role}")
+            if sel != "— none —":
+                new_map[role] = sel
+
+        if new_map:
+            preview_role = st.selectbox("Preview sheet", list(new_map.keys()), key="preview_role")
+            if preview_role:
+                st.dataframe(sheets[new_map[preview_role]].head(5), use_container_width=True)
+
+        if st.button("Confirm Sheet Mapping →", type="primary", disabled=len(new_map) == 0):
+            if "SAS" not in new_map:
+                st.error("SAS sheet is required.")
+                return
+            st.session_state.sheet_map = new_map
+            st.session_state.data_source = "excel"
+            st.session_state.step = max(st.session_state.step, 2)
+            st.session_state.max_step = max(st.session_state.max_step, 2)
+            st.rerun()
 
     # ── TAB 2: Azure Databricks ────────────────────────────────────────────────
     with tab_db:
@@ -375,10 +464,193 @@ def step1_upload():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Mapping profile helpers (save / load column configuration as JSON)
+# ──────────────────────────────────────────────────────────────────────────────
+def _export_profile() -> dict:
+    """Serialise the current sheet + column mappings to a JSON-safe dict.
+
+    Month columns are intentionally excluded — they are auto-detected from the
+    data and vary across files.  Everything else (sheet names, hierarchy columns,
+    SKU column, BB_ID column) is included.
+    """
+    return {
+        "version": 1,
+        "created": datetime.datetime.now().isoformat(timespec="seconds"),
+        "sheet_map": dict(st.session_state.sheet_map),
+        "col_maps": {
+            role: {k: v for k, v in cmap.items() if not k.startswith("_") and v}
+            for role, cmap in st.session_state.col_maps.items()
+        },
+    }
+
+
+def _fuzzy_match(name: str, candidates: list[str]) -> str | None:
+    """Return the first candidate that is a sub/super-string of *name* (case-insensitive)."""
+    nl = name.lower()
+    for c in candidates:
+        cl = c.lower()
+        if nl in cl or cl in nl:
+            return c
+    return None
+
+
+def _apply_profile(profile: dict) -> tuple[int, list[str]]:
+    """Apply a loaded profile dict to session state.
+
+    Matches profile column names against columns that are actually present in the
+    currently-loaded sheets.  Near-miss names are resolved via fuzzy matching.
+
+    Returns:
+        (number of mappings applied, list of warning messages)
+    """
+    applied = 0
+    warnings: list[str] = []
+
+    # --- Sheet map -----------------------------------------------------------
+    available_sheets = list(st.session_state.sheets.keys())
+    for role, sheet_name in profile.get("sheet_map", {}).items():
+        if sheet_name in available_sheets:
+            target = sheet_name
+        else:
+            target = _fuzzy_match(sheet_name, available_sheets)
+            if target:
+                warnings.append(
+                    f"Sheet **{sheet_name}** not found → using **{target}** for *{role}*."
+                )
+            else:
+                warnings.append(f"Sheet **{sheet_name}** (*{role}*) not found in workbook — skipped.")
+                continue
+        st.session_state.sheet_map[role] = target
+        # Push value into widget state so the selectbox renders the right option
+        st.session_state[f"sheet_map_{role}"] = target
+        applied += 1
+
+    # --- Column maps ---------------------------------------------------------
+    for role, cmap_profile in profile.get("col_maps", {}).items():
+        role_df = _get_df(role)
+        available_cols = list(role_df.columns) if role_df is not None else []
+        if role not in st.session_state.col_maps:
+            st.session_state.col_maps[role] = {}
+
+        for logical, actual in cmap_profile.items():
+            if logical.startswith("_"):
+                continue  # skip internal keys (_months, etc.)
+            if actual in available_cols:
+                target_col = actual
+            else:
+                target_col = _fuzzy_match(actual, available_cols)
+                if target_col:
+                    warnings.append(
+                        f"Column **{actual}** not found in *{role}* → using **{target_col}** for *{logical}*."
+                    )
+                else:
+                    warnings.append(
+                        f"Column **{actual}** (*{role} → {logical}*) not found — skipped."
+                    )
+                    continue
+            st.session_state.col_maps[role][logical] = target_col
+            # Also update widget state so selectboxes render the correct option
+            widget_key = f"col_{role}_{logical}" if logical != "SKU" else f"col_{role}_SKU"
+            st.session_state[widget_key] = target_col
+            applied += 1
+
+    return applied, warnings
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # STEP 2 – Column Mapping
 # ──────────────────────────────────────────────────────────────────────────────
 def step2_columns():
     st.header("Step 2 — Column Mapping")
+
+    # ── Mapping Profile ───────────────────────────────────────────────────────
+    with st.expander("💾 Mapping Profile — save or load column configuration", expanded=False):
+        st.caption(
+            "A **Mapping Profile** stores your sheet-to-role and column-to-logical-field "
+            "assignments as a JSON file. Save once, reload on any future run to skip manual "
+            "selection. Month columns are excluded (they are auto-detected each time)."
+        )
+        col_load, col_save = st.columns(2)
+
+        with col_load:
+            st.markdown("**Load a saved profile**")
+            profile_file = st.file_uploader(
+                "Upload profile (.json)", type=["json"], key="profile_upload",
+                help="Select a profile JSON previously exported from this app.",
+            )
+            if profile_file is not None:
+                try:
+                    profile_data = json.loads(profile_file.read())
+                    if profile_data.get("version") != 1:
+                        st.warning("Unrecognised profile version — attempting to apply anyway.")
+                    n_applied, warns = _apply_profile(profile_data)
+                    for w in warns:
+                        st.warning(w)
+                    if n_applied:
+                        st.success(
+                            f"✅ Profile applied — **{n_applied}** mapping(s) pre-filled. "
+                            "Scroll down to review, then click **Confirm**."
+                        )
+                        st.rerun()
+                    else:
+                        st.error("No mappings could be applied. Check that the profile matches this workbook's column names.")
+                except Exception as exc:
+                    st.error(f"Failed to load profile: {exc}")
+
+        with col_save:
+            st.markdown("**Save the current profile**")
+            if st.session_state.col_maps or st.session_state.sheet_map:
+                profile_json = json.dumps(_export_profile(), indent=2)
+                st.download_button(
+                    label="⬇ Download bop_profile.json",
+                    data=profile_json,
+                    file_name="bop_profile.json",
+                    mime="application/json",
+                    help="Save your current sheet and column mappings to reuse on future runs.",
+                )
+                with st.expander("Preview profile JSON", expanded=False):
+                    st.code(profile_json, language="json")
+            else:
+                st.info("Configure at least one column mapping below, then save the profile.")
+
+    st.divider()
+
+    # ── BOP: show auto-mapped summary; manual dropdowns kept as override ───────
+    if st.session_state.get("_is_bop"):
+        st.info(
+            "**SAP BEx BOP format** — columns have been auto-mapped from the SAS and "
+            "Monthly sheets. The mappings below are pre-filled; expand any section to "
+            "override a column if needed."
+        )
+
+        # Measure selector — which Monthly measure to use as the SKU basis in Step 4
+        available_measures = [m for m in MONTHLY_MEASURES if m in st.session_state.sheets]
+        if available_measures:
+            st.subheader("SKU Basis Measure")
+            st.caption(
+                "Choose which row-type from the Monthly sheet represents your SKU actuals. "
+                "This is used in Step 4 to weight SKUs by historical volume."
+            )
+            prev_measure = st.session_state.get("monthly_basis_measure", available_measures[0])
+            idx_m = available_measures.index(prev_measure) if prev_measure in available_measures else 0
+            selected_measure = st.radio(
+                "Use as basis:",
+                available_measures,
+                index=idx_m,
+                horizontal=True,
+                key="monthly_basis_measure_radio",
+            )
+            st.session_state["monthly_basis_measure"] = selected_measure
+            mdf_preview = st.session_state.sheets.get(selected_measure, pd.DataFrame())
+            if not mdf_preview.empty:
+                month_preview = detect_month_columns(mdf_preview)
+                st.caption(
+                    f"**{len(mdf_preview):,} rows** · "
+                    f"{mdf_preview[MONTHLY_SKU_COL].nunique() if MONTHLY_SKU_COL in mdf_preview.columns else '?':,} "
+                    f"unique SKUs · {len(month_preview)} month columns "
+                    + (f"({month_preview[0]} → {month_preview[-1]})" if month_preview else "")
+                )
+        st.divider()
 
     for role in LOGICAL_SHEETS:
         if role not in st.session_state.sheet_map:
