@@ -47,6 +47,7 @@ MONTHLY_HIERARCHY_MAP: dict[str, str] = {
     "Form":         "Family Name 2",
 }
 MONTHLY_SKU_COL = "APO Product"         # SKU identifier in Monthly
+MONTHLY_SFU_VERSION_COL = "SFU_SFU Version"  # composite SFU key (SFU + SFU Version)
 
 MONTHLY_MEASURE_COL = "Calendar Year/Month"
 MONTHLY_MEASURES = [
