@@ -200,6 +200,15 @@ def _show_bop_load_summary(sheets: dict) -> None:
 
     st.success("✅ **SAP BEx BOP export detected** — sheets and columns have been auto-mapped.")
 
+    # Entry Type check — warn if the SAS sheet does not appear to be a BOP file
+    if not sas_df.empty and "Entry Type" in sas_df.columns:
+        first_entry_type = sas_df["Entry Type"].dropna().iloc[0] if not sas_df["Entry Type"].dropna().empty else None
+        if first_entry_type is not None and str(first_entry_type).strip().upper() != "BOP":
+            st.warning(
+                f"⚠️ The first **Entry Type** value in the SAS sheet is **'{first_entry_type}'**, not **'BOP'**. "
+                "This file may not be a standard BOP export — please verify the data before proceeding."
+            )
+
     # Metrics row
     m_cols = st.columns(4)
     m_cols[0].metric("Building Blocks", f"{len(sas_df):,}")
@@ -1363,9 +1372,9 @@ def step7_download():
         return
 
     output_wide = st.session_state.output_wide
-    sal_df = st.session_state.salience_df or pd.DataFrame()
+    sal_df = st.session_state.salience_df if st.session_state.salience_df is not None else pd.DataFrame()
     exc_log = st.session_state.exc_store.log_as_df()
-    val_df = st.session_state.validation_df or pd.DataFrame()
+    val_df = st.session_state.validation_df if st.session_state.validation_df is not None else pd.DataFrame()
     run_settings = st.session_state.run_settings
 
     col1, col2, col3 = st.columns(3)
