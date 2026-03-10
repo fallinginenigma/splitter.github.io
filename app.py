@@ -881,8 +881,24 @@ def step3_filters():
     else:
         st.caption("No historical months found in SAS sheet.")
 
-    # Forecast months: user picks which ones to split
-    prev_forecast = st.session_state.sas_forecast_months_selected or future_months
+    # Forecast months: default = next month through July of the same year
+    def _default_forecast_months(months: list[str]) -> list[str]:
+        next_month = (pd.Timestamp.now().normalize().replace(day=1) + pd.DateOffset(months=1))
+        july_of_year = next_month.replace(month=7)
+        # If next month is already past July, target July of next year
+        if next_month.month > 7:
+            july_of_year = july_of_year + pd.DateOffset(years=1)
+        result = []
+        for m in months:
+            try:
+                ts = pd.to_datetime(m, format="%b-%y")
+                if next_month <= ts <= july_of_year:
+                    result.append(m)
+            except Exception:
+                pass
+        return result or months  # fall back to all if nothing matched
+
+    prev_forecast = st.session_state.sas_forecast_months_selected or _default_forecast_months(future_months)
     selected_forecast = st.multiselect(
         "Select forecast months to split:",
         future_months,
@@ -1193,9 +1209,19 @@ def step4_salience():
         )
 
     if sal_df is not None and not sal_df.empty:
-        display_sal = sal_df.drop(columns=["_split_level"], errors="ignore")
+        display_sal = sal_df.drop(columns=["_split_level"], errors="ignore").copy()
+        if "salience" in display_sal.columns:
+            display_sal["salience %"] = (pd.to_numeric(display_sal["salience"], errors="coerce") * 100).round(2)
+            display_sal = display_sal.drop(columns=["salience"])
         st.subheader(f"Current Salience Table — {len(sal_df)} rows")
-        st.dataframe(display_sal, use_container_width=True, height=300)
+        st.dataframe(
+            display_sal,
+            use_container_width=True,
+            height=300,
+            column_config={
+                "salience %": st.column_config.NumberColumn("Salience %", format="%.2f %%"),
+            },
+        )
 
     # ── BOP Auto-Salience from historical data (Shipments-based, SFU level) ──
     if st.session_state.get("_is_bop"):
