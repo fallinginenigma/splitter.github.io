@@ -679,10 +679,27 @@ def step2_columns():
 
             # Auto-detect months
             detected_months = detect_month_columns(df)
+            # For SAS: default to next-month → July window (same as Step 3 forecast picker)
+            if role == "SAS" and "_months" not in cmap:
+                _next_m = (pd.Timestamp.now().normalize().replace(day=1) + pd.DateOffset(months=1))
+                _july = _next_m.replace(month=7)
+                if _next_m.month > 7:
+                    _july = _july + pd.DateOffset(years=1)
+                _sas_default = []
+                for _m in detected_months:
+                    try:
+                        _ts = pd.to_datetime(_m, format="%b-%y")
+                        if _next_m <= _ts <= _july:
+                            _sas_default.append(_m)
+                    except Exception:
+                        pass
+                _sas_month_default = _sas_default or detected_months
+            else:
+                _sas_month_default = cmap.get("_months", detected_months)
             confirmed_months = st.multiselect(
                 "Month columns",
                 cols_all,
-                default=cmap.get("_months", detected_months),
+                default=[m for m in _sas_month_default if m in cols_all],
                 key=f"months_{role}",
             )
             cmap["_months"] = confirmed_months
@@ -710,7 +727,7 @@ def step2_columns():
 
             # BB_ID column (SAS only)
             if role == "SAS":
-                bb_guess = cmap.get("BB_ID") or _guess_col(cols_all, "BB_ID", "building block", "bb_id")
+                bb_guess = cmap.get("BB_ID") or _guess_col(cols_all, "Plan Name_Brand", "BB_ID", "building block", "bb_id")
                 bb_opts = ["— generate —"] + cols_all
                 bb_idx = bb_opts.index(bb_guess) if bb_guess in bb_opts else 0
                 bb_sel = st.selectbox("Building Block ID column", bb_opts, index=bb_idx, key="col_SAS_BB_ID")
@@ -817,16 +834,19 @@ def _compute_sku_aggregates() -> pd.DataFrame | None:
         if not available:
             continue
 
-        group_cols = [c for c in hier_cols + [MONTHLY_SKU_COL, MONTHLY_SFU_VERSION_COL]
+        # Aggregate at SFU_SFU Version level (not APO Product) across month columns
+        group_cols = [c for c in hier_cols + [MONTHLY_SFU_VERSION_COL]
                       if c in df.columns]
         if not group_cols:
             continue
 
-        numeric = df[available].apply(pd.to_numeric, errors="coerce")
-        agg_series = numeric.sum(axis=1)
         tmp = df[group_cols].copy()
-        tmp[measure] = agg_series.values
-        agg = tmp.groupby(group_cols, dropna=False)[measure].sum().reset_index()
+        numeric = df[available].apply(pd.to_numeric, errors="coerce")
+        for m in available:
+            tmp[m] = numeric[m].values
+        agg = tmp.groupby(group_cols, dropna=False)[available].sum().reset_index()
+        agg[measure] = agg[available].sum(axis=1)
+        agg = agg[group_cols + [measure]]
 
         result = agg if result is None else result.merge(agg, on=group_cols, how="outer")
 
@@ -861,11 +881,19 @@ def step3_filters():
 
     # Build BB_ID if needed
     if st.session_state.bb_id_col not in sas_df.columns:
-        hier_for_hash = [sas_cmap.get(h) for h in LOGICAL_HIER if sas_cmap.get(h) and sas_cmap.get(h) in sas_df.columns]
         sas_df = sas_df.copy()
-        sas_df["BB_ID"] = _make_bb_id(sas_df, hier_for_hash)
+        if "Plan Name" in sas_df.columns and "Brand" in sas_df.columns:
+            sas_df["Plan Name_Brand"] = (
+                sas_df["Plan Name"].astype(str).str.strip()
+                + "_"
+                + sas_df["Brand"].astype(str).str.strip()
+            )
+            st.session_state.bb_id_col = "Plan Name_Brand"
+        else:
+            hier_for_hash = [sas_cmap.get(h) for h in LOGICAL_HIER if sas_cmap.get(h) and sas_cmap.get(h) in sas_df.columns]
+            sas_df["BB_ID"] = _make_bb_id(sas_df, hier_for_hash)
+            st.session_state.bb_id_col = "BB_ID"
         st.session_state.sheets[st.session_state.sheet_map["SAS"]] = sas_df
-        st.session_state.bb_id_col = "BB_ID"
 
     # ---- Month Selection ----
     st.subheader("Months")
@@ -929,7 +957,7 @@ def step3_filters():
         st.subheader("SKU Actuals & Forecasts")
         current_month_start = pd.Timestamp.now().normalize().replace(day=1)
         st.caption(
-            f"Grouped by hierarchy + SFU_SFU Version + APO Product. "
+            f"Grouped by hierarchy + SFU_SFU Version (aggregated across APO Products). "
             f"Shipments = last 12 months before **{current_month_start.strftime('%b-%Y')}**; "
             f"forecasts = **{current_month_start.strftime('%b-%Y')}** onward."
         )
@@ -1172,7 +1200,7 @@ def _compute_bop_salience(sfu_basis_sources: dict) -> pd.DataFrame | None:
                 sal = 0.0
                 flag = "blocked"
 
-            rows.append({**group_id, sku_col: sku_val, "basis": sfu_b, "salience": sal, "flag": flag})
+            rows.append({**group_id, MONTHLY_SFU_VERSION_COL: sfu_ver, sku_col: sku_val, "basis": sfu_b, "salience": sal, "flag": flag})
 
     return pd.DataFrame(rows) if rows else None
 
@@ -1210,10 +1238,21 @@ def step4_salience():
 
     if sal_df is not None and not sal_df.empty:
         display_sal = sal_df.drop(columns=["_split_level"], errors="ignore").copy()
+        # Aggregate to SFU_SFU Version level (sum salience across APO Products per SFU)
+        sku_col_display = hcm.get("SKU", MONTHLY_SKU_COL)
+        if MONTHLY_SFU_VERSION_COL in display_sal.columns:
+            group_disp = [c for c in display_sal.columns
+                          if c not in (sku_col_display, "salience", "basis", "flag")]
+            agg_disp = (
+                display_sal.groupby(group_disp, dropna=False)
+                .agg(salience=("salience", "sum"), basis=("basis", "first"), flag=("flag", "first"))
+                .reset_index()
+            )
+            display_sal = agg_disp
         if "salience" in display_sal.columns:
             display_sal["salience %"] = (pd.to_numeric(display_sal["salience"], errors="coerce") * 100).round(2)
             display_sal = display_sal.drop(columns=["salience"])
-        st.subheader(f"Current Salience Table — {len(sal_df)} rows")
+        st.subheader(f"Current Salience Table — {len(display_sal)} rows (at SFU_SFU Version level)")
         st.dataframe(
             display_sal,
             use_container_width=True,
