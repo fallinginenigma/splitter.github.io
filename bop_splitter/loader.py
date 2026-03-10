@@ -85,9 +85,10 @@ def detect_bop_col_maps(sheets: dict[str, pd.DataFrame]) -> tuple[dict, dict]:
         sas_df = sheets["SAS"]
         sheet_map["SAS"] = "SAS"
         month_cols = detect_month_columns(sas_df)
+        bb_id_default = "Plan Name_Brand" if "Plan Name_Brand" in sas_df.columns else None
         col_maps["SAS"] = {
             **{k: v for k, v in SAS_HIERARCHY_MAP.items() if v in sas_df.columns},
-            "BB_ID": None,          # will be generated in Step 3
+            "BB_ID": bb_id_default,  # "Plan Name_Brand" if available, else generated in Step 3
             "_months": month_cols,
         }
 
@@ -172,6 +173,13 @@ def _load_bop_openpyxl(xl: pd.ExcelFile) -> dict[str, pd.DataFrame]:
     sas_df = xl.parse("SAS", header=0)
     sas_df = _normalize_sas_month_cols(sas_df)   # Timestamp → "Nov-25"
     sas_df.columns = [str(c) for c in sas_df.columns]
+    # Create composite BB_ID: "Plan Name_Brand"
+    if "Plan Name" in sas_df.columns and "Brand" in sas_df.columns:
+        sas_df["Plan Name_Brand"] = (
+            sas_df["Plan Name"].astype(str).str.strip()
+            + "_"
+            + sas_df["Brand"].astype(str).str.strip()
+        )
     sheets["SAS"] = sas_df
 
     # --- Monthly ------------------------------------------------------------
