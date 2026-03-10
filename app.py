@@ -63,11 +63,14 @@ def _init_state():
         "exc_store": ExceptionStore(),
         "output_wide": None,
         "validation_df": None,
-        "split_level": "Sub Brand",
+        "split_level": "Form",        # default global split level
+        "bb_split_levels": {},        # bb_id -> split_level string (per-BB override)
         "basis_source": "Consumption",
         "basis_mode": "last_3",
         "basis_months_selected": [],
         "sas_months_selected": [],
+        "sas_forecast_months_selected": [],  # user-selected future forecast months
+        "sfu_basis_sources": {},      # SFU_SFU Version -> basis source sheet role
         "filters": {},
         "step": 1,
         "max_step": 1,
@@ -833,6 +836,19 @@ def _compute_sku_aggregates() -> pd.DataFrame | None:
 # ──────────────────────────────────────────────────────────────────────────────
 # STEP 3 – Filters & Split Level
 # ──────────────────────────────────────────────────────────────────────────────
+def _classify_months(months: list[str]) -> tuple[list[str], list[str]]:
+    """Split month list into (past_months, future_months) relative to today."""
+    current_month_start = pd.Timestamp.now().normalize().replace(day=1)
+    past, future = [], []
+    for m in months:
+        try:
+            ts = pd.to_datetime(m, format="%b-%y")
+            (past if ts < current_month_start else future).append(m)
+        except Exception:
+            future.append(m)
+    return past, future
+
+
 def step3_filters():
     st.header("Step 3 — Filters & Split Level")
 
@@ -852,15 +868,29 @@ def step3_filters():
         st.session_state.bb_id_col = "BB_ID"
 
     # ---- Month Selection ----
-    st.subheader("Forecast Months")
+    st.subheader("Months")
     all_sas_months = sas_cmap.get("_months", detect_month_columns(sas_df))
-    prev_months = st.session_state.sas_months_selected or all_sas_months
-    sas_months = st.multiselect(
-        "Select which SAS months to split:",
-        all_sas_months,
-        default=[m for m in prev_months if m in all_sas_months],
-        key="sas_months_step3",
+    past_months, future_months = _classify_months(all_sas_months)
+
+    # Actuals (past months): always auto-selected — show as read-only info
+    if past_months:
+        st.info(
+            f"**Actual months (auto-selected — all {len(past_months)}):** "
+            + "  |  ".join(past_months)
+        )
+    else:
+        st.caption("No historical months found in SAS sheet.")
+
+    # Forecast months: user picks which ones to split
+    prev_forecast = st.session_state.sas_forecast_months_selected or future_months
+    selected_forecast = st.multiselect(
+        "Select forecast months to split:",
+        future_months,
+        default=[m for m in prev_forecast if m in future_months],
+        key="forecast_months_step3",
     )
+    st.session_state.sas_forecast_months_selected = selected_forecast
+    sas_months = past_months + selected_forecast
     st.session_state.sas_months_selected = sas_months
 
     # ---- Building Block list ----
@@ -891,7 +921,6 @@ def step3_filters():
             sku_agg = _compute_sku_aggregates()
 
         if sku_agg is not None:
-            # Rename aggregate columns for display
             display_col_map = {
                 "Shipments":             "Shipments — last 12 months",
                 "Statistical Forecast":  "Stat Forecast — future months",
@@ -949,38 +978,187 @@ def step3_filters():
     else:
         st.info(f"**{len(sas_df)}** Building Blocks | **{len(sku_merged)}** SKU rows available")
 
-    # ---- Split Granularity ----
-    st.subheader("Split Granularity")
-    split_level = st.radio(
-        "Split each Building Block at:",
-        list(SPLIT_KEYS.keys()),
-        index=list(SPLIT_KEYS.keys()).index(st.session_state.split_level),
-        horizontal=True,
-        key="split_level_radio",
+    # ---- Per-BB Split Granularity ----
+    st.subheader("Split Granularity per Building Block")
+    st.caption(
+        "Set the hierarchy level at which each Building Block is split to SKUs. "
+        "Default is **Form** (finest level). Edit the 'Split Level' column below."
     )
-    match_desc = " + ".join(SPLIT_KEYS[split_level])
-    st.caption(f"Match keys: **{match_desc}**")
+
+    bb_id_col = st.session_state.bb_id_col or "BB_ID"
+    saved_bb_split_levels = st.session_state.get("bb_split_levels", {})
+
+    if hier_actual and bb_id_col in sas_df.columns:
+        bb_editor_df = (
+            sas_df[hier_actual + [bb_id_col]]
+            .drop_duplicates()
+            .reset_index(drop=True)
+        )
+        bb_editor_df["Split Level"] = bb_editor_df[bb_id_col].map(
+            lambda bid: saved_bb_split_levels.get(bid, "Form")
+        )
+
+        edited_bb = st.data_editor(
+            bb_editor_df,
+            column_config={
+                "Split Level": st.column_config.SelectboxColumn(
+                    "Split Level",
+                    options=list(SPLIT_KEYS.keys()),
+                    required=True,
+                )
+            },
+            disabled=[c for c in bb_editor_df.columns if c != "Split Level"],
+            use_container_width=True,
+            key="bb_split_level_editor",
+            height=min(450, 60 + len(bb_editor_df) * 35),
+        )
+    else:
+        # Fallback: single global split level radio when BB_ID not available
+        edited_bb = None
+        global_split_level = st.radio(
+            "Split each Building Block at:",
+            list(SPLIT_KEYS.keys()),
+            index=list(SPLIT_KEYS.keys()).index(st.session_state.split_level),
+            horizontal=True,
+            key="split_level_radio_fallback",
+        )
+        st.session_state.split_level = global_split_level
 
     if st.button("Confirm Months & Split Level →", type="primary", disabled=bool(sku_problem)):
-        st.session_state.split_level = split_level
+        # Save per-BB split levels
+        if edited_bb is not None and bb_id_col in edited_bb.columns:
+            new_bb_split_levels = dict(zip(edited_bb[bb_id_col], edited_bb["Split Level"]))
+            st.session_state.bb_split_levels = new_bb_split_levels
+            # Use the most common level as the global default (for display purposes)
+            if new_bb_split_levels:
+                from collections import Counter
+                st.session_state.split_level = Counter(new_bb_split_levels.values()).most_common(1)[0][0]
+        else:
+            new_bb_split_levels = {}
+            st.session_state.bb_split_levels = {}
+
         sas_out = sas_df.reset_index(drop=True)
         sku_out = sku_merged.reset_index(drop=True)
         st.session_state.sas_df_filtered = sas_out
         st.session_state.sku_df_filtered = sku_out
 
-        # Auto-compute equal (1/N) salience so Step 4 starts pre-populated
+        # Compute equal salience per unique split level used across BBs
         hcm = hier_col_map_from_state()
-        sal_df, _ = compute_equal_salience(
-            sku_out,
-            split_level,
-            hcm.get("SKU", "SKU"),
-            hcm,
-            st.session_state.exc_store.global_exclusions,
-        )
-        st.session_state.salience_df = sal_df
+        sku_col = hcm.get("SKU", "SKU")
+        global_exclusions = st.session_state.exc_store.global_exclusions
+
+        unique_levels = set(new_bb_split_levels.values()) if new_bb_split_levels else {st.session_state.split_level}
+        sal_parts = []
+        for lvl in unique_levels:
+            part, _ = compute_equal_salience(sku_out, lvl, sku_col, hcm, global_exclusions)
+            if not part.empty:
+                part["_split_level"] = lvl
+                sal_parts.append(part)
+        combined_sal = pd.concat(sal_parts, ignore_index=True) if sal_parts else pd.DataFrame()
+        st.session_state.salience_df = combined_sal
+
         st.session_state.step = max(st.session_state.step, 4)
         st.session_state.max_step = max(st.session_state.max_step, 4)
         st.rerun()
+
+
+def _compute_bop_salience(sfu_basis_sources: dict) -> pd.DataFrame | None:
+    """
+    Compute BOP salience at SFU_SFU Version level.
+
+    Algorithm per split group:
+      1. For each SFU_SFU Version, compute total basis = avg of last 3 past months
+         summed across all APO Products in that SFU (from the SFU's designated source).
+      2. Each APO Product within the SFU shares the SFU total basis equally
+         (SFU_basis / n_APO_Products_in_SFU).
+      3. Normalise within split group so saliences sum to 1.
+    """
+    sku_df = st.session_state.sku_df_filtered
+    if sku_df is None or sku_df.empty:
+        st.error("No SKU data — complete Step 3 first.")
+        return None
+
+    hcm = hier_col_map_from_state()
+    split_level = st.session_state.split_level
+    group_keys_logical = [k for k in SPLIT_KEYS[split_level] if k != "SKU"]
+    group_keys = [hcm.get(k, k) for k in group_keys_logical]
+    valid_group_keys = [k for k in group_keys if k in sku_df.columns]
+    sku_col = hcm.get("SKU", MONTHLY_SKU_COL)
+
+    current_month_start = pd.Timestamp.now().normalize().replace(day=1)
+
+    # Invert sfu_basis_sources: source_role -> [SFU versions using that source]
+    source_to_sfus: dict[str, list] = {}
+    for sfu_ver, src_role in sfu_basis_sources.items():
+        source_to_sfus.setdefault(src_role, []).append(sfu_ver)
+
+    # Step 1: build {(group_vals..., SFU_version): total_SFU_basis}
+    sfu_basis: dict[tuple, float] = {}
+    for src_role, sfu_list in source_to_sfus.items():
+        src_df = _get_df(src_role)
+        if src_df is None or MONTHLY_SFU_VERSION_COL not in src_df.columns:
+            continue
+        cmap = st.session_state.col_maps.get(src_role, {})
+        all_m = cmap.get("_months", detect_month_columns(src_df))
+        past_m = []
+        for m in all_m:
+            try:
+                if pd.to_datetime(m, format="%b-%y") < current_month_start:
+                    past_m.append(m)
+            except Exception:
+                pass
+        last_3 = past_m[-3:] if past_m else []
+        basis_cols = [c for c in last_3 if c in src_df.columns]
+        if not basis_cols:
+            continue
+        sub = src_df[src_df[MONTHLY_SFU_VERSION_COL].isin(sfu_list)].copy()
+        if sub.empty:
+            continue
+        sub["_row_basis"] = sub[basis_cols].apply(pd.to_numeric, errors="coerce").mean(axis=1)
+        agg_keys = [k for k in valid_group_keys if k in sub.columns] + [MONTHLY_SFU_VERSION_COL]
+        for grp_vals, grp in sub.groupby(agg_keys, sort=False, dropna=False):
+            if not isinstance(grp_vals, tuple):
+                grp_vals = (grp_vals,)
+            total = pd.to_numeric(grp["_row_basis"], errors="coerce").sum(min_count=1)
+            sfu_basis[grp_vals] = float(total) if not pd.isna(total) else 0.0
+
+    # Step 2: count APO Products per (group + SFU) in sku_df
+    sfu_n: dict[tuple, int] = {}
+    if sku_col in sku_df.columns and MONTHLY_SFU_VERSION_COL in sku_df.columns:
+        agg_keys_sku = [k for k in valid_group_keys if k in sku_df.columns] + [MONTHLY_SFU_VERSION_COL]
+        for grp_vals, grp in sku_df.groupby(agg_keys_sku, sort=False, dropna=False):
+            if not isinstance(grp_vals, tuple):
+                grp_vals = (grp_vals,)
+            sfu_n[grp_vals] = max(1, grp[sku_col].nunique())
+
+    n_gk = len(valid_group_keys)
+
+    # Step 3: per split group → normalise SFU bases, compute per-APO salience
+    rows = []
+    for grp_vals, grp in sku_df.groupby(valid_group_keys, sort=False, dropna=False):
+        if not isinstance(grp_vals, tuple):
+            grp_vals = (grp_vals,)
+        group_id = dict(zip(valid_group_keys, grp_vals))
+        # Total SFU basis for this split group (all SFU keys that start with grp_vals)
+        total_group_basis = sum(v for k, v in sfu_basis.items() if k[:n_gk] == grp_vals)
+
+        for _, row in grp.iterrows():
+            sku_val = str(row.get(sku_col, "")) if sku_col in grp.columns else ""
+            sfu_ver = row.get(MONTHLY_SFU_VERSION_COL, "") if MONTHLY_SFU_VERSION_COL in grp.columns else ""
+            sfu_key = grp_vals + (sfu_ver,)
+            sfu_b = sfu_basis.get(sfu_key, 0.0)
+            n = sfu_n.get(sfu_key, 1)
+
+            if total_group_basis > 0 and sfu_b > 0:
+                sal = sfu_b / (total_group_basis * n)
+                flag = "computed"
+            else:
+                sal = 0.0
+                flag = "blocked"
+
+            rows.append({**group_id, sku_col: sku_val, "basis": sfu_b, "salience": sal, "flag": flag})
+
+    return pd.DataFrame(rows) if rows else None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1000,15 +1178,89 @@ def step4_salience():
     exc_store = st.session_state.exc_store
 
     # ── Auto salience status ──────────────────────────────────────────────────
-    st.info(
-        f"**Equal split applied automatically** — each Building Block's value is divided equally "
-        f"among the SKUs that match its **{split_level}** criteria "
-        f"({' + '.join(SPLIT_KEYS[split_level])})."
-    )
+    bb_split_levels = st.session_state.get("bb_split_levels", {})
+    if bb_split_levels:
+        level_counts = {}
+        for lvl in bb_split_levels.values():
+            level_counts[lvl] = level_counts.get(lvl, 0) + 1
+        level_summary = ", ".join(f"{cnt} BB(s) at **{lvl}**" for lvl, cnt in level_counts.items())
+        st.info(f"**Equal split applied per Building Block** — {level_summary}.")
+    else:
+        st.info(
+            f"**Equal split applied automatically** — each Building Block's value is divided equally "
+            f"among the SKUs that match its **{split_level}** criteria "
+            f"({' + '.join(SPLIT_KEYS[split_level])})."
+        )
 
     if sal_df is not None and not sal_df.empty:
+        display_sal = sal_df.drop(columns=["_split_level"], errors="ignore")
         st.subheader(f"Current Salience Table — {len(sal_df)} rows")
-        st.dataframe(sal_df, use_container_width=True, height=300)
+        st.dataframe(display_sal, use_container_width=True, height=300)
+
+    # ── BOP Auto-Salience from historical data (Shipments-based, SFU level) ──
+    if st.session_state.get("_is_bop"):
+        with st.expander("BOP Auto-Salience — Shipments-based (SFU Level)", expanded=True):
+            st.caption(
+                "Automatically compute salience from historical data aggregated at **SFU_SFU Version** level. "
+                "Each APO Product's weight = its SFU's total past shipments ÷ number of APO Products in that SFU. "
+                "Select a different basis source per SFU version below."
+            )
+
+            # Discover available SFU versions from Shipments sheet
+            ship_df = _get_df("Shipments")
+            available_basis_sources = [r for r in MONTHLY_MEASURES if r in st.session_state.sheets]
+
+            if ship_df is not None and MONTHLY_SFU_VERSION_COL in ship_df.columns and available_basis_sources:
+                sfu_versions = sorted(ship_df[MONTHLY_SFU_VERSION_COL].dropna().unique().tolist())
+                saved_sfu_sources = st.session_state.get("sfu_basis_sources", {})
+
+                sfu_table = pd.DataFrame({
+                    MONTHLY_SFU_VERSION_COL: sfu_versions,
+                    "Basis Source": [
+                        saved_sfu_sources.get(v, "Shipments") if "Shipments" in available_basis_sources
+                        else available_basis_sources[0]
+                        for v in sfu_versions
+                    ],
+                })
+
+                edited_sfu = st.data_editor(
+                    sfu_table,
+                    column_config={
+                        "Basis Source": st.column_config.SelectboxColumn(
+                            "Basis Source",
+                            options=available_basis_sources,
+                            required=True,
+                        )
+                    },
+                    disabled=[MONTHLY_SFU_VERSION_COL],
+                    use_container_width=True,
+                    key="sfu_basis_editor",
+                    height=min(400, 60 + len(sfu_table) * 35),
+                )
+
+                if st.button("Compute BOP Salience (SFU Level)", type="primary"):
+                    new_sfu_sources = dict(zip(
+                        edited_sfu[MONTHLY_SFU_VERSION_COL],
+                        edited_sfu["Basis Source"],
+                    ))
+                    st.session_state.sfu_basis_sources = new_sfu_sources
+                    with st.spinner("Computing BOP salience…"):
+                        bop_sal = _compute_bop_salience(new_sfu_sources)
+                    if bop_sal is not None and not bop_sal.empty:
+                        st.session_state.salience_df = bop_sal
+                        st.session_state.blocking_groups = []
+                        st.success(f"BOP salience computed — {len(bop_sal):,} rows.")
+                        st.rerun()
+                    else:
+                        st.error(
+                            "Could not compute BOP salience. Ensure the Shipments sheet has past months "
+                            f"and the **{MONTHLY_SFU_VERSION_COL}** column is present."
+                        )
+            else:
+                st.info(
+                    f"BOP auto-salience requires the **Shipments** sheet with a **{MONTHLY_SFU_VERSION_COL}** column. "
+                    "Load a BOP Excel file to enable this feature."
+                )
 
     # ── Optional: override with historical basis ───────────────────────────────
     BASIS_SOURCES = [r for r in SKU_SHEETS if r in st.session_state.sheet_map]
@@ -1290,17 +1542,19 @@ def step6_run():
     sal_df = st.session_state.salience_df
     sas_months = st.session_state.sas_months_selected
     split_level = st.session_state.split_level
+    bb_split_levels = st.session_state.get("bb_split_levels", {})
     bb_id_col = st.session_state.bb_id_col or "BB_ID"
     exc_store = st.session_state.exc_store
     hcm = hier_col_map_from_state()
 
     # Summary
+    per_bb_note = f"per-BB ({len(bb_split_levels)} configured)" if bb_split_levels else split_level
     st.markdown(f"""
 | Parameter | Value |
 |---|---|
 | Building Blocks | {len(sas_df)} |
 | SKU rows | {len(sku_df)} |
-| Split level | **{split_level}** |
+| Split level | **{per_bb_note}** |
 | SAS months | {', '.join(sas_months)} |
 | Global exclusions | {len(exc_store.global_exclusions)} |
 | BB-specific exceptions | {len(exc_store.bb_exceptions)} |
@@ -1315,6 +1569,7 @@ def step6_run():
                     salience_df=sal_df,
                     sas_months=sas_months,
                     split_level=split_level,
+                    bb_split_levels=bb_split_levels,
                     bb_id_col=bb_id_col,
                     sku_col=hcm.get("SKU", "SKU"),
                     hier_col_map=hcm,
