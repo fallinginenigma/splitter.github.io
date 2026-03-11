@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import math
 import pandas as pd
 
 
@@ -33,7 +34,9 @@ def build_excel_output(
             for row_num in range(len(df)):
                 for col_num, col_name in enumerate(df.columns):
                     val = df.iloc[row_num, col_num]
-                    if col_name in pct_cols and isinstance(val, (int, float)):
+                    if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+                        ws.write(row_num + 1, col_num, None)
+                    elif col_name in pct_cols and isinstance(val, (int, float)):
                         ws.write(row_num + 1, col_num, val, pct_fmt)
                     elif isinstance(val, (int, float)) and not isinstance(val, bool):
                         ws.write(row_num + 1, col_num, val, num_fmt)
