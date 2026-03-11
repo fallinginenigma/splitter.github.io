@@ -2,7 +2,6 @@
 
 ## Phase 1: Blueprint (Vision & Logic)
 - [ ] Answer Discovery Questions
-- [ ] Define JSON Data Schema in `gemini.md`
 - [ ] Blueprint approved
 
 ## Phase 2: Link (Connectivity)
@@ -22,4 +21,3 @@
 ## Phase 5: Trigger (Deployment)
 - [ ] Move logic to production cloud environment
 - [ ] Setup automation/triggers
-- [ ] Finalize Maintenance Log in `gemini.md`

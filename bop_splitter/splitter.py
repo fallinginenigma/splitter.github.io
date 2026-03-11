@@ -10,12 +10,12 @@ from .exceptions import ExceptionStore
 
 def run_split(
     sas_df: pd.DataFrame,
-    sku_df: pd.DataFrame,
+    sfuv_df: pd.DataFrame,
     salience_df: pd.DataFrame,
     sas_months: list[str],
     split_level: str,
     bb_id_col: str,
-    sku_col: str,
+    sfuv_col: str,
     hier_col_map: dict[str, str],  # logical -> actual column name
     exc_store: ExceptionStore,
     bb_split_levels: dict[str, str] | None = None,  # bb_id -> split_level override
@@ -31,7 +31,8 @@ def run_split(
       validation: DataFrame with issues
     """
     bb_split_levels = bb_split_levels or {}
-    sku_id_col = hier_col_map.get("SKU", sku_col)
+    sfuv_id_col = hier_col_map.get("SFU_v", sfuv_col)
+    specific_sfuv_col = hier_col_map.get("SFU_v") # Case where SFU_v is directly mapped in SAS
 
     # Pre-build salience sub-frames indexed by split level for fast per-BB lookup
     # salience_df may have a _split_level column (set when per-BB levels are used)
@@ -46,13 +47,13 @@ def run_split(
         sal_by_level[lvl] = sub
 
     def _get_bb_salience(bb_level: str, bb_group_vals: tuple, bb_group_cols: list[str]) -> dict[str, float]:
-        """Filter salience table to this BB's group and return {sku: salience}."""
+        """Filter salience table to this BB's group and return {sfuv: salience}."""
         sal_sub = sal_by_level.get(bb_level, salience_df)
         for col, val in zip(bb_group_cols, bb_group_vals):
             if col in sal_sub.columns:
                 sal_sub = sal_sub[sal_sub[col].astype(str) == str(val)]
         return {
-            str(row.get(sku_id_col, "")): float(row.get("salience", 0) or 0)
+            str(row.get(sfuv_id_col, "")): float(row.get("salience", 0) or 0)
             for _, row in sal_sub.iterrows()
         }
 
@@ -62,58 +63,71 @@ def run_split(
     validation_issues: list[dict] = []
 
     # Finest-level group keys for output column ordering
-    finest_group_keys = [hier_col_map.get(k, k) for k in SPLIT_KEYS["Form"] if k != "SKU"]
+    finest_group_keys = [hier_col_map.get(k, k) for k in SPLIT_KEYS["Form"] if k != "SFU_v"]
 
     for bb_idx, bb_row in sas_df.iterrows():
         bb_id = str(bb_row.get(bb_id_col, f"BB_{bb_idx}"))
         bb_level = bb_split_levels.get(bb_id, split_level)
 
-        bb_group_keys_logical = [k for k in SPLIT_KEYS[bb_level] if k != "SKU"]
-        bb_sas_keys = [hier_col_map.get(k, k) for k in bb_group_keys_logical]
-        bb_group_vals = tuple(bb_row.get(c, "") for c in bb_sas_keys)
+        # 1. Target specific SFU_v if available in SAS row
+        pinned_sfuv = str(bb_row.get(specific_sfuv_col, "")).strip() if specific_sfuv_col in bb_row.index else ""
 
-        # Find matching SKU rows
-        mask = pd.Series([True] * len(sku_df), index=sku_df.index)
-        for col, val in zip(bb_sas_keys, bb_group_vals):
-            if col in sku_df.columns:
-                mask &= sku_df[col].astype(str) == str(val)
-        matched_skus_df = sku_df[mask]
+        # Defaults to avoid NameError if pinned
+        bb_sas_keys: list[str] = []
+        bb_group_vals: tuple = ()
 
-        if matched_skus_df.empty:
+        if pinned_sfuv and pinned_sfuv != "" and pinned_sfuv != "nan":
+            # Force split level to fixed SFU_v
+            mask = sfuv_df[sfuv_id_col].astype(str) == pinned_sfuv
+            matched_sfuvs_df = sfuv_df[mask]
+        else:
+            bb_group_keys_logical = [k for k in SPLIT_KEYS[bb_level] if k != "SFU_v"]
+            bb_sas_keys = [hier_col_map.get(k, k) for k in bb_group_keys_logical]
+            bb_group_vals = tuple(bb_row.get(c, "") for c in bb_sas_keys)
+
+            # Find matching SFU_v rows
+            mask = pd.Series([True] * len(sfuv_df), index=sfuv_df.index)
+            for col, val in zip(bb_sas_keys, bb_group_vals):
+                if col in sfuv_df.columns:
+                    mask &= sfuv_df[col].astype(str) == str(val)
+            matched_sfuvs_df = sfuv_df[mask]
+
+        if matched_sfuvs_df.empty:
             validation_issues.append({
                 "type": "unmatched_BB",
                 "bb_id": bb_id,
-                "group": dict(zip(bb_sas_keys, bb_group_vals)),
-                "detail": "No matching SKUs found for this building block.",
+                "detail": f"No matching SFU_vs found for this building block (pinned={pinned_sfuv}).",
             })
             continue
 
-        all_skus = matched_skus_df[sku_id_col].astype(str).tolist() if sku_id_col in matched_skus_df.columns else []
-        eligible_skus = exc_store.get_eligible_skus(bb_id, all_skus)
+        all_sfuvs = matched_sfuvs_df[sfuv_id_col].astype(str).tolist() if sfuv_id_col in matched_sfuvs_df.columns else []
+        eligible_sfuvs = exc_store.get_eligible_skus(bb_id, all_sfuvs)
 
-        if not eligible_skus:
+        if not eligible_sfuvs:
             validation_issues.append({
                 "type": "empty_eligible_set",
                 "bb_id": bb_id,
-                "group": dict(zip(bb_sas_keys, bb_group_vals)),
-                "detail": "All SKUs excluded — no eligible SKUs remain.",
+                "detail": "All SFU_vs excluded — no eligible items remain.",
             })
             continue
 
         # Per-BB salience lookup (filtered to this BB's group at its split level)
         bb_sal_lookup = _get_bb_salience(bb_level, bb_group_vals, bb_sas_keys)
 
-        # Register SKU metadata (use finest available group keys for output)
-        for _, sku_row in matched_skus_df.iterrows():
-            sku_val = str(sku_row.get(sku_id_col, ""))
-            if sku_val not in eligible_skus:
+        # Register SFU_v metadata (use finest available group keys for output)
+        for _, sfuv_row in matched_sfuvs_df.iterrows():
+            sfuv_val = str(sfuv_row.get(sfuv_id_col, ""))
+            if sfuv_val not in eligible_sfuvs:
                 continue
-            sku_key = bb_group_vals + (sku_val,)
-            if sku_key not in sku_meta:
-                meta = {c: sku_row.get(c, "") for c in finest_group_keys if c in sku_row.index}
-                meta[sku_id_col] = sku_val
-                sku_meta[sku_key] = meta
-                output_rows[sku_key] = {m: 0.0 for m in sas_months}
+            # use a mock group val if pinned
+            if pinned_sfuv:
+                bb_group_vals = ("PINNED",)
+            sfuv_key = bb_group_vals + (sfuv_val,)
+            if sfuv_key not in sku_meta:
+                meta = {c: sfuv_row.get(c, "") for c in finest_group_keys if c in sfuv_row.index}
+                meta[sfuv_id_col] = sfuv_val
+                sku_meta[sfuv_key] = meta
+                output_rows[sfuv_key] = {m: 0.0 for m in sas_months}
 
         for month in sas_months:
             bb_val = pd.to_numeric(bb_row.get(month, 0), errors="coerce")
@@ -123,10 +137,10 @@ def run_split(
             # Fixed quantities
             fixed_total = 0.0
             fixed_alloc: dict[str, float] = {}
-            for sku_val in eligible_skus:
-                fq = exc_store.get_fixed_qty(bb_id, sku_val, month)
+            for sfuv_val in eligible_sfuvs:
+                fq = exc_store.get_fixed_qty(bb_id, sfuv_val, month)
                 if fq is not None:
-                    fixed_alloc[sku_val] = fq
+                    fixed_alloc[sfuv_val] = fq
                     fixed_total += fq
 
             remaining = bb_val - fixed_total
@@ -141,24 +155,24 @@ def run_split(
                 })
                 remaining = 0.0
 
-            proportional_skus = [s for s in eligible_skus if s not in fixed_alloc]
+            proportional_sfuvs = [s for s in eligible_sfuvs if s not in fixed_alloc]
 
-            sal_vals = {sku_val: bb_sal_lookup.get(sku_val, 0.0) for sku_val in proportional_skus}
+            sal_vals = {sfuv_val: bb_sal_lookup.get(sfuv_val, 0.0) for sfuv_val in proportional_sfuvs}
             sal_total = sum(sal_vals.values())
 
-            for sku_val in eligible_skus:
-                sku_key = bb_group_vals + (sku_val,)
-                if sku_key not in output_rows:
-                    output_rows[sku_key] = {m: 0.0 for m in sas_months}
+            for sfuv_val in eligible_sfuvs:
+                sfuv_key = bb_group_vals + (sfuv_val,)
+                if sfuv_key not in output_rows:
+                    output_rows[sfuv_key] = {m: 0.0 for m in sas_months}
 
-                if sku_val in fixed_alloc:
-                    output_rows[sku_key][month] = output_rows[sku_key].get(month, 0.0) + fixed_alloc[sku_val]
+                if sfuv_val in fixed_alloc:
+                    output_rows[sfuv_key][month] = output_rows[sfuv_key].get(month, 0.0) + fixed_alloc[sfuv_val]
                 elif sal_total > 0:
-                    share = sal_vals.get(sku_val, 0.0) / sal_total
-                    output_rows[sku_key][month] = output_rows[sku_key].get(month, 0.0) + remaining * share
+                    share = sal_vals.get(sfuv_val, 0.0) / sal_total
+                    output_rows[sfuv_key][month] = output_rows[sfuv_key].get(month, 0.0) + remaining * share
                 else:
-                    if proportional_skus:
-                        output_rows[sku_key][month] = output_rows[sku_key].get(month, 0.0) + remaining / len(proportional_skus)
+                    if proportional_sfuvs:
+                        output_rows[sfuv_key][month] = output_rows[sfuv_key].get(month, 0.0) + remaining / len(proportional_sfuvs)
                     validation_issues.append({
                         "type": "zero_salience_fallback",
                         "bb_id": bb_id,
@@ -168,16 +182,16 @@ def run_split(
 
     # Assemble wide output
     if not output_rows:
-        front_cols = [c for c in finest_group_keys if c] + [sku_id_col]
+        front_cols = [c for c in finest_group_keys if c] + [sfuv_id_col]
         output_wide = pd.DataFrame(columns=front_cols + sas_months)
     else:
         records = []
-        for sku_key, month_vals in output_rows.items():
-            meta = sku_meta.get(sku_key, {})
+        for sfuv_key, month_vals in output_rows.items():
+            meta = sku_meta.get(sfuv_key, {})
             record = {**meta, **month_vals}
             records.append(record)
         output_wide = pd.DataFrame(records)
-        front_cols = [c for c in finest_group_keys if c in output_wide.columns] + [sku_id_col]
+        front_cols = [c for c in finest_group_keys if c in output_wide.columns] + [sfuv_id_col]
         front_cols = [c for c in front_cols if c in output_wide.columns]
         month_cols_present = [m for m in sas_months if m in output_wide.columns]
         output_wide = output_wide[front_cols + month_cols_present]

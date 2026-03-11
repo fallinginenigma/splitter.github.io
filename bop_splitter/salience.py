@@ -12,7 +12,7 @@ SPLIT_KEYS: dict[str, list[str]] = {
     "Brand": ["Ctry", "SMO Category", "Brand"],
     "Sub Brand": ["Ctry", "SMO Category", "Brand", "Sub Brand"],
     "Form": ["Ctry", "SMO Category", "Brand", "Sub Brand", "Form"],
-    "SKU": ["Ctry", "SMO Category", "Brand", "Sub Brand", "Form", "SKU"],
+    "SFU_v": ["Ctry", "SMO Category", "Brand", "Sub Brand", "Form", "SFU_v"],
 }
 
 
@@ -49,10 +49,10 @@ def compute_basis(
 
 
 def compute_salience(
-    sku_df: pd.DataFrame,
+    sfuv_df: pd.DataFrame,
     basis: pd.Series,
     split_level: str,
-    sku_col: str,
+    sfuv_col: str,
     hier_col_map: dict[str, str],
     global_exclusions: set[str] | None = None,
     overrides: dict | None = None,
@@ -61,23 +61,23 @@ def compute_salience(
     Compute salience weights.
 
     Returns:
-      salience_df: DataFrame with columns = group_keys + [sku_col, 'basis', 'salience', 'flag']
+      salience_df: DataFrame with columns = group_keys + [sfuv_col, 'basis', 'salience', 'flag']
       blocking_groups: list of dicts describing zero/missing basis groups
     """
     global_exclusions = global_exclusions or set()
     overrides = overrides or {}
 
-    group_keys = [hier_col_map.get(k, k) for k in SPLIT_KEYS[split_level] if k != "SKU"]
-    if split_level == "SKU":
+    group_keys = [hier_col_map.get(k, k) for k in SPLIT_KEYS[split_level] if k != "SFU_v"]
+    if split_level == "SFU_v":
         group_keys = [hier_col_map.get(k, k) for k in SPLIT_KEYS["Form"]]
 
-    working = sku_df.copy()
+    working = sfuv_df.copy()
     working["_basis"] = basis.values if len(basis) == len(working) else np.nan
 
     # Apply global exclusions
-    sku_mapped = hier_col_map.get("SKU", "SKU")
-    if sku_mapped in working.columns:
-        working = working[~working[sku_mapped].isin(global_exclusions)].copy()
+    sfuv_mapped = hier_col_map.get("SFU_v", "SFU_v")
+    if sfuv_mapped in working.columns:
+        working = working[~working[sfuv_mapped].isin(global_exclusions)].copy()
 
     rows = []
     blocking_groups = []
@@ -97,14 +97,14 @@ def compute_salience(
                 "n_skus": len(grp),
             })
             for _, row in grp.iterrows():
-                sku_val = row.get(sku_mapped, "")
-                override_key = (tuple(group_vals), sku_val)
+                sfuv_val = row.get(sfuv_mapped, "")
+                override_key = (tuple(group_vals), sfuv_val)
                 sal = overrides.get(override_key, np.nan)
-                rows.append({**group_id, sku_mapped: sku_val, "basis": row["_basis"], "salience": sal, "flag": "manual_override" if not pd.isna(sal) else "blocked"})
+                rows.append({**group_id, sfuv_mapped: sfuv_val, "basis": row["_basis"], "salience": sal, "flag": "manual_override" if not pd.isna(sal) else "blocked"})
         else:
             for _, row in grp.iterrows():
-                sku_val = row.get(sku_mapped, "")
-                override_key = (tuple(group_vals), sku_val)
+                sfuv_val = row.get(sfuv_mapped, "")
+                override_key = (tuple(group_vals), sfuv_val)
                 if override_key in overrides:
                     sal = overrides[override_key]
                     flag = "manual_override"
@@ -112,16 +112,16 @@ def compute_salience(
                     b = pd.to_numeric(row["_basis"], errors="coerce")
                     sal = (b / total) if not pd.isna(b) else 0.0
                     flag = "computed"
-                rows.append({**group_id, sku_mapped: sku_val, "basis": row["_basis"], "salience": sal, "flag": flag})
+                rows.append({**group_id, sfuv_mapped: sfuv_val, "basis": row["_basis"], "salience": sal, "flag": flag})
 
     salience_df = pd.DataFrame(rows)
     return salience_df, blocking_groups
 
 
 def compute_equal_salience(
-    sku_df: pd.DataFrame,
+    sfuv_df: pd.DataFrame,
     split_level: str,
-    sku_col: str,
+    sfuv_col: str,
     hier_col_map: dict[str, str],
     global_exclusions: set[str] | None = None,
 ) -> tuple[pd.DataFrame, list[dict]]:
@@ -132,13 +132,13 @@ def compute_equal_salience(
     Returns the same schema as compute_salience so callers are interchangeable.
     """
     global_exclusions = global_exclusions or set()
-    group_keys_logical = [k for k in SPLIT_KEYS[split_level] if k != "SKU"]
+    group_keys_logical = [k for k in SPLIT_KEYS[split_level] if k != "SFU_v"]
     group_keys = [hier_col_map.get(k, k) for k in group_keys_logical]
-    sku_mapped = hier_col_map.get("SKU", sku_col)
+    sfuv_mapped = hier_col_map.get("SFU_v", sfuv_col)
 
-    working = sku_df.copy()
-    if sku_mapped in working.columns:
-        working = working[~working[sku_mapped].isin(global_exclusions)].copy()
+    working = sfuv_df.copy()
+    if sfuv_mapped in working.columns:
+        working = working[~working[sfuv_mapped].isin(global_exclusions)].copy()
 
     rows = []
     valid_group_keys = [k for k in group_keys if k in working.columns]
@@ -152,13 +152,13 @@ def compute_equal_salience(
         n = len(grp)
         sal = 1.0 / n if n > 0 else 0.0
         for _, row in grp.iterrows():
-            sku_val = row.get(sku_mapped, "") if sku_mapped in grp.columns else ""
-            rows.append({**group_id, sku_mapped: sku_val, "basis": 1.0, "salience": sal, "flag": "equal"})
+            sfuv_val = row.get(sfuv_mapped, "") if sfuv_mapped in grp.columns else ""
+            rows.append({**group_id, sfuv_mapped: sfuv_val, "basis": 1.0, "salience": sal, "flag": "equal"})
 
     return pd.DataFrame(rows), []
 
 
-def normalize_salience(salience_df: pd.DataFrame, group_keys: list[str], sku_col: str) -> pd.DataFrame:
+def normalize_salience(salience_df: pd.DataFrame, group_keys: list[str], sfuv_col: str) -> pd.DataFrame:
     """Force salience within each group to sum to 1."""
     df = salience_df.copy()
     df["salience"] = pd.to_numeric(df["salience"], errors="coerce").fillna(0)

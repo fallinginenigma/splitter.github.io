@@ -11,7 +11,9 @@
 
 ### User Experience (UX) & Navigation
 - [x] **State Persistence**: Implemented logic to preserve all user selections when navigating between steps.
-- [x] **Automated Selections**: Added auto-picking for forecast months (Next Month → July) and actuals months.
+- [x] **Automated Selections**: Added auto-picking for forecast months (Next Month → July) and strictly past months for Shipments. Expanded SFU_v autopicking to FFF and Stat forecasts.
+- [x] **SAS Month Defaults**: Updated SAS to autopick all future months instead of a restricted window.
+- [x] **Month Filtering Bug**: Fixed issue where Shipments was autopicking future months due to over-aggressive pre-filling in the loader.
 - [x] **Improved Visibility**: Enhanced UI to show salience as a percentage and added warnings for Entry Type BOP.
 - [x] **Efficiency Improvements**: Streamlined Step 3 with BB lists, month selection, and default Sub Brand granularity.
 - [x] **SFU Aggregation**: Added SFU-level aggregation for better data overview.

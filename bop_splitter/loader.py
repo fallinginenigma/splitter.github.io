@@ -3,6 +3,7 @@ standard SAP BEx/HANA BOP export format (SAS + Monthly sheets).
 """
 from __future__ import annotations
 
+import datetime
 import io
 import re
 from pathlib import Path
@@ -35,8 +36,8 @@ SAS_HIERARCHY_MAP: dict[str, str] = {
     "Sub Brand":    "Sub Brand",
     "Form":         "Form",
 }
-# Optional pinned-SKU column in SAS (only populated when BB is pegged to 1 SKU)
-SAS_SKU_COL = "Specific SKU"
+# Optional pinned-SFU_v column in SAS (only populated when BB is pegged to 1 SFU_v)
+SAS_SFU_V_COL = "Specific SFU_v"
 
 # Logical name → actual column name in the Monthly sheet (before renaming)
 MONTHLY_HIERARCHY_MAP: dict[str, str] = {
@@ -46,7 +47,7 @@ MONTHLY_HIERARCHY_MAP: dict[str, str] = {
     "Sub Brand":    "Family Name 1",
     "Form":         "Family Name 2",
 }
-MONTHLY_SKU_COL = "APO Product"         # SKU identifier in Monthly
+MONTHLY_SFU_V_COL = "APO Product"         # SFU_v identifier in Monthly
 MONTHLY_SFU_VERSION_COL = "SFU_SFU Version"  # composite SFU key (SFU + SFU Version)
 
 MONTHLY_MEASURE_COL = "Calendar Year/Month"
@@ -89,7 +90,6 @@ def detect_bop_col_maps(sheets: dict[str, pd.DataFrame]) -> tuple[dict, dict]:
         col_maps["SAS"] = {
             **{k: v for k, v in SAS_HIERARCHY_MAP.items() if v in sas_df.columns},
             "BB_ID": bb_id_default,  # "Plan Name_Brand" if available, else generated in Step 3
-            "_months": month_cols,
         }
 
     # Measure-derived sheets (Shipments, Statistical Forecast, …) -------
@@ -100,13 +100,11 @@ def detect_bop_col_maps(sheets: dict[str, pd.DataFrame]) -> tuple[dict, dict]:
         sheet_map[measure] = measure
         # After renaming, hierarchy cols already use the SAS/logical names.
         hier_map = {k: k for k in SAS_HIERARCHY_MAP if k in mdf.columns}
-        month_cols = detect_month_columns(mdf)
         entry = {
             **hier_map,
-            "_months": month_cols,
         }
-        if MONTHLY_SKU_COL in mdf.columns:
-            entry["SKU"] = MONTHLY_SKU_COL
+        if MONTHLY_SFU_V_COL in mdf.columns:
+            entry["SFU_v"] = MONTHLY_SFU_V_COL
         col_maps[measure] = entry
 
     return sheet_map, col_maps
@@ -155,7 +153,7 @@ def _load_openpyxl(buf: io.BytesIO) -> dict[str, pd.DataFrame]:
     sheets: dict[str, pd.DataFrame] = {}
     for sheet in xl.sheet_names:
         df = xl.parse(sheet, header=0)
-        df.columns = [str(c) for c in df.columns]
+        df.columns = [normalize_month_label(str(c)) for c in df.columns]
         sheets[sheet] = df
     return sheets
 
@@ -172,7 +170,7 @@ def _load_bop_openpyxl(xl: pd.ExcelFile) -> dict[str, pd.DataFrame]:
     # --- SAS ----------------------------------------------------------------
     sas_df = xl.parse("SAS", header=0)
     sas_df = _normalize_sas_month_cols(sas_df)   # Timestamp → "Nov-25"
-    sas_df.columns = [str(c) for c in sas_df.columns]
+    sas_df.columns = [normalize_month_label(str(c)) for c in sas_df.columns]
     # Create composite BB_ID: "Plan Name_Brand"
     if "Plan Name" in sas_df.columns and "Brand" in sas_df.columns:
         sas_df["Plan Name_Brand"] = (
@@ -241,7 +239,7 @@ def _load_xlsb(buf: io.BytesIO) -> dict[str, pd.DataFrame]:
             if rows:
                 df = pd.DataFrame(
                     rows[1:],
-                    columns=[str(c) if c is not None else "" for c in rows[0]],
+                    columns=[normalize_month_label(str(c)) if c is not None else "" for c in rows[0]],
                 )
                 sheets[sheet_name] = df
             else:
@@ -254,12 +252,15 @@ def _load_xlsb(buf: io.BytesIO) -> dict[str, pd.DataFrame]:
 # ---------------------------------------------------------------------------
 
 def _normalize_sas_month_cols(df: pd.DataFrame) -> pd.DataFrame:
-    """Rename ``pd.Timestamp`` column headers to ``'Nov-25'`` string format."""
-    rename = {
-        col: col.strftime("%b-%y")
-        for col in df.columns
-        if isinstance(col, pd.Timestamp)
-    }
+    """Rename date-like column headers to 'MMM-yy' (e.g. 'Aug-25') format."""
+    rename = {}
+    for col in df.columns:
+        if isinstance(col, (pd.Timestamp, datetime.datetime)):
+            rename[col] = col.strftime("%b-%y")
+        elif isinstance(col, str):
+            norm = normalize_month_label(col)
+            if norm != col and MONTH_PATTERN.match(norm):
+                rename[col] = norm
     return df.rename(columns=rename) if rename else df
 
 
@@ -277,8 +278,22 @@ def _normalize_monthly_month_label(col: str) -> str:
 # ---------------------------------------------------------------------------
 
 def detect_month_columns(df: pd.DataFrame) -> list[str]:
-    """Return column names that look like month labels (e.g. ``'Nov-25'``)."""
-    return [c for c in df.columns if MONTH_PATTERN.match(str(c).strip())]
+    """Return column names that look like month labels.
+    Handles 'Nov-25' strings and pd.Timestamp objects.
+    """
+    month_cols = []
+    for c in df.columns:
+        if isinstance(c, (pd.Timestamp, datetime.datetime)):
+            month_cols.append(c.strftime("%b-%y"))
+        elif MONTH_PATTERN.match(str(c).strip()):
+            month_cols.append(normalize_month_label(str(c)))
+        elif re.match(r"^\d{4}-\d{1,2}-\d{1,2}", str(c)):
+            try:
+                ts = pd.to_datetime(str(c))
+                month_cols.append(ts.strftime("%b-%y"))
+            except:
+                pass
+    return month_cols
 
 
 def detect_hierarchy_columns(df: pd.DataFrame, month_cols: list[str]) -> list[str]:
@@ -288,11 +303,33 @@ def detect_hierarchy_columns(df: pd.DataFrame, month_cols: list[str]) -> list[st
 
 
 def normalize_month_label(label: str) -> str:
-    """Normalise a month label to Title-case + dash, e.g. ``'jan 26'`` → ``'Jan-26'``."""
-    label = label.strip()
+    """Normalise a month label to Title-case + dash, e.g. ``'jan 26'`` → ``'Jan-26'``.
+    Also handles timestamp-style strings like '2025-08-01'.
+    """
+    label = str(label).strip()
+    if not label:
+        return label
+
+    # 1. Handle timestamp-style strings (e.g. 2025-08-01 00:00:00)
+    if re.match(r"^\d{4}-\d{2}-\d{2}", label):
+        try:
+            ts = pd.to_datetime(label)
+            return ts.strftime("%b-%y")
+        except:
+            pass
+
+    # 2. Existing pattern-based normalization (Jan-25, Jan 25, etc.)
     m = MONTH_PATTERN.match(label)
     if not m:
+        # One last try: if it looks like there's a month name and a year
+        try:
+            ts = pd.to_datetime(label)
+            if 2010 < ts.year < 2050:
+                return ts.strftime("%b-%y")
+        except:
+            pass
         return label
+
     parts = re.split(r"[- ]+", label, maxsplit=1)
     if len(parts) == 2:
         month, year = parts
