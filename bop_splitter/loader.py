@@ -55,6 +55,8 @@ MONTHLY_MEASURES = [
     "Shipments",
     "Statistical Forecast",
     "Final Fcst to Finance",
+    "Retailing",
+    "Consumption",
 ]
 MONTHLY_HEADER_ROW = 13                 # 0-indexed row that contains column headers
 

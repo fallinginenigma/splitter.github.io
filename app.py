@@ -73,7 +73,8 @@ def _init_state():
         "basis_months_selected": [],
         "sas_months_selected": [],
         "sas_forecast_months_selected": [],  # user-selected future forecast months
-        "sfu_basis_sources": {},      # SFU_SFU Version -> basis source sheet role
+        "sfu_basis_sources": {},      # SFU_SFU Version -> basis config (source, mode, selected)
+        "sfu_manual_months": [],      # Global manual month selector for SFU basis
         "filters": {},
         "step": 1,
         "max_step": 1,
@@ -1223,16 +1224,11 @@ def step3_filters():
         st.rerun()
 
 
-def _compute_bop_salience(sfu_basis_sources: dict) -> pd.DataFrame | None:
+def _compute_bop_salience(sfu_configs: dict) -> pd.DataFrame | None:
     """
     Compute BOP salience at SFU_SFU Version level.
 
-    Algorithm per split group:
-      1. For each SFU_SFU Version, compute total basis = avg of last 3 past months
-         summed across all APO Products in that SFU (from the SFU's designated source).
-      2. Each APO Product within the SFU shares the SFU total basis equally
-         (SFU_basis / n_APO_Products_in_SFU).
-      3. Normalise within split group so saliences sum to 1.
+    sfu_configs: dict {SFU_version: {"source": str, "mode": str, "selected": list[str]}}
     """
     sku_df = st.session_state.sku_df_filtered
     if sku_df is None or sku_df.empty:
@@ -1248,40 +1244,67 @@ def _compute_bop_salience(sfu_basis_sources: dict) -> pd.DataFrame | None:
 
     current_month_start = pd.Timestamp.now().normalize().replace(day=1)
 
-    # Invert sfu_basis_sources: source_role -> [SFU versions using that source]
-    source_to_sfus: dict[str, list] = {}
-    for sfu_ver, src_role in sfu_basis_sources.items():
-        source_to_sfus.setdefault(src_role, []).append(sfu_ver)
-
     # Step 1: build {(group_vals..., SFU_version): total_SFU_basis}
     sfu_basis: dict[tuple, float] = {}
-    for src_role, sfu_list in source_to_sfus.items():
+
+    # Group SFUs by their configuration (source, mode, selected_months) to batch process
+    config_to_sfus: dict[tuple, list] = {}
+    for sfu_ver, cfg in sfu_configs.items():
+        # Handle legacy simple role string or modern dict
+        if isinstance(cfg, str):
+            cfg = {"source": cfg, "mode": "last_3", "selected": []}
+        
+        # Tuple-ize the config to use as a key
+        config_key = (cfg["source"], cfg["mode"], tuple(sorted(cfg.get("selected", []))))
+        config_to_sfus.setdefault(config_key, []).append(sfu_ver)
+
+    for (src_role, mode, selected_m), sfu_list in config_to_sfus.items():
         src_df = _get_df(src_role)
         if src_df is None or MONTHLY_SFU_VERSION_COL not in src_df.columns:
             continue
+            
         cmap = st.session_state.col_maps.get(src_role, {})
-        all_m = cmap.get("_months", detect_month_columns(src_df))
-        past_m = []
-        for m in all_m:
-            try:
-                if pd.to_datetime(m, format="%b-%y") < current_month_start:
-                    past_m.append(m)
-            except Exception:
-                pass
-        last_3 = past_m[-3:] if past_m else []
-        basis_cols = [c for c in last_3 if c in src_df.columns]
+        all_months = cmap.get("_months", detect_month_columns(src_df))
+        
+        # Determine basis columns based on mode
+        if mode == "selected":
+            basis_cols = [c for c in selected_m if c in src_df.columns]
+        else:
+            # Filter to past months first
+            past_m = []
+            for m in all_months:
+                try:
+                    if pd.to_datetime(m, format="%b-%y") < current_month_start:
+                        past_m.append(m)
+                except:
+                    pass
+            
+            if mode.startswith("last_"):
+                n = int(mode.split("_")[1])
+                basis_cols = past_m[-n:] if len(past_m) >= n else past_m
+            else:
+                basis_cols = past_m
+        
+        basis_cols = [c for c in basis_cols if c in src_df.columns]
         if not basis_cols:
             continue
+            
         sub = src_df[src_df[MONTHLY_SFU_VERSION_COL].isin(sfu_list)].copy()
         if sub.empty:
             continue
+            
+        # Compute row-level basis as mean of basis_cols
         sub["_row_basis"] = sub[basis_cols].apply(pd.to_numeric, errors="coerce").mean(axis=1)
+        
+        # Aggregate to (Group + SFU) level
         agg_keys = [k for k in valid_group_keys if k in sub.columns] + [MONTHLY_SFU_VERSION_COL]
-        for grp_vals, grp in sub.groupby(agg_keys, sort=False, dropna=False):
-            if not isinstance(grp_vals, tuple):
-                grp_vals = (grp_vals,)
-            total = pd.to_numeric(grp["_row_basis"], errors="coerce").sum(min_count=1)
-            sfu_basis[grp_vals] = float(total) if not pd.isna(total) else 0.0
+        # We sum the bases of all rows within the SFU
+        agg = sub.groupby(agg_keys, sort=False, dropna=False)["_row_basis"].sum(min_count=1).reset_index()
+        
+        for _, row in agg.iterrows():
+            grp_vals = tuple(row[k] for k in agg_keys)
+            val = row["_row_basis"]
+            sfu_basis[grp_vals] = float(val) if not pd.isna(val) else 0.0
 
     # Step 2: count APO Products per (group + SFU) in sku_df
     sfu_n: dict[tuple, int] = {}
@@ -1445,23 +1468,42 @@ def step4_salience():
 
             if ship_df is not None and MONTHLY_SFU_VERSION_COL in ship_df.columns and available_basis_sources:
                 sfu_versions = sorted(ship_df[MONTHLY_SFU_VERSION_COL].dropna().unique().tolist())
-                saved_sfu_sources = st.session_state.get("sfu_basis_sources", {})
+                saved_sfu_configs = st.session_state.get("sfu_basis_sources", {})
 
-                sfu_table = pd.DataFrame({
-                    MONTHLY_SFU_VERSION_COL: sfu_versions,
-                    "Basis Source": [
-                        saved_sfu_sources.get(v, "Shipments") if "Shipments" in available_basis_sources
-                        else available_basis_sources[0]
-                        for v in sfu_versions
-                    ],
-                })
+                basis_mode_options = {
+                    "last_3": "Past 3 months avg",
+                    "last_6": "Past 6 months avg",
+                    "last_9": "Past 9 months avg",
+                    "last_12": "Past 12 months avg",
+                    "selected": "Manual (see below)",
+                }
 
+                sfu_table_rows = []
+                for v in sfu_versions:
+                    cfg = saved_sfu_configs.get(v, {})
+                    if isinstance(cfg, str): # Legacy migration
+                        cfg = {"source": cfg, "mode": "last_3", "selected": []}
+                    
+                    sfu_table_rows.append({
+                        MONTHLY_SFU_VERSION_COL: v,
+                        "Basis Source": cfg.get("source", "Shipments" if "Shipments" in available_basis_sources else available_basis_sources[0]),
+                        "Basis Window": cfg.get("mode", "last_3"),
+                    })
+                
+                sfu_table = pd.DataFrame(sfu_table_rows)
+
+                st.write("### 1. Configure Basis for each SFU Version")
                 edited_sfu = st.data_editor(
                     sfu_table,
                     column_config={
                         "Basis Source": st.column_config.SelectboxColumn(
                             "Basis Source",
                             options=available_basis_sources,
+                            required=True,
+                        ),
+                        "Basis Window": st.column_config.SelectboxColumn(
+                            "Basis Window",
+                            options=list(basis_mode_options.keys()),
                             required=True,
                         )
                     },
@@ -1471,14 +1513,37 @@ def step4_salience():
                     height=min(400, 60 + len(sfu_table) * 35),
                 )
 
+                st.write("### 2. Manual Month Selection")
+                st.caption("If 'Manual' is selected above, pick the months to include for those SFUs.")
+                
+                # Combine all available months from all potential sources to give a full list
+                all_avail_months = set()
+                for src in available_basis_sources:
+                    df_tmp = _get_df(src)
+                    if df_tmp is not None:
+                        all_avail_months.update(detect_month_columns(df_tmp))
+                
+                manual_months = st.multiselect(
+                    "Manual months for basis (applies to SFUs set to 'Manual'):",
+                    sorted(list(all_avail_months), key=lambda x: parse_month_to_date(x) or pd.Timestamp.min),
+                    default=st.session_state.get("sfu_manual_months", []),
+                    key="sfu_manual_months_sel"
+                )
+                st.session_state.sfu_manual_months = manual_months
+
                 if st.button("Compute BOP Salience (SFU Level)", type="primary"):
-                    new_sfu_sources = dict(zip(
-                        edited_sfu[MONTHLY_SFU_VERSION_COL],
-                        edited_sfu["Basis Source"],
-                    ))
-                    st.session_state.sfu_basis_sources = new_sfu_sources
+                    new_sfu_configs = {}
+                    for _, row in edited_sfu.iterrows():
+                        v = row[MONTHLY_SFU_VERSION_COL]
+                        new_sfu_configs[v] = {
+                            "source": row["Basis Source"],
+                            "mode": row["Basis Window"],
+                            "selected": manual_months if row["Basis Window"] == "selected" else []
+                        }
+                    
+                    st.session_state.sfu_basis_sources = new_sfu_configs
                     with st.spinner("Computing BOP salience…"):
-                        bop_sal = _compute_bop_salience(new_sfu_sources)
+                        bop_sal = _compute_bop_salience(new_sfu_configs)
                     if bop_sal is not None and not bop_sal.empty:
                         st.session_state.salience_df = bop_sal
                         st.session_state.blocking_groups = []
@@ -1486,8 +1551,8 @@ def step4_salience():
                         st.rerun()
                     else:
                         st.error(
-                            "Could not compute BOP salience. Ensure the Shipments sheet has past months "
-                            f"and the **{MONTHLY_SFU_VERSION_COL}** column is present."
+                            "Could not compute BOP salience. Ensure the selected source sheets have enough past months "
+                            "and the data matches the SFU versions."
                         )
             else:
                 st.info(
