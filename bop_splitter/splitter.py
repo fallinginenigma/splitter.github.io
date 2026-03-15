@@ -46,16 +46,34 @@ def run_split(
             sub = salience_df.copy()
         sal_by_level[lvl] = sub
 
-    def _get_bb_salience(bb_level: str, bb_group_vals: tuple, bb_group_cols: list[str]) -> dict[str, float]:
-        """Filter salience table to this BB's group and return {sfuv: salience}."""
+    def _get_bb_salience(
+        bb_level: str, bb_group_vals: tuple, bb_group_cols: list[str]
+    ) -> dict[str, dict[str, float] | float]:
+        """Filter salience table to this BB's group.
+
+        Returns {sfuv: value} where value is either:
+          - a dict {month: salience} when per-month columns exist in salience_df, or
+          - a scalar float (scalar 'salience' column) otherwise.
+        """
         sal_sub = sal_by_level.get(bb_level, salience_df)
         for col, val in zip(bb_group_cols, bb_group_vals):
             if col in sal_sub.columns:
                 sal_sub = sal_sub[sal_sub[col].astype(str) == str(val)]
-        return {
-            str(row.get(sfuv_id_col, "")): float(row.get("salience", 0) or 0)
-            for _, row in sal_sub.iterrows()
-        }
+
+        month_cols = [c for c in sal_sub.columns if c in sas_months]
+        result: dict[str, dict[str, float] | float] = {}
+        for _, row in sal_sub.iterrows():
+            sfuv = str(row.get(sfuv_id_col, ""))
+            scalar = float(row.get("salience", 0) or 0)
+            if month_cols:
+                per_month = {}
+                for m in sas_months:
+                    v = row.get(m, np.nan)
+                    per_month[m] = float(v) if not pd.isna(v) else scalar
+                result[sfuv] = per_month
+            else:
+                result[sfuv] = scalar
+        return result
 
     # Output accumulator
     output_rows: dict[tuple, dict] = {}
@@ -157,7 +175,14 @@ def run_split(
 
             proportional_sfuvs = [s for s in eligible_sfuvs if s not in fixed_alloc]
 
-            sal_vals = {sfuv_val: bb_sal_lookup.get(sfuv_val, 0.0) for sfuv_val in proportional_sfuvs}
+            # Resolve per-month or scalar salience for each proportional SFU_v
+            sal_vals: dict[str, float] = {}
+            for sfuv_val in proportional_sfuvs:
+                entry = bb_sal_lookup.get(sfuv_val, 0.0)
+                if isinstance(entry, dict):
+                    sal_vals[sfuv_val] = entry.get(month, 0.0)
+                else:
+                    sal_vals[sfuv_val] = float(entry)
             sal_total = sum(sal_vals.values())
 
             for sfuv_val in eligible_sfuvs:

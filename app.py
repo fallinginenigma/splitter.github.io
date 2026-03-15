@@ -1278,22 +1278,69 @@ def step4_salience():
                 .reset_index()
             )
             display_sal = agg_disp
-        # Always show salience as % with 2 decimal places
-        if "salience" in display_sal.columns:
-            display_sal["Salience %"] = (pd.to_numeric(display_sal["salience"], errors="coerce") * 100).round(2)
-            display_sal = display_sal.drop(columns=["salience"])
-        elif "salience %" in display_sal.columns:
-            display_sal = display_sal.rename(columns={"salience %": "Salience %"})
-            display_sal["Salience %"] = pd.to_numeric(display_sal["Salience %"], errors="coerce").round(2)
-        st.subheader(f"Current Salience Table — {len(display_sal)} rows (at SFU_SFU Version level)")
-        st.dataframe(
-            display_sal,
-            use_container_width=True,
-            height=300,
-            column_config={
-                "Salience %": st.column_config.NumberColumn("Salience %", format="%.2f %%"),
-            },
-        )
+
+        # Build pivot table: SFU_SFU_version × months
+        # Per-month salience columns (named by month) in salience_df take precedence over
+        # the scalar 'salience' column; users can override any cell independently.
+        sas_months = st.session_state.get("sas_months_selected", [])
+        sfuv_col = MONTHLY_SFU_VERSION_COL if MONTHLY_SFU_VERSION_COL in display_sal.columns else None
+        if sfuv_col and sas_months:
+            scalar_pct = (pd.to_numeric(display_sal["salience"], errors="coerce") * 100).round(2)
+            pivot_rows = []
+            for row_idx, row in display_sal.iterrows():
+                default_pct = round(float(scalar_pct.at[row_idx]), 2)
+                entry = {"SFU_SFU_version": row[sfuv_col]}
+                for m in sas_months:
+                    # Use existing per-month column if already set (value stored as 0-1 fraction)
+                    if m in display_sal.columns:
+                        entry[m] = round(float(pd.to_numeric(row[m], errors="coerce")) * 100, 2)
+                    else:
+                        entry[m] = default_pct
+                pivot_rows.append(entry)
+            pivot_df = pd.DataFrame(pivot_rows).set_index("SFU_SFU_version")
+            pivot_df = pivot_df[~pivot_df.index.duplicated(keep="first")]
+            st.subheader(f"Current Salience Table — {len(pivot_df)} SFU_SFU versions (editable per month)")
+            st.caption(
+                "Salience % per SFU_SFU version × month. "
+                "Default is the same weight across all months — edit any cell to override a specific month. "
+                "Click **Apply** to save changes."
+            )
+            col_cfg = {m: st.column_config.NumberColumn(m, format="%.2f") for m in sas_months}
+            edited_pivot = st.data_editor(
+                pivot_df,
+                use_container_width=True,
+                height=min(400, 50 + 35 * len(pivot_df)),
+                column_config=col_cfg,
+                num_rows="fixed",
+            )
+            # Write per-month salience back into salience_df as fractional columns
+            if st.button("Apply Salience Overrides from Table"):
+                updated_sal = st.session_state.salience_df.copy()
+                for m in sas_months:
+                    updated_sal[m] = updated_sal[MONTHLY_SFU_VERSION_COL].map(
+                        lambda v, _m=m: float(edited_pivot.at[v, _m]) / 100.0
+                        if v in edited_pivot.index else np.nan
+                    )
+                st.session_state.salience_df = updated_sal
+                st.success("Per-month salience saved — will be used in the split.")
+                st.rerun()
+        else:
+            # Fallback: long-format display (no SAS months available yet)
+            if "salience" in display_sal.columns:
+                display_sal["Salience %"] = (pd.to_numeric(display_sal["salience"], errors="coerce") * 100).round(2)
+                display_sal = display_sal.drop(columns=["salience"])
+            elif "salience %" in display_sal.columns:
+                display_sal = display_sal.rename(columns={"salience %": "Salience %"})
+                display_sal["Salience %"] = pd.to_numeric(display_sal["Salience %"], errors="coerce").round(2)
+            st.subheader(f"Current Salience Table — {len(display_sal)} rows (at SFU_SFU Version level)")
+            st.dataframe(
+                display_sal,
+                use_container_width=True,
+                height=300,
+                column_config={
+                    "Salience %": st.column_config.NumberColumn("Salience %", format="%.2f %%"),
+                },
+            )
 
     # ── BOP Auto-Salience from historical data (Shipments-based, SFU level) ──
     if st.session_state.get("_is_bop"):
