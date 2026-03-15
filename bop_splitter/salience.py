@@ -15,6 +15,60 @@ SPLIT_KEYS: dict[str, list[str]] = {
     "SFU_v": ["Ctry", "SMO Category", "Brand", "Sub Brand", "Form", "SFU_v"],
 }
 
+# GBB Type → split behaviour rules.
+# Keys are the exact GBB Type strings as they appear in the SAS sheet.
+# Each entry defines:
+#   split_level : hierarchy level to use when splitting (must be a key in SPLIT_KEYS)
+#   action      : one of "split" | "exceptions" | "ignore"
+#                 "split"      → normal split using salience
+#                 "exceptions" → route user to Exception list to pick/confirm SKUs
+#                 "ignore"     → exclude from split; add to exception list with note
+#   user_defined: if True, ask user to select the split level (overrides split_level default)
+GBB_TYPE_RULES: dict[str, dict] = {
+    "Brand Building Activities": {
+        "split_level": "Form",
+        "action": "split",
+        "user_defined": False,
+        "description": "Use all SKUs at Form level.",
+    },
+    "Promotions - Go To Market": {
+        "split_level": "Form",
+        "action": "exceptions",
+        "user_defined": False,
+        "description": "Use all SKUs or ask which SKUs — routes to Exception list.",
+    },
+    "New Channels": {
+        "split_level": "Form",
+        "action": "exceptions",
+        "user_defined": False,
+        "description": "Ask which SKUs — routes to Exception list.",
+    },
+    "Initiatives": {
+        "split_level": "Form",
+        "action": "ignore",
+        "user_defined": False,
+        "description": "Ignore / add to exception list; prompt user to provide inputs.",
+    },
+    "Pricing Strategy": {
+        "split_level": "Brand",
+        "action": "split",
+        "user_defined": False,
+        "description": "Split across the brand.",
+    },
+    "Market Trend": {
+        "split_level": "Sub Brand",
+        "action": "split",
+        "user_defined": False,
+        "description": "Split at Sub Brand level.",
+    },
+    "Customer Inventory Strategy": {
+        "split_level": "Form",
+        "action": "split",
+        "user_defined": True,
+        "description": "Use all SKUs — split level defined by user.",
+    },
+}
+
 
 def compute_basis(
     df: pd.DataFrame,
