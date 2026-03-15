@@ -33,6 +33,7 @@ from bop_splitter.salience import (
     normalize_salience,
     HIERARCHY_LEVELS,
     SPLIT_KEYS,
+    GBB_TYPE_RULES,
 )
 from bop_splitter.exceptions import ExceptionStore
 from bop_splitter.splitter import run_split
@@ -906,6 +907,21 @@ def step3_filters():
             st.session_state.bb_id_col = "BB_ID"
         st.session_state.sheets[st.session_state.sheet_map["SAS"]] = sas_df
 
+    # ---- Aggregation (One block = One total) ----
+    hier_actual = [sas_cmap.get(h) for h in LOGICAL_HIER if sas_cmap.get(h) and sas_cmap.get(h) in sas_df.columns]
+    bb_id_col = st.session_state.bb_id_col or "BB_ID"
+    group_keys = [k for k in [bb_id_col] + hier_actual if k in sas_df.columns]
+    
+    if group_keys:
+        month_cols = detect_month_columns(sas_df)
+        if month_cols:
+            # Ensure all month columns are numeric for summation
+            sas_df[month_cols] = sas_df[month_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
+            # Group and sum
+            sas_df = sas_df.groupby(group_keys, as_index=False, dropna=False)[month_cols].sum()
+            # Update session state with aggregated data
+            st.session_state.sheets[st.session_state.sheet_map["SAS"]] = sas_df
+
     # ---- Month Selection ----
     st.subheader("Months")
     all_sas_months = sas_cmap.get("_months", detect_month_columns(sas_df))
@@ -1037,13 +1053,19 @@ def step3_filters():
     # ---- Per-BB Split Granularity ----
     st.subheader("Split Granularity per Building Block")
     st.caption(
-        "Set the hierarchy level at which each Building Block is split to SFU_vs. "
-        "Default is **Form** (finest level). If SAS has specific SFU_v data for a BB, it is auto-set to **SFU_v**. "
-        "Edit the 'Split Level' column below."
+        "GBB Type (read from SAS) drives the default split level and action for each Building Block. "
+        "You can override **Split Level** for any row. Rows flagged as *exceptions* or *ignore* will be "
+        "highlighted in Step 5."
     )
 
     bb_id_col = st.session_state.bb_id_col or "BB_ID"
     saved_bb_split_levels = st.session_state.get("bb_split_levels", {})
+
+    # Detect GBB Type column in SAS (try common names)
+    _gbb_col = next(
+        (c for c in ["GBB Type", "GBB_Type", "Plan Type", "gbb_type"] if c in sas_df.columns),
+        None,
+    )
 
     # Auto-detect SFU_v split level: if SAS has a Specific SFU_v column with data for a BB row → use SFU_v level
     _sas_sfuv_col_in_data = SAS_SFU_V_COL if SAS_SFU_V_COL in sas_df.columns else None
@@ -1055,36 +1077,89 @@ def step3_filters():
         vals = bb_row_subset[_sas_sfuv_col_in_data].dropna().astype(str).str.strip()
         return "SFU_v" if (vals != "").any() else "Form"
 
+    def _gbb_split_level(gbb_type: str, bid: str) -> str:
+        """Derive split level from GBB Type rule, falling back to SFU_v auto-detect or Form."""
+        rule = GBB_TYPE_RULES.get(gbb_type)
+        if rule and not rule["user_defined"]:
+            return rule["split_level"]
+        # user_defined or unknown type → fall through to SFU_v check
+        bb_rows = sas_df[sas_df[bb_id_col] == bid]
+        return _auto_split_level(bb_rows)
+
+    def _gbb_action(gbb_type: str) -> str:
+        rule = GBB_TYPE_RULES.get(gbb_type)
+        return rule["action"] if rule else "split"
+
     if hier_actual and bb_id_col in sas_df.columns:
+        # Build base columns: hierarchy + BB_ID + optionally GBB Type
+        base_cols = hier_actual + [bb_id_col]
+        if _gbb_col:
+            base_cols = hier_actual + [bb_id_col, _gbb_col]
+
         bb_editor_df = (
-            sas_df[hier_actual + [bb_id_col]]
+            sas_df[base_cols]
             .drop_duplicates()
             .reset_index(drop=True)
         )
 
-        def _resolve_split_level(bid):
-            # User override takes precedence; otherwise auto-detect from SAS SFU_v column
+        # Rename GBB Type col to standard name for consistent handling
+        if _gbb_col and _gbb_col != "GBB Type":
+            bb_editor_df = bb_editor_df.rename(columns={_gbb_col: "GBB Type"})
+
+        # Fill missing GBB Type with empty string
+        if "GBB Type" not in bb_editor_df.columns:
+            bb_editor_df["GBB Type"] = ""
+
+        def _resolve_split_level(row):
+            bid = row[bb_id_col]
+            gbb = str(row.get("GBB Type", "") or "").strip()
             if bid in saved_bb_split_levels:
                 return saved_bb_split_levels[bid]
-            bb_rows = sas_df[sas_df[bb_id_col] == bid]
-            return _auto_split_level(bb_rows)
+            return _gbb_split_level(gbb, bid)
 
-        bb_editor_df["Split Level"] = bb_editor_df[bb_id_col].map(_resolve_split_level)
+        bb_editor_df["Split Level"] = bb_editor_df.apply(_resolve_split_level, axis=1)
+        bb_editor_df["Action"] = bb_editor_df["GBB Type"].apply(
+            lambda g: _gbb_action(str(g).strip())
+        )
+
+        # Columns users may edit: GBB Type (if not in SAS), Split Level
+        editable_cols = ["Split Level"]
+        if not _gbb_col:
+            editable_cols.append("GBB Type")
+        disabled_cols = [c for c in bb_editor_df.columns if c not in editable_cols]
+
+        col_config = {
+            "Split Level": st.column_config.SelectboxColumn(
+                "Split Level",
+                options=list(SPLIT_KEYS.keys()),
+                required=True,
+            ),
+            "GBB Type": st.column_config.SelectboxColumn(
+                "GBB Type",
+                options=[""] + list(GBB_TYPE_RULES.keys()),
+                required=False,
+            ),
+            "Action": st.column_config.TextColumn("Action", disabled=True),
+        }
 
         edited_bb = st.data_editor(
             bb_editor_df,
-            column_config={
-                "Split Level": st.column_config.SelectboxColumn(
-                    "Split Level",
-                    options=list(SPLIT_KEYS.keys()),
-                    required=True,
-                )
-            },
-            disabled=[c for c in bb_editor_df.columns if c != "Split Level"],
+            column_config=col_config,
+            disabled=disabled_cols,
             use_container_width=True,
             key="bb_split_level_editor",
             height=min(450, 60 + len(bb_editor_df) * 35),
         )
+
+        # Show legend
+        with st.expander("GBB Type rules reference", expanded=False):
+            rule_rows = [
+                {"GBB Type": k, "Default Split Level": v["split_level"],
+                 "Action": v["action"], "Notes": v["description"]}
+                for k, v in GBB_TYPE_RULES.items()
+            ]
+            st.dataframe(pd.DataFrame(rule_rows), use_container_width=True, hide_index=True)
+
     else:
         # Fallback: single global split level radio when BB_ID not available
         edited_bb = None
@@ -1106,9 +1181,22 @@ def step3_filters():
             if new_bb_split_levels:
                 from collections import Counter
                 st.session_state.split_level = Counter(new_bb_split_levels.values()).most_common(1)[0][0]
+
+            # Persist GBB action flags so Step 5 can surface them
+            gbb_actions: dict[str, str] = {}
+            gbb_types: dict[str, str] = {}
+            if "Action" in edited_bb.columns and "GBB Type" in edited_bb.columns:
+                for _, row in edited_bb.iterrows():
+                    bid = row[bb_id_col]
+                    gbb_actions[bid] = str(row.get("Action", "split"))
+                    gbb_types[bid] = str(row.get("GBB Type", ""))
+            st.session_state.gbb_actions = gbb_actions
+            st.session_state.gbb_types = gbb_types
         else:
             new_bb_split_levels = {}
             st.session_state.bb_split_levels = {}
+            st.session_state.gbb_actions = {}
+            st.session_state.gbb_types = {}
 
         sas_out = sas_df.reset_index(drop=True)
         sku_out = sku_merged.reset_index(drop=True)
@@ -1550,6 +1638,35 @@ def step5_exceptions():
     sku_filtered = st.session_state.sku_df_filtered
     sas_filtered = st.session_state.sas_df_filtered
     all_skus = sorted(sku_filtered[sku_col].dropna().astype(str).unique().tolist()) if (sku_filtered is not None and sku_col in (sku_filtered.columns if sku_filtered is not None else [])) else []
+
+    # ── GBB action banners ────────────────────────────────────────────────────
+    gbb_actions: dict[str, str] = st.session_state.get("gbb_actions", {})
+    gbb_types: dict[str, str] = st.session_state.get("gbb_types", {})
+    exception_bbs = [bid for bid, act in gbb_actions.items() if act == "exceptions"]
+    ignore_bbs = [bid for bid, act in gbb_actions.items() if act == "ignore"]
+
+    if exception_bbs or ignore_bbs:
+        with st.expander("⚠️ GBB Type actions required — click to review", expanded=True):
+            if ignore_bbs:
+                st.error(
+                    f"**{len(ignore_bbs)} Building Block(s) flagged as *Ignore* (Initiatives):** "
+                    "These BBs will not be split. Add them to the exception list with a note or provide manual inputs. "
+                    f"BBs: `{'`, `'.join(ignore_bbs)}`"
+                )
+                if st.button("Add Initiatives BBs to exception log", key="gbb_add_ignore"):
+                    for bid in ignore_bbs:
+                        note = f"Initiatives BB — excluded from split. GBB Type: {gbb_types.get(bid, 'Initiatives')}"
+                        for sku in all_skus:
+                            exc_store.add_bb_exclude(bid, sku, notes=note)
+                    st.success(f"{len(ignore_bbs)} BB(s) added to exception log with all SKUs excluded.")
+                    st.rerun()
+
+            if exception_bbs:
+                st.warning(
+                    f"**{len(exception_bbs)} Building Block(s) require SKU selection** "
+                    f"(Promotions / New Channels): `{'`, `'.join(exception_bbs)}`  \n"
+                    "Use the **Per-BB Exceptions** tab below to specify which SKUs should receive allocation."
+                )
 
     tab_global, tab_bb, tab_log = st.tabs(["Global Exclusions", "Per-BB Exceptions", "Exception Log"])
 
