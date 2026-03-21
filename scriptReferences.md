@@ -15,6 +15,7 @@ Located at `/bop_splitter/`, this module contains the deterministic logic for da
 | File | Purpose |
 |------|---------|
 | `__init__.py` | Package initialization. |
+| `config_profile.py` | Monthly profile save/load. Serialises all user choices (sheet mapping, column mapping, filters, split levels, basis config, SFU-specific months, exclusions, per-BB exceptions, salience overrides) to a portable JSON file. Users download the profile at end-of-month and re-upload it next month to pre-fill every setting, only reviewing what has changed. |
 | `databricks_loader.py` | Utilities for connecting to Azure Databricks. Fetches tables as DataFrames and provides connection testing functionality. |
 | `exceptions.py` | Manages split exceptions, including global exclusions, BB-specific inclusions/exclusions, fixed quantity allocations, and manual salience overrides. |
 | `exporter.py` | Handles the generation of multi-sheet Excel workbooks (`.xlsx`) for the final split results, salience tables, exception logs, and validation reports. |

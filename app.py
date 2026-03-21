@@ -23,6 +23,8 @@ from bop_splitter.loader import (
     MONTHLY_SFU_V_COL,
     MONTHLY_SFU_VERSION_COL,
     SAS_SFU_V_COL,
+    SAS_GBB_TYPE_COL,
+    SAS_GBB_TYPE_VARIANTS,
     parse_month_to_date,
 )
 from bop_splitter.databricks_loader import fetch_table as fetch_databricks_table, test_connection as test_databricks_connection
@@ -38,6 +40,12 @@ from bop_splitter.salience import (
 from bop_splitter.exceptions import ExceptionStore
 from bop_splitter.splitter import run_split
 from bop_splitter.exporter import build_excel_output
+from bop_splitter.config_profile import (
+    build_profile,
+    apply_profile,
+    profile_to_json,
+    profile_from_json,
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Page config
@@ -74,7 +82,9 @@ def _init_state():
         "sas_months_selected": [],
         "sas_forecast_months_selected": [],  # user-selected future forecast months
         "sfu_basis_sources": {},      # SFU_SFU Version -> basis config (source, mode, selected)
-        "sfu_manual_months": [],      # Global manual month selector for SFU basis
+        "sfu_manual_months": [],      # Global manual month selector for SFU basis (legacy)
+        "sfu_specific_months": {},    # SFU_SFU Version -> list[str] of manually chosen months
+        "sfu_remarks": {},            # SFU_SFU Version -> user remarks string
         "filters": {},
         "step": 1,
         "max_step": 1,
@@ -115,6 +125,72 @@ with st.sidebar:
     for i, label in enumerate(STEPS, 1):
         icon = "▶️" if i == st.session_state.step else ("✅" if i <= st.session_state.max_step else "⬜")
         st.markdown(f"{icon} {label}")
+    st.divider()
+
+    # ── Monthly Profile: Save & Load ─────────────────────────────────────────
+    with st.expander("💾 Monthly Profile — Save / Load", expanded=False):
+        st.caption(
+            "Save all your choices (sheet mapping, column mapping, filters, "
+            "split levels, basis config, exclusions, exceptions) to a small JSON file. "
+            "Next month, upload your new Excel and reload this profile — "
+            "only review and change what's different."
+        )
+
+        # ── Save ────────────────────────────────────────────────────────────
+        st.markdown("**Save current settings**")
+        st.caption(
+            "💡 **Recommended naming:** `Country_Category_Month` — e.g. `UK_BabyPants_Mar2026`. "
+            "This makes it easy to find the right profile when you reload next month."
+        )
+        profile_name = st.text_input(
+            "Profile name",
+            value=f"bop_profile_{datetime.date.today().strftime('%Y_%m')}",
+            placeholder="e.g. UK_BabyPants_Mar2026",
+            key="profile_name_input",
+        )
+        if st.button("⬇️ Download profile as JSON", use_container_width=True, key="profile_save_btn"):
+            try:
+                profile_dict = build_profile(st.session_state, ExceptionStore)
+                profile_json = profile_to_json(profile_dict)
+                st.download_button(
+                    label="📥 Click here to download",
+                    data=profile_json,
+                    file_name=f"{profile_name}.json",
+                    mime="application/json",
+                    key="profile_download_btn",
+                )
+            except Exception as _pe:
+                st.error(f"Could not build profile: {_pe}")
+
+        st.divider()
+
+        # ── Load ────────────────────────────────────────────────────────────
+        st.markdown("**Load saved profile**")
+        uploaded_profile = st.file_uploader(
+            "Upload a .json profile",
+            type=["json"],
+            key="profile_uploader",
+            help="Upload a profile saved from a previous month to pre-fill all settings.",
+        )
+        if uploaded_profile is not None:
+            if st.button("✅ Apply profile", use_container_width=True, key="profile_apply_btn"):
+                try:
+                    raw = uploaded_profile.read().decode("utf-8")
+                    profile_dict = profile_from_json(raw)
+                    load_notes = apply_profile(profile_dict, st.session_state, ExceptionStore)
+                    # After loading, keep the user at step 1 so they upload fresh data
+                    # but mark max_step so they can navigate freely
+                    st.session_state.step = 1
+                    st.session_state.max_step = 7
+                    st.success("Profile loaded! Upload your new Excel file and all previous settings will be pre-filled.")
+                    with st.expander("What was loaded", expanded=False):
+                        st.text("\n".join(load_notes))
+                    st.rerun()
+                except ValueError as _ve:
+                    st.error(f"Invalid profile file: {_ve}")
+                except Exception as _le:
+                    st.error(f"Could not apply profile: {_le}")
+
     st.divider()
     if st.button("↺ Reset All", use_container_width=True):
         for k in list(st.session_state.keys()):
@@ -245,12 +321,48 @@ def _show_bop_load_summary(sheets: dict) -> None:
             "SAS column": "Specific SFU_v (optional — pinned BBs only)",
             "Monthly column → renamed to SAS name": MONTHLY_SFU_V_COL,
         })
+
+        # GBB Type — detect which variant is present in the SAS sheet
+        gbb_col_found = next(
+            (c for c in SAS_GBB_TYPE_VARIANTS if c in sas_df.columns), None
+        )
+        mapping_rows.append({
+            "Logical Level": "GBB Type",
+            "SAS column": gbb_col_found if gbb_col_found else "⚠️ not found in SAS sheet",
+            "Monthly column → renamed to SAS name": "— (SAS only)",
+        })
+
         st.dataframe(pd.DataFrame(mapping_rows), use_container_width=True, hide_index=True)
+
+        if gbb_col_found:
+            st.success(
+                f"✅ **GBB Type** column detected in SAS sheet as `{gbb_col_found}` — "
+                "Split Level and Action will be auto-derived from it in Step 3."
+            )
+            # Show unique GBB Type values present
+            unique_gbb = sas_df[gbb_col_found].dropna().astype(str).str.strip()
+            unique_gbb = sorted(unique_gbb[unique_gbb != ""].unique().tolist())
+            if unique_gbb:
+                st.caption(f"Unique GBB Types found: {', '.join(f'`{v}`' for v in unique_gbb)}")
+        else:
+            st.warning(
+                "⚠️ **GBB Type** column not found in the SAS sheet "
+                f"(looked for: {', '.join(f'`{v}`' for v in SAS_GBB_TYPE_VARIANTS)}). "
+                "You can assign GBB Types manually per Building Block in Step 3."
+            )
 
     # SAS preview
     if not sas_df.empty:
         with st.expander("Preview SAS (Building Blocks) — first 5 rows"):
-            st.dataframe(sas_df.head(5), use_container_width=True)
+            # Pin GBB Type column first in the preview if it exists
+            gbb_preview_col = next(
+                (c for c in SAS_GBB_TYPE_VARIANTS if c in sas_df.columns), None
+            )
+            if gbb_preview_col:
+                priority_cols = [gbb_preview_col] + [c for c in sas_df.columns if c != gbb_preview_col]
+                st.dataframe(sas_df[priority_cols].head(5), use_container_width=True)
+            else:
+                st.dataframe(sas_df.head(5), use_container_width=True)
 
     # Monthly preview per measure
     for measure in MONTHLY_MEASURES:
@@ -746,6 +858,34 @@ def step2_columns():
                 )
                 cmap["BB_ID"] = bb_sel if bb_sel != "— generate —" else None
 
+                # ── GBB Type column mapping (SAS only) ──────────────────────
+                st.markdown("**GBB Type column**")
+                # Auto-detect from known variants; allow user to override
+                auto_gbb = cmap.get("GBB Type") or next(
+                    (c for c in SAS_GBB_TYPE_VARIANTS if c in cols_all), None
+                )
+                gbb_opts = ["— not present —"] + cols_all
+                gbb_idx = gbb_opts.index(auto_gbb) if auto_gbb in gbb_opts else 0
+                gbb_sel = st.selectbox(
+                    "GBB Type column",
+                    gbb_opts,
+                    index=gbb_idx,
+                    key="col_SAS_GBB_Type",
+                    help=(
+                        "The column in the SAS sheet that contains the GBB Type "
+                        "(e.g. 'Brand Building Activities', 'Promotions - Go To Market'). "
+                        "This drives the default Split Level and Action for each Building Block in Step 3."
+                    ),
+                )
+                if gbb_sel != "— not present —":
+                    cmap[SAS_GBB_TYPE_COL] = gbb_sel
+                    st.caption(f"✅ GBB Type mapped to column: `{gbb_sel}`")
+                else:
+                    cmap.pop(SAS_GBB_TYPE_COL, None)
+                    st.caption(
+                        "⚠️ No GBB Type column selected — you can assign GBB Types manually in Step 3."
+                    )
+
             st.session_state.col_maps[role] = cmap
 
     # Ensure BB_ID in SAS
@@ -912,14 +1052,25 @@ def step3_filters():
     hier_actual = [sas_cmap.get(h) for h in LOGICAL_HIER if sas_cmap.get(h) and sas_cmap.get(h) in sas_df.columns]
     bb_id_col = st.session_state.bb_id_col or "BB_ID"
     group_keys = [k for k in [bb_id_col] + hier_actual if k in sas_df.columns]
-    
+
     if group_keys:
         month_cols = detect_month_columns(sas_df)
         if month_cols:
+            month_col_set = set(month_cols)
+            # Include all non-month, non-numeric metadata columns in the groupby
+            # so they are preserved after aggregation (e.g. GBB Type, Entry Type, Plan Name)
+            meta_cols = [
+                c for c in sas_df.columns
+                if c not in month_col_set
+                and c not in group_keys
+                and sas_df[c].dtype == object  # string/categorical metadata
+            ]
+            full_group_keys = group_keys + meta_cols
+
             # Ensure all month columns are numeric for summation
             sas_df[month_cols] = sas_df[month_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
-            # Group and sum
-            sas_df = sas_df.groupby(group_keys, as_index=False, dropna=False)[month_cols].sum()
+            # Group and sum — metadata columns are part of the key so they survive
+            sas_df = sas_df.groupby(full_group_keys, as_index=False, dropna=False)[month_cols].sum()
             # Update session state with aggregated data
             st.session_state.sheets[st.session_state.sheet_map["SAS"]] = sas_df
 
@@ -1053,20 +1204,29 @@ def step3_filters():
 
     # ---- Per-BB Split Granularity ----
     st.subheader("Split Granularity per Building Block")
-    st.caption(
-        "GBB Type (read from SAS) drives the default split level and action for each Building Block. "
-        "You can override **Split Level** for any row. Rows flagged as *exceptions* or *ignore* will be "
-        "highlighted in Step 5."
-    )
 
     bb_id_col = st.session_state.bb_id_col or "BB_ID"
     saved_bb_split_levels = st.session_state.get("bb_split_levels", {})
 
-    # Detect GBB Type column in SAS (try common names)
+    # Detect GBB Type column in SAS — use canonical variants from loader constants
     _gbb_col = next(
-        (c for c in ["GBB Type", "GBB_Type", "Plan Type", "gbb_type"] if c in sas_df.columns),
+        (c for c in SAS_GBB_TYPE_VARIANTS if c in sas_df.columns),
         None,
     )
+
+    if _gbb_col:
+        st.caption(
+            f"**GBB Type** is pulled directly from the SAS sheet (column: `{_gbb_col}`) and is read-only. "
+            "It drives the default **Split Level** and **Action** for each Building Block. "
+            "You can still override **Split Level** for any row. "
+            "Rows flagged as *exceptions* or *ignore* will be highlighted in Step 5."
+        )
+    else:
+        st.caption(
+            "No GBB Type column was found in the SAS sheet — you can manually assign a **GBB Type** per row. "
+            "GBB Type drives the default **Split Level** and **Action** for each Building Block. "
+            "Rows flagged as *exceptions* or *ignore* will be highlighted in Step 5."
+        )
 
     # Auto-detect SFU_v split level: if SAS has a Specific SFU_v column with data for a BB row → use SFU_v level
     _sas_sfuv_col_in_data = SAS_SFU_V_COL if SAS_SFU_V_COL in sas_df.columns else None
@@ -1103,13 +1263,13 @@ def step3_filters():
             .reset_index(drop=True)
         )
 
-        # Rename GBB Type col to standard name for consistent handling
-        if _gbb_col and _gbb_col != "GBB Type":
-            bb_editor_df = bb_editor_df.rename(columns={_gbb_col: "GBB Type"})
+        # Rename GBB Type col to canonical name for consistent handling
+        if _gbb_col and _gbb_col != SAS_GBB_TYPE_COL:
+            bb_editor_df = bb_editor_df.rename(columns={_gbb_col: SAS_GBB_TYPE_COL})
 
-        # Fill missing GBB Type with empty string
-        if "GBB Type" not in bb_editor_df.columns:
-            bb_editor_df["GBB Type"] = ""
+        # Fill missing GBB Type with empty string (only when not sourced from SAS)
+        if SAS_GBB_TYPE_COL not in bb_editor_df.columns:
+            bb_editor_df[SAS_GBB_TYPE_COL] = ""
 
         def _resolve_split_level(row):
             bid = row[bb_id_col]
@@ -1123,7 +1283,7 @@ def step3_filters():
             lambda g: _gbb_action(str(g).strip())
         )
 
-        # Columns users may edit: GBB Type (if not in SAS), Split Level
+        # Columns users may edit: Split Level always; GBB Type only if NOT sourced from SAS
         editable_cols = ["Split Level"]
         if not _gbb_col:
             editable_cols.append("GBB Type")
@@ -1134,14 +1294,26 @@ def step3_filters():
                 "Split Level",
                 options=list(SPLIT_KEYS.keys()),
                 required=True,
-            ),
-            "GBB Type": st.column_config.SelectboxColumn(
-                "GBB Type",
-                options=[""] + list(GBB_TYPE_RULES.keys()),
-                required=False,
+                help="Override the split granularity for this Building Block.",
             ),
             "Action": st.column_config.TextColumn("Action", disabled=True),
         }
+
+        if _gbb_col:
+            # GBB Type came from SAS — display read-only with a clear label
+            col_config["GBB Type"] = st.column_config.TextColumn(
+                "GBB Type (from SAS)",
+                disabled=True,
+                help=f"Read directly from the SAS sheet column '{_gbb_col}'. Edit in the source file to change.",
+            )
+        else:
+            # GBB Type not in SAS — let user set it manually
+            col_config["GBB Type"] = st.column_config.SelectboxColumn(
+                "GBB Type (manual)",
+                options=[""] + list(GBB_TYPE_RULES.keys()),
+                required=False,
+                help="No GBB Type column found in SAS — select manually to drive split level and action.",
+            )
 
         edited_bb = st.data_editor(
             bb_editor_df,
@@ -1378,11 +1550,14 @@ def step4_salience():
 
     if sal_df is not None and not sal_df.empty:
         display_sal = sal_df.drop(columns=["_split_level"], errors="ignore").copy()
-        # Aggregate to SFU_SFU Version level (sum salience across APO Products per SFU)
-        sku_col_display = hcm.get("SKU", MONTHLY_SFU_V_COL)
+        # Aggregate strictly to SFU_SFU Version level (drop SKU/APO Product from group keys)
         if MONTHLY_SFU_VERSION_COL in display_sal.columns:
-            group_disp = [c for c in display_sal.columns
-                          if c not in (sku_col_display, "salience", "basis", "flag")]
+            group_disp = [MONTHLY_SFU_VERSION_COL]
+            # Optionally add hierarchy columns if needed (but not SKU/APO Product)
+            for h in HIERARCHY_LEVELS:
+                col = hcm.get(h)
+                if col and col in display_sal.columns and col != hcm.get("SKU"):
+                    group_disp.append(col)
             agg_disp = (
                 display_sal.groupby(group_disp, dropna=False)
                 .agg(salience=("salience", "sum"), basis=("basis", "first"), flag=("flag", "first"))
@@ -1455,110 +1630,436 @@ def step4_salience():
 
     # ── BOP Auto-Salience from historical data (Shipments-based, SFU level) ──
     if st.session_state.get("_is_bop"):
-        with st.expander("BOP Auto-Salience — Shipments-based (SFU Level)", expanded=True):
+        with st.expander("BOP Auto-Salience — Basis & Salience Configuration (SFU Level)", expanded=True):
             st.caption(
-                "Automatically compute salience from historical data aggregated at **SFU_SFU Version** level. "
-                "Each APO Product's weight = its SFU's total past shipments ÷ number of APO Products in that SFU. "
-                "Select a different basis source per SFU version below."
+                "Configure the **Basis / Metric** and **Basis Window** for each SFU Version. "
+                "The table previews the last 6 historical months of that basis, "
+                "computes the **Final Basis** (average over the window), and shows the resulting **Salience %**. "
+                "Add optional **Remarks** per row."
             )
 
-            # Discover available SFU versions from Shipments sheet
-            ship_df = _get_df("Shipments")
+            # ── Discover available data ──────────────────────────────────────
             available_basis_sources = [r for r in MONTHLY_MEASURES if r in st.session_state.sheets]
 
-            if ship_df is not None and MONTHLY_SFU_VERSION_COL in ship_df.columns and available_basis_sources:
-                sfu_versions = sorted(ship_df[MONTHLY_SFU_VERSION_COL].dropna().unique().tolist())
-                saved_sfu_configs = st.session_state.get("sfu_basis_sources", {})
+            # Collect SFU versions from ALL available basis source sheets
+            all_sfu_versions: list = []
+            for _src in available_basis_sources:
+                _df_src = _get_df(_src)
+                if _df_src is not None and MONTHLY_SFU_VERSION_COL in _df_src.columns:
+                    all_sfu_versions.extend(_df_src[MONTHLY_SFU_VERSION_COL].dropna().unique().tolist())
+            sfu_versions = sorted(set(all_sfu_versions))
 
-                basis_mode_options = {
-                    "last_3": "Past 3 months avg",
-                    "last_6": "Past 6 months avg",
-                    "last_9": "Past 9 months avg",
-                    "last_12": "Past 12 months avg",
-                    "selected": "Manual (see below)",
+            if not sfu_versions or not available_basis_sources:
+                st.info(
+                    f"BOP auto-salience requires at least one measure sheet "
+                    f"(Shipments / Consumption / Retailing) with a **{MONTHLY_SFU_VERSION_COL}** column. "
+                    "Load a BOP Excel file to enable this feature."
+                )
+            else:
+                # ── Build list of all past months available across all sources ──
+                all_avail_months_set: set = set()
+                for _src in available_basis_sources:
+                    _df_tmp = _get_df(_src)
+                    if _df_tmp is not None:
+                        all_avail_months_set.update(detect_month_columns(_df_tmp))
+                current_month_start_sal = pd.Timestamp.now().normalize().replace(day=1)
+                all_past_months_sorted = sorted(
+                    [m for m in all_avail_months_set
+                     if (parse_month_to_date(m) or pd.Timestamp.max) < current_month_start_sal],
+                    key=lambda x: parse_month_to_date(x) or pd.Timestamp.min,
+                )
+                # Last 6 past months for preview columns
+                preview_months = all_past_months_sorted[-6:] if len(all_past_months_sorted) >= 6 else all_past_months_sorted
+                # Friendly display labels P6M … P1M (oldest → newest)
+                preview_labels = [f"P{len(preview_months) - i}M" for i in range(len(preview_months))]
+                preview_col_map = dict(zip(preview_labels, preview_months))  # label → actual col name
+
+                # ── Basis window options ─────────────────────────────────────
+                basis_window_options = ["P3M", "P6M", "P9M", "P12M", "specific months"]
+                basis_window_mode_map = {
+                    "P3M": "last_3",
+                    "P6M": "last_6",
+                    "P9M": "last_9",
+                    "P12M": "last_12",
+                    "specific months": "selected",
                 }
 
+                # ── Restore saved configs ────────────────────────────────────
+                saved_sfu_configs = st.session_state.get("sfu_basis_sources", {})
+                saved_remarks: dict = st.session_state.get("sfu_remarks", {})
+
+                # ── Helper: compute basis value for one SFU from a source df ─
+                def _sfu_basis_value(sfu_ver: str, src_role: str, mode_key: str, sel_months: list[str]) -> float:
+                    src_df = _get_df(src_role)
+                    if src_df is None or MONTHLY_SFU_VERSION_COL not in src_df.columns:
+                        return float("nan")
+                    cmap_s = st.session_state.col_maps.get(src_role, {})
+                    all_m = cmap_s.get("_months", detect_month_columns(src_df))
+                    past_m = [m for m in all_m
+                               if (parse_month_to_date(m) or pd.Timestamp.max) < current_month_start_sal]
+                    if mode_key == "selected":
+                        cols = [m for m in sel_months if m in src_df.columns]
+                    elif mode_key.startswith("last_"):
+                        n = int(mode_key.split("_")[1])
+                        cols = past_m[-n:] if len(past_m) >= n else past_m
+                    else:
+                        cols = past_m
+                    cols = [c for c in cols if c in src_df.columns]
+                    if not cols:
+                        return float("nan")
+                    sub = src_df[src_df[MONTHLY_SFU_VERSION_COL] == sfu_ver]
+                    if sub.empty:
+                        return float("nan")
+                    return float(sub[cols].apply(pd.to_numeric, errors="coerce").values.mean())
+
+                # ── Helper: get preview month value for one SFU ──────────────
+                def _sfu_month_val(sfu_ver: str, src_role: str, month_col: str) -> float:
+                    src_df = _get_df(src_role)
+                    if src_df is None or month_col not in src_df.columns or MONTHLY_SFU_VERSION_COL not in src_df.columns:
+                        return float("nan")
+                    sub = src_df[src_df[MONTHLY_SFU_VERSION_COL] == sfu_ver]
+                    if sub.empty:
+                        return float("nan")
+                    return float(pd.to_numeric(sub[month_col], errors="coerce").sum(min_count=1))
+
+                # ── Build config table rows ──────────────────────────────────
                 sfu_table_rows = []
                 for v in sfu_versions:
                     cfg = saved_sfu_configs.get(v, {})
-                    if isinstance(cfg, str): # Legacy migration
+                    if isinstance(cfg, str):
                         cfg = {"source": cfg, "mode": "last_3", "selected": []}
-                    
-                    sfu_table_rows.append({
+                    default_src = "Shipments" if "Shipments" in available_basis_sources else available_basis_sources[0]
+                    src = cfg.get("source", default_src)
+                    raw_mode = cfg.get("mode", "last_3")
+                    # Reverse-map internal mode → display label
+                    window_label = next((k for k, mv in basis_window_mode_map.items() if mv == raw_mode), "P3M")
+                    row_d: dict = {
                         MONTHLY_SFU_VERSION_COL: v,
-                        "Basis Source": cfg.get("source", "Shipments" if "Shipments" in available_basis_sources else available_basis_sources[0]),
-                        "Basis Window": cfg.get("mode", "last_3"),
-                    })
-                
-                sfu_table = pd.DataFrame(sfu_table_rows)
+                        "Basis / Metric": src,
+                        "Basis Window": window_label,
+                    }
+                    sfu_table_rows.append(row_d)
 
-                st.write("### 1. Configure Basis for each SFU Version")
+                sfu_config_df = pd.DataFrame(sfu_table_rows)
+
+                # ── Step 1: editable config table ───────────────────────────
+                st.markdown("#### Step 1 — Set Basis / Metric and Window per SFU Version")
                 edited_sfu = st.data_editor(
-                    sfu_table,
+                    sfu_config_df,
                     column_config={
-                        "Basis Source": st.column_config.SelectboxColumn(
-                            "Basis Source",
+                        MONTHLY_SFU_VERSION_COL: st.column_config.TextColumn("SFU_SFU Version", disabled=True),
+                        "Basis / Metric": st.column_config.SelectboxColumn(
+                            "Basis / Metric",
                             options=available_basis_sources,
                             required=True,
+                            help="Select which historical data sheet to use as the basis for this SFU version.",
                         ),
                         "Basis Window": st.column_config.SelectboxColumn(
                             "Basis Window",
-                            options=list(basis_mode_options.keys()),
+                            options=basis_window_options,
                             required=True,
-                        )
+                            help="P3M = avg last 3 months, P6M = avg last 6 months, etc. 'specific months' = manual pick below.",
+                        ),
                     },
                     disabled=[MONTHLY_SFU_VERSION_COL],
                     use_container_width=True,
                     key="sfu_basis_editor",
-                    height=min(400, 60 + len(sfu_table) * 35),
+                    height=min(450, 60 + len(sfu_config_df) * 35),
                 )
 
-                st.write("### 2. Manual Month Selection")
-                st.caption("If 'Manual' is selected above, pick the months to include for those SFUs.")
-                
-                # Combine all available months from all potential sources to give a full list
-                all_avail_months = set()
-                for src in available_basis_sources:
-                    df_tmp = _get_df(src)
-                    if df_tmp is not None:
-                        all_avail_months.update(detect_month_columns(df_tmp))
-                
-                manual_months = st.multiselect(
-                    "Manual months for basis (applies to SFUs set to 'Manual'):",
-                    sorted(list(all_avail_months), key=lambda x: parse_month_to_date(x) or pd.Timestamp.min),
-                    default=st.session_state.get("sfu_manual_months", []),
-                    key="sfu_manual_months_sel"
-                )
-                st.session_state.sfu_manual_months = manual_months
+                # ── Step 2: per-SFU manual month selection (only for "specific months" rows) ──
+                specific_sfu_rows = [
+                    r for _, r in edited_sfu.iterrows()
+                    if str(r.get("Basis Window", "")) == "specific months"
+                ]
+                saved_specific: dict = st.session_state.get("sfu_specific_months", {})
 
-                if st.button("Compute BOP Salience (SFU Level)", type="primary"):
-                    new_sfu_configs = {}
-                    for _, row in edited_sfu.iterrows():
-                        v = row[MONTHLY_SFU_VERSION_COL]
-                        new_sfu_configs[v] = {
-                            "source": row["Basis Source"],
-                            "mode": row["Basis Window"],
-                            "selected": manual_months if row["Basis Window"] == "selected" else []
+                if specific_sfu_rows:
+                    st.markdown("#### Step 2 — Manual Month Selection per SFU Version")
+                    st.caption(
+                        "For each SFU Version set to *specific months*, pick the exact months "
+                        "to use as basis. Expand a row to configure it."
+                    )
+                    # Render one expander per SFU that needs manual months
+                    new_specific: dict = {}
+                    for r in specific_sfu_rows:
+                        v = r[MONTHLY_SFU_VERSION_COL]
+                        src_for_months = str(r.get("Basis / Metric", available_basis_sources[0]))
+                        # Offer months from the SFU's own chosen source sheet first, fallback to all
+                        src_df_m = _get_df(src_for_months)
+                        if src_df_m is not None:
+                            cmap_m = st.session_state.col_maps.get(src_for_months, {})
+                            src_months = sorted(
+                                [m for m in cmap_m.get("_months", detect_month_columns(src_df_m))
+                                 if (parse_month_to_date(m) or pd.Timestamp.max) < current_month_start_sal],
+                                key=lambda x: parse_month_to_date(x) or pd.Timestamp.min,
+                            )
+                        else:
+                            src_months = all_past_months_sorted
+                        prev_sel = saved_specific.get(v, [])
+                        # Filter previous selection to only valid months for this source
+                        valid_prev = [m for m in prev_sel if m in src_months]
+                        with st.expander(f"📅 {v}  ({src_for_months})", expanded=(not valid_prev)):
+                            chosen = st.multiselect(
+                                f"Months for **{v}**:",
+                                src_months,
+                                default=valid_prev,
+                                key=f"sfu_specific_{v}",
+                            )
+                        new_specific[v] = chosen
+                    st.session_state.sfu_specific_months = new_specific
+                else:
+                    new_specific = st.session_state.get("sfu_specific_months", {})
+
+                # ── Step 3: live preview table ───────────────────────────────
+                st.markdown("#### Step 3 — Preview: Basis Values and Salience")
+                st.caption(
+                    "The table below shows the actual historical values for the **last 6 months** (P6M→P1M) "
+                    "pulled from the selected Basis / Metric sheet for each SFU Version, "
+                    "plus the **Final Basis** (avg over the chosen window) and the resulting **Salience %**. "
+                    "Edit **Remarks** directly in the table."
+                )
+
+                # Build per-SFU config dict from edited table
+                preview_configs: dict[str, dict] = {}
+                for _, r in edited_sfu.iterrows():
+                    v = r[MONTHLY_SFU_VERSION_COL]
+                    window_lbl = str(r.get("Basis Window", "P3M"))
+                    preview_configs[v] = {
+                        "source": str(r.get("Basis / Metric", available_basis_sources[0])),
+                        "mode": basis_window_mode_map.get(window_lbl, "last_3"),
+                        "selected": new_specific.get(v, []) if window_lbl == "specific months" else [],
+                    }
+
+                # Compute Final Basis for each SFU for salience % calculation
+                sfu_final_basis: dict[str, float] = {}
+                for v, cfg_p in preview_configs.items():
+                    sfu_final_basis[v] = _sfu_basis_value(v, cfg_p["source"], cfg_p["mode"], cfg_p["selected"])
+
+                # Normalize to salience % within each SFU version group
+                # (each SFU's share = its basis / sum of all SFU bases)
+                total_basis = sum(b for b in sfu_final_basis.values() if not pd.isna(b))
+
+                # Build preview rows
+                preview_rows = []
+                for v, cfg_p in preview_configs.items():
+                    src_role = cfg_p["source"]
+                    row_p: dict = {
+                        "SFU_SFU Version": v,
+                        "Basis / Metric": src_role,
+                        "Basis Window": next(
+                            (k for k, mv in basis_window_mode_map.items() if mv == cfg_p["mode"]),
+                            cfg_p["mode"],
+                        ),
+                    }
+                    for lbl, actual_col in preview_col_map.items():
+                        row_p[lbl] = _sfu_month_val(v, src_role, actual_col)
+                    final_b = sfu_final_basis.get(v, float("nan"))
+                    row_p["Final Basis"] = round(final_b, 2) if not pd.isna(final_b) else None
+                    sal_pct = (final_b / total_basis * 100) if (total_basis > 0 and not pd.isna(final_b)) else None
+                    row_p["Salience %"] = round(sal_pct, 2) if sal_pct is not None else None
+                    row_p["Remarks"] = saved_remarks.get(v, "")
+                    preview_rows.append(row_p)
+
+                preview_df = pd.DataFrame(preview_rows)
+
+                # Build column config for preview table
+                preview_col_cfg: dict = {
+                    "SFU_SFU Version": st.column_config.TextColumn("SFU_SFU Version", disabled=True),
+                    "Basis / Metric": st.column_config.TextColumn("Basis / Metric", disabled=True),
+                    "Basis Window": st.column_config.TextColumn("Basis Window", disabled=True),
+                    "Final Basis": st.column_config.NumberColumn("Final Basis Calculated", format="%.2f", disabled=True),
+                    "Salience %": st.column_config.NumberColumn("Salience %", format="%.2f %%", disabled=True),
+                    "Remarks": st.column_config.TextColumn("Remarks", help="Add any notes about this SFU version's basis choice."),
+                }
+                for lbl in preview_labels:
+                    preview_col_cfg[lbl] = st.column_config.NumberColumn(
+                        lbl,
+                        format="%.2f",
+                        disabled=True,
+                        help=f"Actual value for {preview_col_map.get(lbl, lbl)} from the selected basis sheet.",
+                    )
+
+                # Column order: SFU_v, Basis, Window, P6M…P1M, Final, Salience, Remarks
+                ordered_cols = (
+                    ["SFU_SFU Version", "Basis / Metric", "Basis Window"]
+                    + preview_labels
+                    + ["Final Basis", "Salience %", "Remarks"]
+                )
+                ordered_cols = [c for c in ordered_cols if c in preview_df.columns]
+
+                edited_preview = st.data_editor(
+                    preview_df[ordered_cols],
+                    column_config=preview_col_cfg,
+                    use_container_width=True,
+                    key="sfu_preview_editor",
+                    height=min(500, 60 + len(preview_df) * 35),
+                    num_rows="fixed",
+                )
+
+                # ── Step 4: Exclusions before salience ──────────────────────
+                st.markdown("#### Step 4 — Exclusions")
+                st.caption(
+                    "Select any **SFU Versions or APO Products** to exclude before salience is calculated. "
+                    "Excluded items will receive a salience weight of **0** and will not participate in the split."
+                )
+
+                sku_df_excl = st.session_state.sku_df_filtered
+                exc_store_sal: ExceptionStore = st.session_state.exc_store
+                hcm_excl = hier_col_map_from_state()
+                sku_col_excl = hcm_excl.get("SKU", MONTHLY_SFU_V_COL)
+
+                # Try to get product description column from Monthly sheet
+                monthly_df = None
+                for sheet_name in ["Shipments", "Consumption", "Monthly"]:
+                    df = _get_df(sheet_name)
+                    if df is not None and not df.empty:
+                        monthly_df = df
+                        break
+                desc_col = None
+                if monthly_df is not None:
+                    for cand in ["Product Description", "Description", "Desc"]:
+                        for c in monthly_df.columns:
+                            if cand.lower() in c.lower():
+                                desc_col = c
+                                break
+                        if desc_col:
+                            break
+
+                if sku_df_excl is not None and not sku_df_excl.empty:
+                    # Build a display table of all APO Products with their SFU Version
+                    excl_cols = []
+                    if MONTHLY_SFU_VERSION_COL in sku_df_excl.columns:
+                        excl_cols.append(MONTHLY_SFU_VERSION_COL)
+                    if sku_col_excl in sku_df_excl.columns and sku_col_excl != MONTHLY_SFU_VERSION_COL:
+                        excl_cols.append(sku_col_excl)
+                    # Add hierarchy cols for context
+                    for h in HIERARCHY_LEVELS:
+                        actual_h = hcm_excl.get(h)
+                        if actual_h and actual_h in sku_df_excl.columns and actual_h not in excl_cols:
+                            excl_cols.append(actual_h)
+
+                    # Add product description if available
+                    if desc_col and monthly_df is not None and sku_col_excl in monthly_df.columns:
+                        # Build a mapping: APO Product -> description (pick first non-null)
+                        desc_map = monthly_df.drop_duplicates(subset=[sku_col_excl]).set_index(sku_col_excl)[desc_col].to_dict()
+                        sku_df_excl = sku_df_excl.copy()
+                        sku_df_excl["Product Description"] = sku_df_excl[sku_col_excl].map(desc_map)
+                        if "Product Description" not in excl_cols:
+                            excl_cols.append("Product Description")
+
+                    if excl_cols:
+                        excl_display = (
+                            sku_df_excl[excl_cols]
+                            .drop_duplicates()
+                            .sort_values(excl_cols)
+                            .reset_index(drop=True)
+                        )
+                        # Mark rows already globally excluded
+                        excl_display["Exclude"] = excl_display[sku_col_excl].isin(
+                            exc_store_sal.global_exclusions
+                        ) if sku_col_excl in excl_display.columns else False
+
+                        # Column order: Exclude checkbox first, then SFU Version, APO Product, description, hierarchy
+                        excl_ordered = ["Exclude"] + [c for c in excl_cols if c in excl_display.columns]
+                        excl_col_cfg: dict = {
+                            "Exclude": st.column_config.CheckboxColumn(
+                                "Exclude",
+                                help="Check to exclude this APO Product from salience calculation.",
+                            ),
                         }
-                    
+                        if MONTHLY_SFU_VERSION_COL in excl_display.columns:
+                            excl_col_cfg[MONTHLY_SFU_VERSION_COL] = st.column_config.TextColumn(
+                                "SFU Version", disabled=True
+                            )
+                        if sku_col_excl in excl_display.columns:
+                            excl_col_cfg[sku_col_excl] = st.column_config.TextColumn(
+                                "APO Product", disabled=True
+                            )
+                        if "Product Description" in excl_display.columns:
+                            excl_col_cfg["Product Description"] = st.column_config.TextColumn(
+                                "Product Description", disabled=True
+                            )
+
+                        edited_excl = st.data_editor(
+                            excl_display[excl_ordered],
+                            column_config=excl_col_cfg,
+                            disabled=[c for c in excl_ordered if c != "Exclude"],
+                            use_container_width=True,
+                            key="sfu_exclusion_editor",
+                            height=min(400, 60 + len(excl_display) * 35),
+                            num_rows="fixed",
+                        )
+
+                        # Apply exclusion changes immediately to exc_store
+                        if st.button("💾 Save Exclusions", key="save_excl_btn"):
+                            # Clear existing global exclusions that were set via this editor
+                            # (only touch ones that appear in this table)
+                            all_skus_in_table = set(
+                                excl_display[sku_col_excl].dropna().astype(str).tolist()
+                            ) if sku_col_excl in excl_display.columns else set()
+                            exc_store_sal.global_exclusions -= all_skus_in_table
+                            # Re-add checked ones
+                            newly_excluded = set()
+                            for _, erow in edited_excl.iterrows():
+                                if erow.get("Exclude"):
+                                    sku_val = str(erow.get(sku_col_excl, ""))
+                                    if sku_val:
+                                        exc_store_sal.add_global_exclusion(sku_val, notes="Excluded before salience in Step 4")
+                                        newly_excluded.add(sku_val)
+                            st.session_state.exc_store = exc_store_sal
+                            if newly_excluded:
+                                st.success(f"✅ {len(newly_excluded)} APO Product(s) marked for exclusion: {', '.join(sorted(newly_excluded))}")
+                            else:
+                                st.info("No exclusions set — all APO Products will be included in salience.")
+                            st.rerun()
+
+                        # Show current exclusion summary
+                        current_excl = exc_store_sal.global_exclusions & (
+                            set(excl_display[sku_col_excl].dropna().astype(str).tolist())
+                            if sku_col_excl in excl_display.columns else set()
+                        )
+                        if current_excl:
+                            st.warning(
+                                f"⚠️ **{len(current_excl)} APO Product(s) currently excluded** "
+                                f"(will be skipped in salience): "
+                                f"{', '.join(sorted(current_excl))}"
+                            )
+                    else:
+                        st.info("No APO Product data available — complete Step 3 first.")
+                else:
+                    st.info("No SFU_v data loaded yet — complete Step 3 first.")
+
+                # ── Compute button ───────────────────────────────────────────
+                if st.button("✅ Compute BOP Salience (SFU Level)", type="primary"):
+                    # Save remarks
+                    new_remarks = {}
+                    for _, pr in edited_preview.iterrows():
+                        new_remarks[pr["SFU_SFU Version"]] = str(pr.get("Remarks", "") or "")
+                    st.session_state.sfu_remarks = new_remarks
+
+                    # Persist per-SFU specific month selections
+                    st.session_state.sfu_specific_months = new_specific
+
+                    # Save configs
+                    new_sfu_configs: dict = {}
+                    for v, cfg_p in preview_configs.items():
+                        new_sfu_configs[v] = cfg_p
                     st.session_state.sfu_basis_sources = new_sfu_configs
+
                     with st.spinner("Computing BOP salience…"):
                         bop_sal = _compute_bop_salience(new_sfu_configs)
                     if bop_sal is not None and not bop_sal.empty:
                         st.session_state.salience_df = bop_sal
                         st.session_state.blocking_groups = []
-                        st.success(f"BOP salience computed — {len(bop_sal):,} rows.")
+                        st.success(f"✅ BOP salience computed — {len(bop_sal):,} rows.")
                         st.rerun()
                     else:
                         st.error(
-                            "Could not compute BOP salience. Ensure the selected source sheets have enough past months "
+                            "Could not compute BOP salience. "
+                            "Ensure the selected source sheets have enough past months "
                             "and the data matches the SFU versions."
                         )
-            else:
-                st.info(
-                    f"BOP auto-salience requires the **Shipments** sheet with a **{MONTHLY_SFU_VERSION_COL}** column. "
-                    "Load a BOP Excel file to enable this feature."
-                )
 
     # ── Optional: override with historical basis ───────────────────────────────
     BASIS_SOURCES = [r for r in SKU_SHEETS if r in st.session_state.sheet_map]

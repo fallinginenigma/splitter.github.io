@@ -39,6 +39,10 @@ SAS_HIERARCHY_MAP: dict[str, str] = {
 # Optional pinned-SFU_v column in SAS (only populated when BB is pegged to 1 SFU_v)
 SAS_SFU_V_COL = "Specific SFU_v"
 
+# GBB Type column in SAS — canonical name plus known variants
+SAS_GBB_TYPE_COL = "GBB Type"
+SAS_GBB_TYPE_VARIANTS = ["GBB Type", "GBB_Type", "Plan Type", "gbb_type"]
+
 # Logical name → actual column name in the Monthly sheet (before renaming)
 MONTHLY_HIERARCHY_MAP: dict[str, str] = {
     "Ctry":         "Reporting Country",
@@ -89,10 +93,16 @@ def detect_bop_col_maps(sheets: dict[str, pd.DataFrame]) -> tuple[dict, dict]:
         sheet_map["SAS"] = "SAS"
         month_cols = detect_month_columns(sas_df)
         bb_id_default = "Plan Name_Brand" if "Plan Name_Brand" in sas_df.columns else None
+        # Detect GBB Type column (try canonical name first, then variants)
+        gbb_col_actual = next(
+            (c for c in SAS_GBB_TYPE_VARIANTS if c in sas_df.columns), None
+        )
         col_maps["SAS"] = {
             **{k: v for k, v in SAS_HIERARCHY_MAP.items() if v in sas_df.columns},
             "BB_ID": bb_id_default,  # "Plan Name_Brand" if available, else generated in Step 3
         }
+        if gbb_col_actual:
+            col_maps["SAS"]["GBB Type"] = gbb_col_actual
 
     # Measure-derived sheets (Shipments, Statistical Forecast, …) -------
     for measure in MONTHLY_MEASURES:
@@ -172,7 +182,16 @@ def _load_bop_openpyxl(xl: pd.ExcelFile) -> dict[str, pd.DataFrame]:
     # --- SAS ----------------------------------------------------------------
     sas_df = xl.parse("SAS", header=0)
     sas_df = _normalize_sas_month_cols(sas_df)   # Timestamp → "Nov-25"
-    sas_df.columns = [normalize_month_label(str(c)) for c in sas_df.columns]
+    # Only normalise columns that look like month labels — leave all other
+    # columns (GBB Type, Plan Name, Entry Type, …) completely untouched.
+    sas_df.columns = [
+        normalize_month_label(str(c)) if (
+            isinstance(c, (pd.Timestamp,))
+            or MONTH_PATTERN.match(str(c).strip())
+            or re.match(r"^\d{4}-\d{2}-\d{2}", str(c).strip())
+        ) else str(c)
+        for c in sas_df.columns
+    ]
     # Create composite BB_ID: "Plan Name_Brand"
     if "Plan Name" in sas_df.columns and "Brand" in sas_df.columns:
         sas_df["Plan Name_Brand"] = (
@@ -323,13 +342,15 @@ def normalize_month_label(label: str) -> str:
     # 2. Existing pattern-based normalization (Jan-25, Jan 25, etc.)
     m = MONTH_PATTERN.match(label)
     if not m:
-        # One last try: if it looks like there's a month name and a year
-        try:
-            ts = pd.to_datetime(label)
-            if 2010 < ts.year < 2050:
-                return ts.strftime("%b-%y")
-        except:
-            pass
+        # One last try: only attempt date-parsing if the string contains a digit
+        # (prevents "GBB Type", "Plan Name" etc. from being mangled)
+        if re.search(r"\d", label):
+            try:
+                ts = pd.to_datetime(label)
+                if 2010 < ts.year < 2050:
+                    return ts.strftime("%b-%y")
+            except:
+                pass
         return label
 
     parts = re.split(r"[- ]+", label, maxsplit=1)
