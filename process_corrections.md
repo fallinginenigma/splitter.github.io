@@ -59,6 +59,28 @@ Format for each correction:
 
 <!-- Add your corrections below this line -->
 
+### [C-301] Update GBB Type Split Level Defaults
+- **Current behaviour:** Brand Building Activities splits at Form level; Customer Inventory Strategy splits at Form level (user-defined)
+- **Expected behaviour:** Brand Building Activities should split at Brand level; Customer Inventory Strategy should split at Brand level (user-defined)
+- **Where in code:** `bop_splitter/salience.py → GBB_TYPE_RULES`
+- **Priority:** High
+
+**Updated GBB Type rules:**
+| GBB Type | Split Level | Action |
+|---|---|---|
+| Brand Building Activities | **Brand** | split |
+| Promotions - Go To Market | Form | exceptions |
+| New Channels | Form | exceptions |
+| Initiatives | Form | ignore |
+| Pricing Strategy | Brand | split |
+| Market Trend | Sub Brand | split |
+| Customer Inventory Strategy | **Brand** | split (user-defined) |
+
+### [C-302] Consider Only SFUs with Future FFF
+- **Current behaviour:** All SFU_vs are considered during split regardless of future forecast availability
+- **Expected behaviour:** Only consider SFU_vs that have FFF (Final Forecast to Finance) values in the future months during the split
+- **Where in code:** `app.py → step3_filters()` and split logic
+- **Priority:** High
 
 ---
 
@@ -75,6 +97,14 @@ Format for each correction:
 
 <!-- Add your corrections below this line -->
 
+### [C-401] Remove Equal Split and Historical Override Methods
+- **Current behaviour:** Three salience methods available: Equal split (default), BOP Auto-Salience (per SFU_SFU Version), and Historical Override (per APO Product)
+- **Expected behaviour:** Remove methods 1 (Equal split) and 3 (Historical Override). Only keep BOP Auto-Salience method since we always need to split at SFU_v level and methods 2 & 3 are similar
+- **Where in code:** `app.py → step4_salience()`
+- **Priority:** Medium
+
+**Simplified salience approach:**
+- **BOP Auto-Salience (SFU_v level only)** — per SFU_SFU Version, choose source (Shipments/Consumption/Retailing) + time window (P3M/P6M/P9M/P12M/specific months) → mean historical value determines proportional weight
 
 ---
 
@@ -105,6 +135,33 @@ Format for each correction:
 **Current output sheets:** BOP_Split_Forecast, Salience_Table, Exception_Log, Validation_Report, Run_Settings.
 
 <!-- Add your corrections below this line -->
+
+### [C-701] Add Reasonability Check Step Before Download
+- **Current behaviour:** No validation step between Step 6 (Run Split) and Step 7 (Download)
+- **Expected behaviour:** Add a new validation step (Step 6.5 or separate tab in Step 6) where users can review split reasonability before downloading
+- **Priority:** High
+
+**Reasonability Check Requirements:**
+- Display format: SKUs (SFU_SFU Version) in rows, future demand months in columns
+- Color coding logic:
+  - **Blue highlight**: Demand > 120% of baseline average
+  - **Yellow highlight**: Demand < 80% of baseline average
+  - **No highlight**: Demand within 80-120% range
+- User-configurable options:
+  - Tolerance threshold (default: 80-120%)
+  - Baseline calculation options:
+    - Past 3 months average (default)
+    - Past 6 months average
+  - Baseline metric options:
+    - Shipments (default)
+    - Sellout/Retailing
+- Table structure:
+  ```
+  | SFU_SFU Version | Future Month 1 | Future Month 2 | Future Month 3 | ... |
+  | --------------- | -------------- | -------------- | -------------- | --- |
+  | 1000966943_00   | [value]        | [value]        | [value]        | ... |
+  | 1000966945_00   | [value]        | [value]        | [value]        | ... |
+  ```
 
 
 ---
@@ -142,17 +199,47 @@ Format for each correction:
 
 <!-- Add your corrections below this line -->
 
-Combine both Step 1 and 2 together, also - most of this should work on autopicking and the user can review and change if needed.
+### [C-901] Combine Steps 1 & 2 with Auto-Picking
+- **Current behaviour:** Step 1 (Load Data) and Step 2 (Column Mapping) are separate steps
+- **Expected behaviour:** Combine both steps together; most mappings should work on auto-picking with user review/override capability
+- **Where in code:** `app.py → step1_upload()` and `step2_columns()`
+- **Priority:** Medium
 
-General Rules:
+### [C-902] Terminology & Synonym Handling
+Document standard terminology and synonyms used throughout the application:
 
-  1. "Stat", "Statistical forecast", "LDS", and "Stat forecast" all mean the same thing.
-  2. "Final Forecast to Finance" can also be called "FFF".
-  3. SAS data for each building block is divided by 1000, therefore before splitting the building blocks, multiply it by 1000.
-  4. Each line in SAS is called a building block, GBBs, and have GBB Type and volume across the months
-  4. GCAS/FPC/APO Product is an eight digit code: all of them mean the same.
-  5. SFU_SFU Version can also be called "SFU_v" and is the SKU in our context, always ensure that the numbers are split or aggregated to an SFU_v level. One SFU_v combination can have multiple GCAS/FPC/APO Product codes.
-  6. The Monthly file is a SAP BW workbook output that has multiple key figures: Shipments, FFF, and Stat Forecast.
-  7. The data for Shipment, FFF, Stat, and SAS is called volume. The unit of measure is SU.
-  8. When splitting the GBBs, this would be the general thumb rule:
-    
+**Forecast Types:**
+- "Stat", "Statistical Forecast", "LDS", "Stat Forecast" → all mean the same thing
+- "Final Forecast to Finance" = "FFF"
+
+**Product Identifiers:**
+- GCAS = FPC = APO Product (8-digit code) → all mean the same
+- SFU_SFU Version = SFU_v = SFU = "SKU" in this context
+- One SFU_v can have multiple GCAS/FPC/APO Product codes
+
+**Data Files:**
+- Monthly file = SAP BW workbook output with key figures: Shipments, FFF, Stat Forecast
+- All data (Shipments, FFF, Stat, SAS) is called "volume" with unit of measure = SU (Sales Units)
+
+**Other Terms:**
+- Sellout = Retailing (interchangeable)
+- Each line in SAS = Building Block = GBB (with GBB Type and volume across months)
+
+### [C-903] SAS Volume Scaling
+- **Current behaviour:** SAS data used as-is from the input file
+- **Expected behaviour:** SAS data for each building block is divided by 1000 in the input file, so **multiply by 1000** before splitting
+- **Where in code:** `app.py → step3_filters()` or split preprocessing
+- **Priority:** High
+
+### [C-904] Split Level SKU Selection Rules
+Document which SKUs should be considered at each split level (from Monthly sheet):
+
+| Split Level  | SKUs to Consider                           |
+| ------------ | ------------------------------------------ |
+| SMO Category | All SKUs that belong to that Category      |
+| Brand        | All SKUs that belong to that Brand         |
+| Sub Brand    | All SKUs that belong to that Family Name 1 |
+| Form         | All SKUs that belong to that Family Name 2 |
+| Sub Form     | All SKUs that belong to that Family Name 3 |
+
+**Note:** Current implementation only has levels up to Form. Sub Form would need to be added if required.
