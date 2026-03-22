@@ -115,7 +115,8 @@ STEPS = [
     "4. Basis & Salience",
     "5. Exceptions",
     "6. Run Split",
-    "7. Download",
+    "7. Reasonability Check",
+    "8. Download",
 ]
 
 with st.sidebar:
@@ -1071,6 +1072,8 @@ def step3_filters():
             sas_df[month_cols] = sas_df[month_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
             # Group and sum — metadata columns are part of the key so they survive
             sas_df = sas_df.groupby(full_group_keys, as_index=False, dropna=False)[month_cols].sum()
+            # C-903: SAS values are stored /1000 in the source file — multiply back to real SU volume
+            sas_df[month_cols] = sas_df[month_cols] * 1000
             # Update session state with aggregated data
             st.session_state.sheets[st.session_state.sheet_map["SAS"]] = sas_df
 
@@ -1373,6 +1376,33 @@ def step3_filters():
 
         sas_out = sas_df.reset_index(drop=True)
         sku_out = sku_merged.reset_index(drop=True)
+
+        # C-302: Only retain SFU_vs that have at least one non-zero FFF value in future months
+        fff_df = _get_df("Final Fcst to Finance")
+        if fff_df is not None and not fff_df.empty and MONTHLY_SFU_VERSION_COL in fff_df.columns:
+            fff_months = detect_month_columns(fff_df)
+            current_month_start_filter = pd.Timestamp.now().normalize().replace(day=1)
+            future_fff_months = [
+                m for m in fff_months
+                if (parse_month_to_date(m) or pd.Timestamp.min) >= current_month_start_filter
+            ]
+            if future_fff_months:
+                fff_numeric = fff_df[future_fff_months].apply(pd.to_numeric, errors="coerce").fillna(0)
+                fff_df = fff_df.copy()
+                fff_df["_has_fff"] = fff_numeric.sum(axis=1) > 0
+                sfus_with_fff = set(
+                    fff_df.loc[fff_df["_has_fff"], MONTHLY_SFU_VERSION_COL].dropna().astype(str).tolist()
+                )
+                if sfus_with_fff and MONTHLY_SFU_VERSION_COL in sku_out.columns:
+                    original_count = len(sku_out[MONTHLY_SFU_VERSION_COL].unique())
+                    sku_out = sku_out[sku_out[MONTHLY_SFU_VERSION_COL].astype(str).isin(sfus_with_fff)].reset_index(drop=True)
+                    filtered_count = len(sku_out[MONTHLY_SFU_VERSION_COL].unique())
+                    if filtered_count < original_count:
+                        st.info(
+                            f"ℹ️ Filtered to **{filtered_count}** SFU_vs with future FFF "
+                            f"(removed {original_count - filtered_count} with no future Final Forecast to Finance)."
+                        )
+
         st.session_state.sas_df_filtered = sas_out
         st.session_state.sku_df_filtered = sku_out
 
@@ -1533,20 +1563,8 @@ def step4_salience():
     split_level = st.session_state.split_level
     exc_store = st.session_state.exc_store
 
-    # ── Auto salience status ──────────────────────────────────────────────────
+    # ── BOP Auto-Salience is the only supported salience method ──────────────
     bb_split_levels = st.session_state.get("bb_split_levels", {})
-    if bb_split_levels:
-        level_counts = {}
-        for lvl in bb_split_levels.values():
-            level_counts[lvl] = level_counts.get(lvl, 0) + 1
-        level_summary = ", ".join(f"{cnt} BB(s) at **{lvl}**" for lvl, cnt in level_counts.items())
-        st.info(f"**Equal split applied per Building Block** — {level_summary}.")
-    else:
-        st.info(
-            f"**Equal split applied automatically** — each Building Block's value is divided equally "
-            f"among the SFU_vs that match its **{split_level}** criteria "
-            f"({' + '.join(SPLIT_KEYS[split_level])})."
-        )
 
     if sal_df is not None and not sal_df.empty:
         display_sal = sal_df.drop(columns=["_split_level"], errors="ignore").copy()
@@ -2061,93 +2079,7 @@ def step4_salience():
                             "and the data matches the SFU versions."
                         )
 
-    # ── Optional: override with historical basis ───────────────────────────────
-    BASIS_SOURCES = [r for r in SKU_SHEETS if r in st.session_state.sheet_map]
-    if BASIS_SOURCES:
-        with st.expander("Override with Historical Basis (optional)", expanded=False):
-            st.caption(
-                "Use actual sales data to weight SFU_vs by their historical share instead of an equal split."
-            )
-            col1, col2 = st.columns(2)
-
-            basis_source = col1.selectbox(
-                "Basis Source Sheet",
-                BASIS_SOURCES,
-                index=BASIS_SOURCES.index(st.session_state.basis_source) if st.session_state.basis_source in BASIS_SOURCES else 0,
-                key="basis_source_sel",
-            )
-
-            basis_mode_options = {
-                "last_3": "Past 3 months avg",
-                "last_6": "Past 6 months avg",
-                "last_9": "Past 9 months avg",
-                "last_12": "Past 12 months avg",
-                "selected": "Selected specific months",
-            }
-            basis_mode = col2.selectbox(
-                "Window",
-                list(basis_mode_options.keys()),
-                format_func=lambda k: basis_mode_options[k],
-                index=list(basis_mode_options.keys()).index(st.session_state.basis_mode),
-                key="basis_mode_sel",
-            )
-
-            basis_months_selected = []
-            if basis_mode == "selected":
-                basis_df_tmp = _get_df(basis_source)
-                cmap_tmp = st.session_state.col_maps.get(basis_source, {})
-                avail_months = cmap_tmp.get("_months", detect_month_columns(basis_df_tmp) if basis_df_tmp is not None else [])
-                basis_months_selected = st.multiselect(
-                    "Select months for basis", avail_months,
-                    default=st.session_state.basis_months_selected, key="basis_months_sel",
-                )
-
-            if st.button("Compute Historical Salience", type="secondary"):
-                basis_df_raw = _get_df(basis_source)
-                if basis_df_raw is None:
-                    st.error("Basis source sheet not found.")
-                else:
-                    cmap = st.session_state.col_maps.get(basis_source, {})
-                    month_cols = cmap.get("_months", detect_month_columns(basis_df_raw))
-
-                    basis_df_slim = basis_df_raw.copy()
-                    basis_vals = compute_basis(basis_df_slim, month_cols, basis_mode, basis_months_selected)
-                    basis_df_slim["_basis_val"] = basis_vals
-
-                    merge_keys = [
-                        v for k, v in hcm.items()
-                        if k != "SKU" and v in sku_filtered.columns and v in basis_df_slim.columns
-                    ]
-                    sku_key_col = hcm.get("SKU")
-                    if sku_key_col and sku_key_col in sku_filtered.columns and sku_key_col in basis_df_slim.columns:
-                        merge_keys = merge_keys + [sku_key_col]
-
-                    if merge_keys:
-                        basis_slim = basis_df_slim[merge_keys + ["_basis_val"]].drop_duplicates(subset=merge_keys)
-                        sku_work = sku_filtered.merge(basis_slim, on=merge_keys, how="left")
-                    else:
-                        sku_work = sku_filtered.copy()
-                        sku_work["_basis_val"] = np.nan
-
-                    basis_series = sku_work["_basis_val"] if "_basis_val" in sku_work.columns else pd.Series(np.nan, index=sku_work.index)
-
-                    new_sal, blocking = compute_salience(
-                        sfuv_df=sku_work,
-                        basis=basis_series,
-                        split_level=split_level,
-                        sfuv_col=hcm.get("SKU", "SKU"),
-                        hier_col_map=hcm,
-                        global_exclusions=exc_store.global_exclusions,
-                        overrides=st.session_state.sal_overrides,
-                    )
-                    st.session_state.salience_df = new_sal
-                    st.session_state.blocking_groups = blocking
-                    st.session_state.basis_source = basis_source
-                    st.session_state.basis_mode = basis_mode
-                    st.session_state.basis_months_selected = basis_months_selected
-                    st.rerun()
-
-    # ── Blocked groups (only relevant after historical basis) ─────────────────
+    # ── Blocked groups ────────────────────────────────────────────────────────
     blocking = st.session_state.blocking_groups
     if sal_df is not None and blocking:
         st.error(f"⚠️ **{len(blocking)} blocked group(s)** with zero/missing basis — override required:")
@@ -2438,17 +2370,161 @@ def step6_run():
         st.subheader("Output Preview (first 20 rows)")
         st.dataframe(st.session_state.output_wide.head(20), use_container_width=True)
 
-        if st.button("Proceed to Download →", type="primary"):
+        if st.button("Proceed to Reasonability Check →", type="primary"):
             st.session_state.step = max(st.session_state.step, 7)
             st.session_state.max_step = max(st.session_state.max_step, 7)
             st.rerun()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# STEP 7 – Download
+# STEP 7 – Reasonability Check
+# ──────────────────────────────────────────────────────────────────────────────
+def step7_reasonability():
+    st.header("Step 7 — Reasonability Check")
+    st.caption(
+        "Review the split output against historical actuals. "
+        "Cells highlighted in **🔵 blue** are above the upper tolerance; "
+        "cells in **🟡 yellow** are below the lower tolerance."
+    )
+
+    output_wide = st.session_state.output_wide
+    if output_wide is None or output_wide.empty:
+        st.warning("No split output yet — complete Step 6 first.")
+        return
+
+    # ── Controls ──────────────────────────────────────────────────────────────
+    col_tol1, col_tol2, col_window, col_metric = st.columns(4)
+    lower_pct = col_tol1.number_input("Lower tolerance (%)", min_value=0, max_value=100, value=80, step=5, key="rb_lower")
+    upper_pct = col_tol2.number_input("Upper tolerance (%)", min_value=100, max_value=500, value=120, step=5, key="rb_upper")
+    baseline_window = col_window.selectbox("Baseline window", ["Past 3 months", "Past 6 months"], key="rb_window")
+    baseline_metric = col_metric.selectbox("Baseline metric", ["Shipments", "Retailing"], key="rb_metric")
+
+    n_baseline = 3 if "3" in baseline_window else 6
+
+    # ── Get baseline data ─────────────────────────────────────────────────────
+    baseline_df = _get_df(baseline_metric)
+    if baseline_df is None:
+        baseline_df = _get_df("Shipments")  # fallback
+    if baseline_df is None:
+        st.warning(f"No {baseline_metric} sheet loaded — cannot compute baseline.")
+        return
+
+    baseline_months_all = detect_month_columns(baseline_df)
+    current_month_start_rb = pd.Timestamp.now().normalize().replace(day=1)
+    past_baseline_months = [
+        m for m in baseline_months_all
+        if (parse_month_to_date(m) or pd.Timestamp.max) < current_month_start_rb
+    ]
+    selected_baseline_months = past_baseline_months[-n_baseline:] if len(past_baseline_months) >= n_baseline else past_baseline_months
+
+    if not selected_baseline_months:
+        st.warning("No past months found in baseline sheet.")
+        return
+
+    # Aggregate baseline by SFU_SFU Version
+    if MONTHLY_SFU_VERSION_COL not in baseline_df.columns:
+        st.warning(f"`{MONTHLY_SFU_VERSION_COL}` column not found in {baseline_metric} sheet.")
+        return
+
+    baseline_numeric = baseline_df[[MONTHLY_SFU_VERSION_COL] + [m for m in selected_baseline_months if m in baseline_df.columns]].copy()
+    for m in selected_baseline_months:
+        if m in baseline_numeric.columns:
+            baseline_numeric[m] = pd.to_numeric(baseline_numeric[m], errors="coerce").fillna(0)
+
+    month_cols_avail = [m for m in selected_baseline_months if m in baseline_numeric.columns]
+    baseline_agg = (
+        baseline_numeric.groupby(MONTHLY_SFU_VERSION_COL, dropna=False)[month_cols_avail]
+        .sum()
+        .reset_index()
+    )
+    baseline_agg["_baseline_avg"] = baseline_agg[month_cols_avail].mean(axis=1)
+    baseline_avg_map = baseline_agg.set_index(MONTHLY_SFU_VERSION_COL)["_baseline_avg"].to_dict()
+
+    # ── Build the output pivot table at SFU_SFU Version level ─────────────────
+    future_months = st.session_state.sas_months_selected or []
+    future_months = [m for m in future_months if (parse_month_to_date(m) or pd.Timestamp.min) >= current_month_start_rb]
+
+    if MONTHLY_SFU_VERSION_COL not in output_wide.columns:
+        st.warning(f"`{MONTHLY_SFU_VERSION_COL}` column not found in split output.")
+        return
+
+    available_future = [m for m in future_months if m in output_wide.columns]
+    if not available_future:
+        st.warning("No future month columns found in the split output.")
+        return
+
+    pivot_cols = [MONTHLY_SFU_VERSION_COL] + available_future
+    pivot_df = (
+        output_wide[[c for c in pivot_cols if c in output_wide.columns]]
+        .groupby(MONTHLY_SFU_VERSION_COL, dropna=False)[available_future]
+        .sum()
+        .reset_index()
+    )
+    pivot_df["_baseline_avg"] = pivot_df[MONTHLY_SFU_VERSION_COL].map(baseline_avg_map).fillna(0)
+    lower_mult = lower_pct / 100.0
+    upper_mult = upper_pct / 100.0
+
+    # ── Apply conditional styling ─────────────────────────────────────────────
+    def _style_cell(val, baseline):
+        if pd.isna(val) or baseline == 0:
+            return ""
+        if val > baseline * upper_mult:
+            return "background-color: #cce5ff; color: #003366"  # blue
+        if val < baseline * lower_mult:
+            return "background-color: #fff3cd; color: #664d00"  # yellow
+        return ""
+
+    display_pivot = pivot_df.set_index(MONTHLY_SFU_VERSION_COL)
+    baseline_series = display_pivot.pop("_baseline_avg")
+
+    def _style_row(row):
+        bl = baseline_series.get(row.name, 0)
+        return [_style_cell(v, bl) for v in row]
+
+    styled = display_pivot.style.apply(_style_row, axis=1).format("{:,.1f}")
+
+    st.caption(
+        f"Baseline: **{baseline_metric}** avg over **{len(selected_baseline_months)} months** "
+        f"({', '.join(selected_baseline_months)}). "
+        f"Tolerance: {lower_pct}% – {upper_pct}%."
+    )
+
+    st.dataframe(
+        styled,
+        use_container_width=True,
+        height=min(600, 60 + len(display_pivot) * 35),
+    )
+
+    n_high = sum(
+        1 for sfu in display_pivot.index
+        for m in available_future
+        if (bl := baseline_series.get(sfu, 0)) > 0 and display_pivot.at[sfu, m] > bl * upper_mult
+    )
+    n_low = sum(
+        1 for sfu in display_pivot.index
+        for m in available_future
+        if (bl := baseline_series.get(sfu, 0)) > 0 and display_pivot.at[sfu, m] < bl * lower_mult
+    )
+
+    if n_high or n_low:
+        st.warning(
+            f"**{n_high}** cell(s) above {upper_pct}% of baseline (blue) · "
+            f"**{n_low}** cell(s) below {lower_pct}% of baseline (yellow)"
+        )
+    else:
+        st.success("All cells are within tolerance. ✅")
+
+    if st.button("Proceed to Download →", type="primary"):
+        st.session_state.step = max(st.session_state.step, 8)
+        st.session_state.max_step = max(st.session_state.max_step, 8)
+        st.rerun()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# STEP 8 – Download
 # ──────────────────────────────────────────────────────────────────────────────
 def step7_download():
-    st.header("Step 7 — Download Results")
+    st.header("Step 8 — Download Results")
 
     if st.session_state.output_wide is None:
         st.warning("No output yet — complete Step 6.")
@@ -2533,7 +2609,9 @@ def main():
         step5_exceptions()
     elif step == 6:
         step6_run()
-    elif step >= 7:
+    elif step == 7:
+        step7_reasonability()
+    elif step >= 8:
         step7_download()
 
 

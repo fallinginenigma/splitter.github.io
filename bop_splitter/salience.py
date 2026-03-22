@@ -26,10 +26,10 @@ SPLIT_KEYS: dict[str, list[str]] = {
 #   user_defined: if True, ask user to select the split level (overrides split_level default)
 GBB_TYPE_RULES: dict[str, dict] = {
     "Brand Building Activities": {
-        "split_level": "Form",
+        "split_level": "Brand",
         "action": "split",
         "user_defined": False,
-        "description": "Use all SKUs at Form level.",
+        "description": "Split across the brand.",
     },
     "Promotions - Go To Market": {
         "split_level": "Form",
@@ -62,10 +62,10 @@ GBB_TYPE_RULES: dict[str, dict] = {
         "description": "Split at Sub Brand level.",
     },
     "Customer Inventory Strategy": {
-        "split_level": "Form",
+        "split_level": "Brand",
         "action": "split",
         "user_defined": True,
-        "description": "Use all SKUs — split level defined by user.",
+        "description": "Split at Brand level — split level defined by user.",
     },
 }
 
