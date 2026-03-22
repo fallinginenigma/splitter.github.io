@@ -149,7 +149,7 @@ with st.sidebar:
             placeholder="e.g. UK_BabyPants_Mar2026",
             key="profile_name_input",
         )
-        if st.button("⬇️ Download profile as JSON", use_container_width=True, key="profile_save_btn"):
+        if st.button("⬇️ Download profile as JSON", width='stretch', key="profile_save_btn"):
             try:
                 profile_dict = build_profile(st.session_state, ExceptionStore)
                 profile_json = profile_to_json(profile_dict)
@@ -174,7 +174,7 @@ with st.sidebar:
             help="Upload a profile saved from a previous month to pre-fill all settings.",
         )
         if uploaded_profile is not None:
-            if st.button("✅ Apply profile", use_container_width=True, key="profile_apply_btn"):
+            if st.button("✅ Apply profile", width='stretch', key="profile_apply_btn"):
                 try:
                     raw = uploaded_profile.read().decode("utf-8")
                     profile_dict = profile_from_json(raw)
@@ -193,7 +193,7 @@ with st.sidebar:
                     st.error(f"Could not apply profile: {_le}")
 
     st.divider()
-    if st.button("↺ Reset All", use_container_width=True):
+    if st.button("↺ Reset All", width='stretch'):
         for k in list(st.session_state.keys()):
             del st.session_state[k]
         st.rerun()
@@ -333,7 +333,7 @@ def _show_bop_load_summary(sheets: dict) -> None:
             "Monthly column → renamed to SAS name": "— (SAS only)",
         })
 
-        st.dataframe(pd.DataFrame(mapping_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(mapping_rows), width='stretch', hide_index=True)
 
         if gbb_col_found:
             st.success(
@@ -361,15 +361,15 @@ def _show_bop_load_summary(sheets: dict) -> None:
             )
             if gbb_preview_col:
                 priority_cols = [gbb_preview_col] + [c for c in sas_df.columns if c != gbb_preview_col]
-                st.dataframe(sas_df[priority_cols].head(5), use_container_width=True)
+                st.dataframe(sas_df[priority_cols].head(5), width='stretch')
             else:
-                st.dataframe(sas_df.head(5), use_container_width=True)
+                st.dataframe(sas_df.head(5), width='stretch')
 
     # Monthly preview per measure
     for measure in MONTHLY_MEASURES:
         if measure in sheets:
             with st.expander(f"Preview Monthly · {measure} — first 5 rows"):
-                st.dataframe(sheets[measure].head(5), use_container_width=True)
+                st.dataframe(sheets[measure].head(5), width='stretch')
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -467,7 +467,7 @@ def step1_upload():
         if new_map:
             preview_role = st.selectbox("Preview sheet", list(new_map.keys()), key="preview_role")
             if preview_role:
-                st.dataframe(sheets[new_map[preview_role]].head(5), use_container_width=True)
+                st.dataframe(sheets[new_map[preview_role]].head(5), width='stretch')
 
         if st.button("Confirm Sheet Mapping →", type="primary", disabled=len(new_map) == 0):
             if "SAS" not in new_map:
@@ -1130,42 +1130,10 @@ def step3_filters():
         if forecast_month_cols_in_data:
             bb_table = bb_table.copy()
             bb_table["Total"] = bb_table[forecast_month_cols_in_data].apply(pd.to_numeric, errors="coerce").sum(axis=1)
-        st.dataframe(bb_table, use_container_width=True, height=min(400, 40 + len(bb_table) * 35))
+        st.dataframe(bb_table, width='stretch', height=min(400, 40 + len(bb_table) * 35))
         st.caption(f"**{len(bb_table)}** Building Blocks")
     else:
         st.info("No hierarchy columns mapped — configure hierarchy columns in Step 2 to see Building Blocks here.")
-
-    # ---- SFU_v Actuals & Forecasts (BOP only) ----
-    if st.session_state.get("_is_bop"):
-        st.subheader("SFU_v Actuals & Forecasts")
-        current_month_start = pd.Timestamp.now().normalize().replace(day=1)
-        st.caption(
-            f"Grouped by hierarchy + SFU_SFU Version (aggregated across APO Products). "
-            f"Shipments = last 12 months before **{current_month_start.strftime('%b-%Y')}**; "
-            f"forecasts = **{current_month_start.strftime('%b-%Y')}** onward."
-        )
-        with st.spinner("Aggregating…"):
-            sfuv_agg = _compute_sfuv_aggregates()
-
-        if sfuv_agg is not None:
-            display_col_map = {
-                "Shipments":             "Shipments — last 12 months",
-                "Statistical Forecast":  "Stat Forecast — future months",
-                "Final Fcst to Finance": "Final Fcst to Finance — future months",
-            }
-            display_df = sfuv_agg.rename(columns=display_col_map)
-            st.dataframe(
-                display_df,
-                use_container_width=True,
-                height=min(500, 60 + len(display_df) * 35),
-            )
-            st.caption(f"**{len(display_df):,}** rows")
-        else:
-            st.info(
-                f"SFU_v aggregate data unavailable — verify that the "
-                f"**{MONTHLY_SFU_VERSION_COL}** column exists in the Monthly sheet "
-                f"and that at least one measure was loaded."
-            )
 
     # ---- Diagnose SFU_v data availability ----
     sku_merged = _sku_merged()
@@ -1322,7 +1290,7 @@ def step3_filters():
             bb_editor_df,
             column_config=col_config,
             disabled=disabled_cols,
-            use_container_width=True,
+            width='stretch',
             key="bb_split_level_editor",
             height=min(450, 60 + len(bb_editor_df) * 35),
         )
@@ -1334,7 +1302,7 @@ def step3_filters():
                  "Action": v["action"], "Notes": v["description"]}
                 for k, v in GBB_TYPE_RULES.items()
             ]
-            st.dataframe(pd.DataFrame(rule_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(rule_rows), width='stretch', hide_index=True)
 
     else:
         # Fallback: single global split level radio when BB_ID not available
@@ -1612,7 +1580,7 @@ def step4_salience():
             col_cfg = {m: st.column_config.NumberColumn(m, format="%.2f") for m in sas_months}
             edited_pivot = st.data_editor(
                 pivot_df,
-                use_container_width=True,
+                width='stretch',
                 height=min(400, 50 + 35 * len(pivot_df)),
                 column_config=col_cfg,
                 num_rows="fixed",
@@ -1639,7 +1607,7 @@ def step4_salience():
             st.subheader(f"Current Salience Table — {len(display_sal)} rows (at SFU_SFU Version level)")
             st.dataframe(
                 display_sal,
-                use_container_width=True,
+                width='stretch',
                 height=300,
                 column_config={
                     "Salience %": st.column_config.NumberColumn("Salience %", format="%.2f %%"),
@@ -1780,7 +1748,7 @@ def step4_salience():
                         ),
                     },
                     disabled=[MONTHLY_SFU_VERSION_COL],
-                    use_container_width=True,
+                    width='stretch',
                     key="sfu_basis_editor",
                     height=min(450, 60 + len(sfu_config_df) * 35),
                 )
@@ -1909,7 +1877,7 @@ def step4_salience():
                 edited_preview = st.data_editor(
                     preview_df[ordered_cols],
                     column_config=preview_col_cfg,
-                    use_container_width=True,
+                    width='stretch',
                     key="sfu_preview_editor",
                     height=min(500, 60 + len(preview_df) * 35),
                     num_rows="fixed",
@@ -2003,7 +1971,7 @@ def step4_salience():
                             excl_display[excl_ordered],
                             column_config=excl_col_cfg,
                             disabled=[c for c in excl_ordered if c != "Exclude"],
-                            use_container_width=True,
+                            width='stretch',
                             key="sfu_exclusion_editor",
                             height=min(400, 60 + len(excl_display) * 35),
                             num_rows="fixed",
@@ -2093,7 +2061,7 @@ def step4_salience():
             _ctx_cols = [c for c in override_rows.columns if c not in ("basis", "flag")]
             edited = st.data_editor(
                 override_rows[_ctx_cols].assign(salience=override_rows["salience"].fillna(0.0)),
-                use_container_width=True,
+                width='stretch',
                 key="sal_override_editor",
                 num_rows="fixed",
                 disabled=[c for c in _ctx_cols if c != "salience"],
@@ -2228,7 +2196,7 @@ def step5_exceptions():
                                 row_data[m] = cur_fixed.get(sku, {}).get(m, 0.0)
                             fq_data.append(row_data)
                         fq_df = pd.DataFrame(fq_data)
-                        edited_fq = st.data_editor(fq_df, use_container_width=True, key=f"fq_editor_{selected_bb}", num_rows="fixed")
+                        edited_fq = st.data_editor(fq_df, width='stretch', key=f"fq_editor_{selected_bb}", num_rows="fixed")
                     else:
                         edited_fq = None
                 else:
@@ -2267,7 +2235,7 @@ def step5_exceptions():
         if log_df.empty:
             st.info("No exceptions logged yet.")
         else:
-            st.dataframe(log_df, use_container_width=True)
+            st.dataframe(log_df, width='stretch')
 
     if st.button("Proceed to Split →", type="primary"):
         st.session_state.step = max(st.session_state.step, 6)
@@ -2358,7 +2326,7 @@ def step6_run():
 
         if not validation_df.empty:
             st.warning(f"**{len(validation_df)} validation issue(s)** — review before downloading.")
-            st.dataframe(validation_df, use_container_width=True)
+            st.dataframe(validation_df, width='stretch')
         else:
             st.success("No validation issues.")
 
@@ -2368,7 +2336,7 @@ def step6_run():
     # Preview if already run
     if st.session_state.output_wide is not None:
         st.subheader("Output Preview (first 20 rows)")
-        st.dataframe(st.session_state.output_wide.head(20), use_container_width=True)
+        st.dataframe(st.session_state.output_wide.head(20), width='stretch')
 
         if st.button("Proceed to Reasonability Check →", type="primary"):
             st.session_state.step = max(st.session_state.step, 7)
@@ -2491,7 +2459,7 @@ def step7_reasonability():
 
     st.dataframe(
         styled,
-        use_container_width=True,
+        width='stretch',
         height=min(600, 60 + len(display_pivot) * 35),
     )
 
@@ -2557,26 +2525,26 @@ def step7_download():
         file_name=f"BOP_Split_Output_{ts}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
-        use_container_width=True,
+        width='stretch',
     )
 
     st.divider()
     tab_out, tab_sal, tab_exc, tab_val = st.tabs(["Split Forecast", "Salience Table", "Exception Log", "Validation"])
 
     with tab_out:
-        st.dataframe(output_wide, use_container_width=True, height=400)
+        st.dataframe(output_wide, width='stretch', height=400)
     with tab_sal:
-        st.dataframe(sal_df, use_container_width=True, height=400)
+        st.dataframe(sal_df, width='stretch', height=400)
     with tab_exc:
         if exc_log.empty:
             st.info("No exceptions logged.")
         else:
-            st.dataframe(exc_log, use_container_width=True)
+            st.dataframe(exc_log, width='stretch')
     with tab_val:
         if val_df.empty:
             st.success("No validation issues.")
         else:
-            st.dataframe(val_df, use_container_width=True)
+            st.dataframe(val_df, width='stretch')
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2590,7 +2558,7 @@ def main():
         st.divider()
         st.subheader("Jump to Step")
         max_step = st.session_state.max_step
-        jump = st.radio("", STEPS[:max_step], index=min(step - 1, max_step - 1), label_visibility="collapsed")
+        jump = st.radio("Navigate to step", STEPS[:max_step], index=min(step - 1, max_step - 1), label_visibility="collapsed")
         if jump:
             target = STEPS.index(jump) + 1
             if target != step:
