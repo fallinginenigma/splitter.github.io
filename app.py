@@ -1394,6 +1394,23 @@ def step3_filters():
         st.rerun()
 
 
+def _build_exclusion_upload_template(sku_col: str, months: list[str]) -> bytes:
+    """Build an Excel template for the exclusions upload (SKU column + month columns)."""
+    import io
+    template_months = months if months else ["Jan-26", "Feb-26", "Mar-26"]
+    template_df = pd.DataFrame(columns=[sku_col] + template_months)
+    # Add a couple of example rows
+    for i in range(2):
+        row = {sku_col: f"1234567{i}"}
+        for m in template_months:
+            row[m] = 0.0
+        template_df = pd.concat([template_df, pd.DataFrame([row])], ignore_index=True)
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        template_df.to_excel(writer, index=False, sheet_name="Exclusions")
+    return buf.getvalue()
+
+
 def _compute_bop_salience(sfu_configs: dict) -> pd.DataFrame | None:
     """
     Compute BOP salience at SFU_SFU Version level.
@@ -1887,7 +1904,8 @@ def step4_salience():
                 st.markdown("#### Step 4 — Exclusions")
                 st.caption(
                     "Select any **SFU Versions or APO Products** to exclude before salience is calculated. "
-                    "Excluded items will receive a salience weight of **0** and will not participate in the split."
+                    "Excluded items will receive a salience weight of **0** and will not participate in the split. "
+                    "SKUs with fewer than 3 months of shipments are flagged automatically and pre-checked for exclusion."
                 )
 
                 sku_df_excl = st.session_state.sku_df_filtered
@@ -1912,109 +1930,228 @@ def step4_salience():
                         if desc_col:
                             break
 
-                if sku_df_excl is not None and not sku_df_excl.empty:
-                    # Build a display table of all APO Products with their SFU Version
-                    excl_cols = []
-                    if MONTHLY_SFU_VERSION_COL in sku_df_excl.columns:
-                        excl_cols.append(MONTHLY_SFU_VERSION_COL)
-                    if sku_col_excl in sku_df_excl.columns and sku_col_excl != MONTHLY_SFU_VERSION_COL:
-                        excl_cols.append(sku_col_excl)
-                    # Add hierarchy cols for context
-                    for h in HIERARCHY_LEVELS:
-                        actual_h = hcm_excl.get(h)
-                        if actual_h and actual_h in sku_df_excl.columns and actual_h not in excl_cols:
-                            excl_cols.append(actual_h)
-
-                    # Add product description if available
-                    if desc_col and monthly_df is not None and sku_col_excl in monthly_df.columns:
-                        # Build a mapping: APO Product -> description (pick first non-null)
-                        desc_map = monthly_df.drop_duplicates(subset=[sku_col_excl]).set_index(sku_col_excl)[desc_col].to_dict()
-                        sku_df_excl = sku_df_excl.copy()
-                        sku_df_excl["Product Description"] = sku_df_excl[sku_col_excl].map(desc_map)
-                        if "Product Description" not in excl_cols:
-                            excl_cols.append("Product Description")
-
-                    if excl_cols:
-                        excl_display = (
-                            sku_df_excl[excl_cols]
-                            .drop_duplicates()
-                            .sort_values(excl_cols)
-                            .reset_index(drop=True)
-                        )
-                        # Mark rows already globally excluded
-                        excl_display["Exclude"] = excl_display[sku_col_excl].isin(
-                            exc_store_sal.global_exclusions
-                        ) if sku_col_excl in excl_display.columns else False
-
-                        # Column order: Exclude checkbox first, then SFU Version, APO Product, description, hierarchy
-                        excl_ordered = ["Exclude"] + [c for c in excl_cols if c in excl_display.columns]
-                        excl_col_cfg: dict = {
-                            "Exclude": st.column_config.CheckboxColumn(
-                                "Exclude",
-                                help="Check to exclude this APO Product from salience calculation.",
-                            ),
-                        }
-                        if MONTHLY_SFU_VERSION_COL in excl_display.columns:
-                            excl_col_cfg[MONTHLY_SFU_VERSION_COL] = st.column_config.TextColumn(
-                                "SFU Version", disabled=True
+                # ── Detect SKUs with < 3 months of shipments ─────────────────
+                sparse_skus: set[str] = set()
+                shipments_df = _get_df("Shipments")
+                if shipments_df is not None and sku_col_excl in (shipments_df.columns if shipments_df is not None else []):
+                    ship_past_months = [
+                        m for m in detect_month_columns(shipments_df)
+                        if (parse_month_to_date(m) or pd.Timestamp.max) < current_month_start_sal
+                    ]
+                    if ship_past_months:
+                        for _sku_val, grp in shipments_df.groupby(sku_col_excl):
+                            nonzero_months = sum(
+                                1 for m in ship_past_months
+                                if m in grp.columns
+                                and pd.to_numeric(grp[m], errors="coerce").sum() > 0
                             )
-                        if sku_col_excl in excl_display.columns:
-                            excl_col_cfg[sku_col_excl] = st.column_config.TextColumn(
-                                "APO Product", disabled=True
-                            )
-                        if "Product Description" in excl_display.columns:
-                            excl_col_cfg["Product Description"] = st.column_config.TextColumn(
-                                "Product Description", disabled=True
+                            if nonzero_months < 3:
+                                sparse_skus.add(str(_sku_val))
+
+                if sparse_skus:
+                    st.warning(
+                        f"⚠️ **{len(sparse_skus)} APO Product(s) have fewer than 3 months of shipments** "
+                        "and are pre-checked for exclusion below. "
+                        "Please confirm whether these are **Initiatives** or new SKUs before saving exclusions: "
+                        f"`{'`, `'.join(sorted(sparse_skus))}`"
+                    )
+
+                # ── Sub-tabs: SKU table exclusions | Upload exclusions Excel ─
+                tab_excl_table, tab_excl_upload = st.tabs(["📋 Select Exclusions", "📤 Upload Exclusions + Volumes"])
+
+                with tab_excl_table:
+                    if sku_df_excl is not None and not sku_df_excl.empty:
+                        # Build a display table of all APO Products with their SFU Version
+                        excl_cols = []
+                        if MONTHLY_SFU_VERSION_COL in sku_df_excl.columns:
+                            excl_cols.append(MONTHLY_SFU_VERSION_COL)
+                        if sku_col_excl in sku_df_excl.columns and sku_col_excl != MONTHLY_SFU_VERSION_COL:
+                            excl_cols.append(sku_col_excl)
+                        # Add hierarchy cols for context
+                        for h in HIERARCHY_LEVELS:
+                            actual_h = hcm_excl.get(h)
+                            if actual_h and actual_h in sku_df_excl.columns and actual_h not in excl_cols:
+                                excl_cols.append(actual_h)
+
+                        # Add product description if available
+                        if desc_col and monthly_df is not None and sku_col_excl in monthly_df.columns:
+                            desc_map = monthly_df.drop_duplicates(subset=[sku_col_excl]).set_index(sku_col_excl)[desc_col].to_dict()
+                            sku_df_excl = sku_df_excl.copy()
+                            sku_df_excl["Product Description"] = sku_df_excl[sku_col_excl].map(desc_map)
+                            if "Product Description" not in excl_cols:
+                                excl_cols.append("Product Description")
+
+                        if excl_cols:
+                            excl_display = (
+                                sku_df_excl[excl_cols]
+                                .drop_duplicates()
+                                .sort_values(excl_cols)
+                                .reset_index(drop=True)
                             )
 
-                        edited_excl = st.data_editor(
-                            excl_display[excl_ordered],
-                            column_config=excl_col_cfg,
-                            disabled=[c for c in excl_ordered if c != "Exclude"],
-                            width='stretch',
-                            key="sfu_exclusion_editor",
-                            height=min(400, 60 + len(excl_display) * 35),
-                            num_rows="fixed",
-                        )
+                            # "Exclude" checkbox — pre-checked if already excluded OR has < 3 months shipments
+                            already_excl_set = exc_store_sal.global_exclusions
+                            excl_display["Exclude"] = excl_display[sku_col_excl].apply(
+                                lambda v: (str(v) in already_excl_set) or (str(v) in sparse_skus)
+                            ) if sku_col_excl in excl_display.columns else False
 
-                        # Apply exclusion changes immediately to exc_store
-                        if st.button("💾 Save Exclusions", key="save_excl_btn"):
-                            # Clear existing global exclusions that were set via this editor
-                            # (only touch ones that appear in this table)
-                            all_skus_in_table = set(
-                                excl_display[sku_col_excl].dropna().astype(str).tolist()
-                            ) if sku_col_excl in excl_display.columns else set()
-                            exc_store_sal.global_exclusions -= all_skus_in_table
-                            # Re-add checked ones
-                            newly_excluded = set()
-                            for _, erow in edited_excl.iterrows():
-                                if erow.get("Exclude"):
-                                    sku_val = str(erow.get(sku_col_excl, ""))
-                                    if sku_val:
-                                        exc_store_sal.add_global_exclusion(sku_val, notes="Excluded before salience in Step 4")
-                                        newly_excluded.add(sku_val)
-                            st.session_state.exc_store = exc_store_sal
-                            if newly_excluded:
-                                st.success(f"✅ {len(newly_excluded)} APO Product(s) marked for exclusion: {', '.join(sorted(newly_excluded))}")
-                            else:
-                                st.info("No exclusions set — all APO Products will be included in salience.")
-                            st.rerun()
+                            # "Flagged (< 3 months shipments)" indicator column
+                            excl_display["⚠️ < 3 months data"] = excl_display[sku_col_excl].apply(
+                                lambda v: "⚠️ Sparse" if str(v) in sparse_skus else ""
+                            ) if sku_col_excl in excl_display.columns else ""
 
-                        # Show current exclusion summary
-                        current_excl = exc_store_sal.global_exclusions & (
-                            set(excl_display[sku_col_excl].dropna().astype(str).tolist())
-                            if sku_col_excl in excl_display.columns else set()
-                        )
-                        if current_excl:
-                            st.warning(
-                                f"⚠️ **{len(current_excl)} APO Product(s) currently excluded** "
-                                f"(will be skipped in salience): "
-                                f"{', '.join(sorted(current_excl))}"
+                            # "Currently Excluded" status column
+                            excl_display["📌 Status"] = excl_display[sku_col_excl].apply(
+                                lambda v: "Excluded ✓" if str(v) in already_excl_set else ""
+                            ) if sku_col_excl in excl_display.columns else ""
+
+                            # Column order: Exclude, status, flag, ID cols
+                            excl_ordered = (
+                                ["Exclude", "⚠️ < 3 months data", "📌 Status"]
+                                + [c for c in excl_cols if c in excl_display.columns]
                             )
+                            excl_col_cfg: dict = {
+                                "Exclude": st.column_config.CheckboxColumn(
+                                    "Exclude",
+                                    help="Check to exclude this APO Product from salience calculation.",
+                                ),
+                                "⚠️ < 3 months data": st.column_config.TextColumn(
+                                    "< 3 months shipments",
+                                    disabled=True,
+                                    help="SKUs with fewer than 3 non-zero shipment months — likely Initiatives.",
+                                ),
+                                "📌 Status": st.column_config.TextColumn(
+                                    "Current Status",
+                                    disabled=True,
+                                    help="Whether this SKU is currently in the global exclusions list.",
+                                ),
+                            }
+                            if MONTHLY_SFU_VERSION_COL in excl_display.columns:
+                                excl_col_cfg[MONTHLY_SFU_VERSION_COL] = st.column_config.TextColumn("SFU Version", disabled=True)
+                            if sku_col_excl in excl_display.columns:
+                                excl_col_cfg[sku_col_excl] = st.column_config.TextColumn("APO Product", disabled=True)
+                            if "Product Description" in excl_display.columns:
+                                excl_col_cfg["Product Description"] = st.column_config.TextColumn("Product Description", disabled=True)
+
+                            edited_excl = st.data_editor(
+                                excl_display[excl_ordered],
+                                column_config=excl_col_cfg,
+                                disabled=[c for c in excl_ordered if c != "Exclude"],
+                                width='stretch',
+                                key="sfu_exclusion_editor",
+                                height=min(450, 60 + len(excl_display) * 35),
+                                num_rows="fixed",
+                            )
+
+                            if st.button("💾 Save Exclusions", key="save_excl_btn"):
+                                all_skus_in_table = set(
+                                    excl_display[sku_col_excl].dropna().astype(str).tolist()
+                                ) if sku_col_excl in excl_display.columns else set()
+                                exc_store_sal.global_exclusions -= all_skus_in_table
+                                newly_excluded = set()
+                                for _, erow in edited_excl.iterrows():
+                                    if erow.get("Exclude"):
+                                        sku_val = str(erow.get(sku_col_excl, ""))
+                                        if sku_val:
+                                            flag_note = " [< 3 months shipments — confirmed initiative/new SKU]" if sku_val in sparse_skus else ""
+                                            exc_store_sal.add_global_exclusion(sku_val, notes=f"Excluded before salience in Step 4{flag_note}")
+                                            newly_excluded.add(sku_val)
+                                st.session_state.exc_store = exc_store_sal
+                                if newly_excluded:
+                                    st.success(f"✅ {len(newly_excluded)} APO Product(s) marked for exclusion: {', '.join(sorted(newly_excluded))}")
+                                else:
+                                    st.info("No exclusions set — all APO Products will be included in salience.")
+                                st.rerun()
+
+                            # Summary of currently excluded SKUs
+                            current_excl = exc_store_sal.global_exclusions & (
+                                set(excl_display[sku_col_excl].dropna().astype(str).tolist())
+                                if sku_col_excl in excl_display.columns else set()
+                            )
+                            if current_excl:
+                                st.warning(
+                                    f"⚠️ **{len(current_excl)} APO Product(s) currently excluded** "
+                                    f"(will be skipped in salience): "
+                                    f"{', '.join(sorted(current_excl))}"
+                                )
+                        else:
+                            st.info("No APO Product data available — complete Step 3 first.")
                     else:
-                        st.info("No APO Product data available — complete Step 3 first.")
-                else:
-                    st.info("No SFU_v data loaded yet — complete Step 3 first.")
+                        st.info("No SFU_v data loaded yet — complete Step 3 first.")
+
+                with tab_excl_upload:
+                    st.markdown(
+                        "Upload an **Excel file** with excluded SKUs and their volumes. "
+                        "The file must have:\n"
+                        "- A column named **`APO Product`** (or the SKU column name for your data)\n"
+                        "- Month columns in `Mmm-YY` format (e.g. `Jan-26`, `Feb-26`) with the volumes to allocate\n\n"
+                        "These SKUs will be **globally excluded from the salience split** and their volumes will be "
+                        "loaded as **fixed allocations** in the exception store."
+                    )
+                    st.download_button(
+                        label="📥 Download template",
+                        data=_build_exclusion_upload_template(sku_col_excl, st.session_state.get("sas_months_selected", [])),
+                        file_name="exclusions_template.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+                    excl_upload_file = st.file_uploader(
+                        "Upload exclusions Excel",
+                        type=["xlsx", "xls"],
+                        key="excl_upload_file",
+                    )
+                    if excl_upload_file is not None:
+                        try:
+                            excl_up_df = pd.read_excel(excl_upload_file)
+                            # Normalise SKU column name
+                            sku_col_candidates = [sku_col_excl, "APO Product", "SKU", "GCAS", "FPC"]
+                            found_sku_col = next((c for c in sku_col_candidates if c in excl_up_df.columns), None)
+                            if found_sku_col is None:
+                                st.error(f"Could not find a SKU column in the uploaded file. Expected one of: {sku_col_candidates}")
+                            else:
+                                month_cols_up = [
+                                    c for c in excl_up_df.columns
+                                    if c != found_sku_col and parse_month_to_date(c) is not None
+                                ]
+                                if not month_cols_up:
+                                    st.warning("No month columns detected in the uploaded file. Ensure columns are in `Mmm-YY` format.")
+                                else:
+                                    st.success(
+                                        f"Detected **{len(excl_up_df)} SKU row(s)** and "
+                                        f"**{len(month_cols_up)} month column(s)**: {', '.join(month_cols_up)}"
+                                    )
+                                    st.dataframe(excl_up_df[[found_sku_col] + month_cols_up].head(20), width='stretch')
+
+                                    if st.button("✅ Apply Uploaded Exclusions + Volumes", key="apply_excl_upload"):
+                                        applied_skus = set()
+                                        for _, urow in excl_up_df.iterrows():
+                                            sku_v = str(urow[found_sku_col])
+                                            if not sku_v or sku_v == "nan":
+                                                continue
+                                            # Globally exclude this SKU
+                                            exc_store_sal.add_global_exclusion(
+                                                sku_v,
+                                                notes="Excluded via uploaded exclusions Excel (Step 4)"
+                                            )
+                                            applied_skus.add(sku_v)
+                                            # Load fixed volumes per month (stored under a special bb_id = "__uploaded__")
+                                            for mc in month_cols_up:
+                                                qty_val = pd.to_numeric(urow.get(mc, 0), errors="coerce")
+                                                if not pd.isna(qty_val) and qty_val != 0:
+                                                    exc_store_sal.set_fixed_qty(
+                                                        "__uploaded__",
+                                                        sku_v,
+                                                        mc,
+                                                        float(qty_val),
+                                                        notes="Volume from uploaded exclusions Excel",
+                                                    )
+                                        st.session_state.exc_store = exc_store_sal
+                                        st.success(
+                                            f"✅ {len(applied_skus)} SKU(s) excluded and volumes loaded: "
+                                            f"{', '.join(sorted(applied_skus))}"
+                                        )
+                                        st.rerun()
+                        except Exception as _exc_up_err:
+                            st.error(f"Error reading uploaded file: {_exc_up_err}")
 
                 # ── Compute button ───────────────────────────────────────────
                 if st.button("✅ Compute BOP Salience (SFU Level)", type="primary"):
