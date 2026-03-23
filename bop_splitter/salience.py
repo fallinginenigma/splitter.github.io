@@ -25,6 +25,12 @@ SPLIT_KEYS: dict[str, list[str]] = {
 #                 "ignore"     → exclude from split; add to exception list with note
 #   user_defined: if True, ask user to select the split level (overrides split_level default)
 GBB_TYPE_RULES: dict[str, dict] = {
+    "Base": {
+        "split_level": "Brand",
+        "action": "split",
+        "user_defined": False,
+        "description": "Base volume — split across the brand.",
+    },
     "Brand Building Activities": {
         "split_level": "Brand",
         "action": "split",
@@ -68,6 +74,32 @@ GBB_TYPE_RULES: dict[str, dict] = {
         "description": "Split at Brand level — split level defined by user.",
     },
 }
+
+
+def _match_gbb_type(raw: str) -> str | None:
+    """
+    Match a raw GBB Type string (which may include a leading number prefix like
+    '0.Base', '1. Brand Building Activities', '2.Promotions - Go To Market')
+    to a canonical key in GBB_TYPE_RULES.
+
+    Returns the matching key, or None if no match.
+    """
+    if not raw:
+        return None
+    raw_strip = raw.strip()
+    # Exact match first
+    if raw_strip in GBB_TYPE_RULES:
+        return raw_strip
+    # Strip leading number+dot prefix (e.g. "1. " or "0." or "8.")
+    import re
+    without_prefix = re.sub(r"^\d+\s*\.\s*", "", raw_strip).strip()
+    if without_prefix in GBB_TYPE_RULES:
+        return without_prefix
+    # Fuzzy substring: check if any canonical key appears as substring
+    for key in GBB_TYPE_RULES:
+        if key.lower() in without_prefix.lower() or without_prefix.lower() in key.lower():
+            return key
+    return None
 
 
 def compute_basis(

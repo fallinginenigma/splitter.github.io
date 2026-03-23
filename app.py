@@ -36,6 +36,7 @@ from bop_splitter.salience import (
     HIERARCHY_LEVELS,
     SPLIT_KEYS,
     GBB_TYPE_RULES,
+    _match_gbb_type,
 )
 from bop_splitter.exceptions import ExceptionStore
 from bop_splitter.splitter import run_split
@@ -1211,7 +1212,8 @@ def step3_filters():
 
     def _gbb_split_level(gbb_type: str, bid: str) -> str:
         """Derive split level from GBB Type rule, falling back to SFU_v auto-detect or Form."""
-        rule = GBB_TYPE_RULES.get(gbb_type)
+        canonical = _match_gbb_type(gbb_type)
+        rule = GBB_TYPE_RULES.get(canonical) if canonical else None
         if rule and not rule["user_defined"]:
             return rule["split_level"]
         # user_defined or unknown type → fall through to SFU_v check
@@ -1219,7 +1221,8 @@ def step3_filters():
         return _auto_split_level(bb_rows)
 
     def _gbb_action(gbb_type: str) -> str:
-        rule = GBB_TYPE_RULES.get(gbb_type)
+        canonical = _match_gbb_type(gbb_type)
+        rule = GBB_TYPE_RULES.get(canonical) if canonical else None
         return rule["action"] if rule else "split"
 
     if hier_actual and bb_id_col in sas_df.columns:
@@ -1262,10 +1265,10 @@ def step3_filters():
 
         col_config = {
             "Split Level": st.column_config.SelectboxColumn(
-                "Split Level",
+                "Split Level ▾",
                 options=list(SPLIT_KEYS.keys()),
                 required=True,
-                help="Override the split granularity for this Building Block.",
+                help="Click a cell to open the dropdown and override the split granularity for this Building Block.",
             ),
             "Action": st.column_config.TextColumn("Action", disabled=True),
         }
@@ -1280,10 +1283,10 @@ def step3_filters():
         else:
             # GBB Type not in SAS — let user set it manually
             col_config["GBB Type"] = st.column_config.SelectboxColumn(
-                "GBB Type (manual)",
+                "GBB Type (manual) ▾",
                 options=[""] + list(GBB_TYPE_RULES.keys()),
                 required=False,
-                help="No GBB Type column found in SAS — select manually to drive split level and action.",
+                help="No GBB Type column found in SAS — click a cell and select from the dropdown to drive split level and action.",
             )
 
         edited_bb = st.data_editor(
@@ -1294,14 +1297,36 @@ def step3_filters():
             key="bb_split_level_editor",
             height=min(450, 60 + len(bb_editor_df) * 35),
         )
+        st.caption("💡 **Tip:** Click any cell in the **Split Level ▾** column (or **GBB Type ▾** if shown) to open a dropdown and change the value.")
 
         # Show legend
-        with st.expander("GBB Type rules reference", expanded=False):
+        with st.expander("📋 GBB Type rules reference (click to expand)", expanded=False):
+            # Number prefixes as they appear in SAS files
+            _gbb_prefix_map = {
+                "Base": "0.",
+                "Brand Building Activities": "1.",
+                "Promotions - Go To Market": "2.",
+                "New Channels": "3.",
+                "Initiatives": "4.",
+                "Pricing Strategy": "5.",
+                "Market Trend": "6.",
+                "Customer Inventory Strategy": "8.",
+            }
             rule_rows = [
-                {"GBB Type": k, "Default Split Level": v["split_level"],
-                 "Action": v["action"], "Notes": v["description"]}
+                {
+                    "GBB Type (in SAS file)": f"{_gbb_prefix_map.get(k, '')} {k}".strip(),
+                    "Canonical Name": k,
+                    "Default Split Level": v["split_level"],
+                    "Action": v["action"],
+                    "Notes": v["description"],
+                }
                 for k, v in GBB_TYPE_RULES.items()
             ]
+            st.caption(
+                "The **GBB Type** in your SAS file may include a leading number prefix "
+                "(e.g. `1. Brand Building Activities`). The tool automatically strips the prefix "
+                "and matches to the canonical name to pick the correct Split Level and Action."
+            )
             st.dataframe(pd.DataFrame(rule_rows), width='stretch', hide_index=True)
 
     else:
@@ -1752,16 +1777,16 @@ def step4_salience():
                     column_config={
                         MONTHLY_SFU_VERSION_COL: st.column_config.TextColumn("SFU_SFU Version", disabled=True),
                         "Basis / Metric": st.column_config.SelectboxColumn(
-                            "Basis / Metric",
+                            "Basis / Metric ▾",
                             options=available_basis_sources,
                             required=True,
-                            help="Select which historical data sheet to use as the basis for this SFU version.",
+                            help="Click a cell to open the dropdown and select which historical data sheet to use as the basis for this SFU version.",
                         ),
                         "Basis Window": st.column_config.SelectboxColumn(
-                            "Basis Window",
+                            "Basis Window ▾",
                             options=basis_window_options,
                             required=True,
-                            help="P3M = avg last 3 months, P6M = avg last 6 months, etc. 'specific months' = manual pick below.",
+                            help="Click a cell to open the dropdown. P3M = avg last 3 months, P6M = avg last 6 months, etc. 'specific months' = manual pick below.",
                         ),
                     },
                     disabled=[MONTHLY_SFU_VERSION_COL],
@@ -1769,6 +1794,7 @@ def step4_salience():
                     key="sfu_basis_editor",
                     height=min(450, 60 + len(sfu_config_df) * 35),
                 )
+                st.caption("💡 **Tip:** Click any cell in the **Basis / Metric ▾** or **Basis Window ▾** columns to open a dropdown and change the value.")
 
                 # ── Step 2: per-SFU manual month selection (only for "specific months" rows) ──
                 specific_sfu_rows = [
@@ -1901,7 +1927,7 @@ def step4_salience():
                 )
 
                 # ── Step 4: Exclusions before salience ──────────────────────
-                st.markdown("#### Step 4 — Exclusions")
+                st.markdown("#### Step 4 — Exclusions (Fixed Promo volumes, Initiatives)")
                 st.caption(
                     "Select any **SFU Versions or APO Products** to exclude before salience is calculated. "
                     "Excluded items will receive a salience weight of **0** and will not participate in the split. "

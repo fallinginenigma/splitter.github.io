@@ -47,13 +47,13 @@ Format for each correction:
 **Current GBB Type rules (for reference):**
 | GBB Type | Split Level | Action |
 |---|---|---|
-| Brand Building Activities | Form | split |
-| Promotions - Go To Market | Form | exceptions |
-| New Channels | Form | exceptions |
-| Initiatives | Form | ignore |
-| Pricing Strategy | Brand | split |
-| Market Trend | Sub Brand | split |
-| Customer Inventory Strategy | Form | split (user-defined) |
+| 1.Brand Building Activities | Form | split |
+| 2.Promotions - Go To Market | Form | exceptions |
+| 3.New Channels | Form | exceptions |
+| 4.Initiatives | Form | ignore |
+| 5.Pricing Strategy | Brand | split |
+| 6.Market Trend | Sub Brand | split |
+| 8.Customer Inventory Strategy | Form | split (user-defined) |
 
 **Current default forecast month range:** next calendar month → July of the same year (or next year if already past July).
 
@@ -68,13 +68,16 @@ Format for each correction:
 **Updated GBB Type rules:**
 | GBB Type | Split Level | Action |
 |---|---|---|
-| Brand Building Activities | **Brand** | split |
-| Promotions - Go To Market | Form | exceptions |
-| New Channels | Form | exceptions |
-| Initiatives | Form | ignore |
-| Pricing Strategy | Brand | split |
-| Market Trend | Sub Brand | split |
-| Customer Inventory Strategy | **Brand** | split (user-defined) |
+|0.Base | **Brand** | split |
+|1. Brand Building Activities | **Brand** | split |
+| 2.Promotions - Go To Market | Form | exceptions |
+| 3.New Channels | Form | exceptions |
+| 4.Initiatives | Form | ignore (remind in Exclusions) |
+| 5.Pricing Strategy | Brand | split |
+| 6.Market Trend | Sub Brand | split |
+| 8.Customer Inventory Strategy | **Brand** | split (user-defined) |
+
+> ✅ **Implemented:** GBB rules updated in `bop_splitter/salience.py`. Auto-pick now uses `_match_gbb_type()` to strip leading number prefixes (e.g. `0.Base`, `1. Brand Building Activities`) and match to the canonical rule. Reference table in Step 3 shows both numbered SAS format and canonical name.
 
 ### [C-302] Consider Only SFUs with Future FFF
 - **Current behaviour:** All SFU_vs are considered during split regardless of future forecast availability
@@ -243,3 +246,9 @@ Document which SKUs should be considered at each split level (from Monthly sheet
 | Sub Form     | All SKUs that belong to that Family Name 3 |
 
 **Note:** Current implementation only has levels up to Form. Sub Form would need to be added if required.
+
+
+- Any SKU with less than 3 months of shipment -> confirm whether it is an initiative and move it to Exclusions
+- Confirm if SKUs are under Exclusions
+- For Exclusions> give the user an option to upload a list of Excluded SKUs as well as the volumes that need to be loaded in those specific SKUs. Can use an Excel to upload these volumes
+  
