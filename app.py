@@ -1577,7 +1577,7 @@ def step4_salience():
                 "Default is the same weight across all months — edit any cell to override a specific month. "
                 "Click **Apply** to save changes."
             )
-            col_cfg = {m: st.column_config.NumberColumn(m, format="%.2f") for m in sas_months}
+            col_cfg = {m: st.column_config.NumberColumn(m, format="%.2f %%") for m in sas_months}
             edited_pivot = st.data_editor(
                 pivot_df,
                 width='stretch',
@@ -2059,19 +2059,26 @@ def step4_salience():
         if not override_rows.empty:
             sku_col_sal = hcm.get("SKU", "SKU")
             _ctx_cols = [c for c in override_rows.columns if c not in ("basis", "flag")]
+            # Show salience as % for editing; convert back on save
+            override_edit = override_rows[_ctx_cols].assign(
+                **{"Salience %": (pd.to_numeric(override_rows["salience"].fillna(0.0), errors="coerce") * 100).round(2)}
+            ).drop(columns=["salience"], errors="ignore")
+            _override_disabled = [c for c in override_edit.columns if c != "Salience %"]
             edited = st.data_editor(
-                override_rows[_ctx_cols].assign(salience=override_rows["salience"].fillna(0.0)),
+                override_edit,
                 width='stretch',
                 key="sal_override_editor",
                 num_rows="fixed",
-                disabled=[c for c in _ctx_cols if c != "salience"],
+                disabled=_override_disabled,
+                column_config={"Salience %": st.column_config.NumberColumn("Salience %", format="%.2f %%")},
             )
             if st.button("Apply Overrides"):
                 _group_cols = [c for c in override_rows.columns if c not in (sku_col_sal, "basis", "salience", "flag")]
                 for idx_row, (_, row) in enumerate(override_rows.iterrows()):
                     g_key = tuple(row[c] for c in _group_cols if c in row.index)
                     sku_val = row.get(sku_col_sal, "")
-                    st.session_state.sal_overrides[(g_key, sku_val)] = float(edited.iloc[idx_row]["salience"])
+                    # Convert % back to fraction (0-1) for storage
+                    st.session_state.sal_overrides[(g_key, sku_val)] = float(edited.iloc[idx_row]["Salience %"]) / 100.0
                 st.success("Overrides saved. Click 'Compute Historical Salience' again to refresh.")
 
     if st.button("Confirm Salience →", type="primary", disabled=(sal_df is None)):
@@ -2534,7 +2541,20 @@ def step7_download():
     with tab_out:
         st.dataframe(output_wide, width='stretch', height=400)
     with tab_sal:
-        st.dataframe(sal_df, width='stretch', height=400)
+        # Always show salience as % — drop raw fraction column, add Salience %
+        sal_display = sal_df.copy()
+        if not sal_display.empty and "salience" in sal_display.columns:
+            sal_display["Salience %"] = (pd.to_numeric(sal_display["salience"], errors="coerce") * 100).round(2)
+            sal_display = sal_display.drop(columns=["salience"])
+            # Move Salience % right after the last hierarchy / ID column
+            non_sal_cols = [c for c in sal_display.columns if c != "Salience %"]
+            sal_display = sal_display[non_sal_cols + ["Salience %"]]
+        st.dataframe(
+            sal_display,
+            width='stretch',
+            height=400,
+            column_config={"Salience %": st.column_config.NumberColumn("Salience %", format="%.2f %%")},
+        )
     with tab_exc:
         if exc_log.empty:
             st.info("No exceptions logged.")
