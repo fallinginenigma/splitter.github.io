@@ -22,6 +22,7 @@
 - [x] **Project Structure**: Initialized B.L.A.S.T. / A.N.T. architecture with essential documentation (`task_plan.md`, `findings.md`, `progress.md`, `claude.md`).
 - [x] **Environment Configuration**: Added `.gitignore` to manage `__pycache__` and other generated files.
 - [x] **Branch Management**: Successfully merged specialized feature branches (Streamlit app fixes) into `main`.
+- [x] **Documentation Sync**: Updated `claude.md`, `findings.md`, and `task_plan.md` with latest business rules (SAS scaling, terminology mapping) and architectural constraints (Step 1+2 merge).
 
 ---
-*(Current focus: Maintaining synchronization between implementation and project documentation)*
+*(Current focus: Engineering the combined Load & Map logic with autopicking)*

@@ -10,6 +10,15 @@
 - Layer 3: Tools (Deterministic Python scripts)
 
 - **Domain Rules**:
+  - **Terminology Pairs**: 
+    - "Stat" = "Statistical forecast" = "LDS" = "Stat forecast"
+    - "Final Forecast to Finance" = "FFF"
+    - "GCAS" = "FPC" = "APO Product" (8-digit code)
+    - "SFU_SFU Version" = "SFU_v" (The SKU level)
+  - **Data Scaling**: SAS data is divided by 1000; MUST multiply by 1000 before splitting.
+  - **Entities**: Each SAS line is a "Building Block" (BB/GBB) with volume across months.
+  - **UoM**: All volume data (Shipment, FFF, Stat, SAS) is in Statistical Units (SU).
+  - **aggregation**: One SFU_v can map to multiple GCAS codes. Always split/aggregate to SFU_v level.
 
 
 ## Architectural Invariants
