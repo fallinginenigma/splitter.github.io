@@ -19,10 +19,10 @@
 - [x] **SFU Aggregation**: Added SFU-level aggregation for better data overview.
 
 ### Infrastructure & Documentation
-- [x] **Project Structure**: Initialized B.L.A.S.T. / A.N.T. architecture with essential documentation (`task_plan.md`, `findings.md`, `progress.md`, `claude.md`).
+- [x] **Project Structure**: Initialized B.L.A.S.T. / A.N.T. architecture with essential documentation (`todo.md`, `findings.md`, `progress.md`, `claude.md`).
 - [x] **Environment Configuration**: Added `.gitignore` to manage `__pycache__` and other generated files.
-- [x] **Branch Management**: Successfully merged specialized feature branches (Streamlit app fixes) into `main`.
-- [x] **Documentation Sync**: Updated `claude.md`, `findings.md`, and `task_plan.md` with latest business rules (SAS scaling, terminology mapping) and architectural constraints (Step 1+2 merge).
+- [x] **Branch Management**: Successfully merged specialized feature branches into `main`.
+- [x] **Documentation Sync**: Consolidated architectural invariants and domain rules in `claude.md`, removed redundancies, and tracked pending implementations in `todo.md`.
 
 ---
-*(Current focus: Engineering the combined Load & Map logic with autopicking)*
+*(Current focus: Engineering the combined Load & Map logic with autopicking [C-901] and SKU selection/exclusion rules [C-904])*
