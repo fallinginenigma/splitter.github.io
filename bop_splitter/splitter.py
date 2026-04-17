@@ -19,12 +19,16 @@ def run_split(
     hier_col_map: dict[str, str],  # logical -> actual column name
     exc_store: ExceptionStore,
     bb_split_levels: dict[str, str] | None = None,  # bb_id -> split_level override
+    forecast_boundaries: dict[str, tuple[pd.Timestamp | None, pd.Timestamp | None]] | None = None,  # SFU_v -> (from, to)
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Perform the split.
 
     When bb_split_levels is provided, each Building Block is split at its own
     granularity level (looked up by bb_id, falling back to split_level global).
+    
+    When forecast_boundaries is provided, months outside the Forecast From/To range
+    for each SFU_v will be set to 0.
 
     Returns:
       output_wide: wide DataFrame (SKU rows × month columns)
@@ -111,10 +115,18 @@ def run_split(
             matched_sfuvs_df = sfuv_df[mask]
 
         if matched_sfuvs_df.empty:
+            # Build detailed error message
+            if pinned_sfuv and pinned_sfuv != "" and pinned_sfuv != "nan":
+                detail_msg = f"No matching SFU_vs found. Pinned SFU_v '{pinned_sfuv}' does not exist in SFU_v data."
+            else:
+                # Show what we were trying to match
+                match_criteria = ", ".join([f"{col}='{val}'" for col, val in zip(bb_sas_keys, bb_group_vals)])
+                detail_msg = f"No matching SFU_vs found for split level '{bb_level}'. Criteria: {match_criteria}"
+            
             validation_issues.append({
                 "type": "unmatched_BB",
                 "bb_id": bb_id,
-                "detail": f"No matching SFU_vs found for this building block (pinned={pinned_sfuv}).",
+                "detail": detail_msg,
             })
             continue
 
@@ -220,6 +232,50 @@ def run_split(
         front_cols = [c for c in front_cols if c in output_wide.columns]
         month_cols_present = [m for m in sas_months if m in output_wide.columns]
         output_wide = output_wide[front_cols + month_cols_present]
+
+    # Enforce forecast date boundaries (Stat_DB: Forecast From / Forecast To)
+    if forecast_boundaries and not output_wide.empty and sfuv_id_col in output_wide.columns:
+        from .loader import parse_month_to_date
+        
+        # Track how many cells were zeroed
+        zeroed_count = 0
+        
+        for idx, row in output_wide.iterrows():
+            sfu_v = str(row.get(sfuv_id_col, ""))
+            if sfu_v not in forecast_boundaries:
+                continue
+            
+            from_date, to_date = forecast_boundaries[sfu_v]
+            
+            for month_col in month_cols_present:
+                month_ts = parse_month_to_date(month_col)
+                if month_ts is None:
+                    continue
+                
+                # Normalize to start of month
+                month_ts = month_ts.replace(day=1).normalize()
+                
+                # Check if month is outside the forecast boundary
+                outside_boundary = False
+                
+                if from_date is not None and month_ts < from_date:
+                    outside_boundary = True
+                
+                if to_date is not None and month_ts > to_date:
+                    outside_boundary = True
+                
+                if outside_boundary:
+                    # Zero out this cell
+                    if pd.notna(output_wide.at[idx, month_col]) and output_wide.at[idx, month_col] != 0:
+                        output_wide.at[idx, month_col] = 0.0
+                        zeroed_count += 1
+        
+        if zeroed_count > 0:
+            validation_issues.append({
+                "type": "forecast_boundary_enforcement",
+                "bb_id": "ALL",
+                "detail": f"Zeroed {zeroed_count} cell(s) outside Forecast From/To date boundaries from Stat DB.",
+            })
 
     validation_df = pd.DataFrame(validation_issues) if validation_issues else pd.DataFrame(
         columns=["type", "bb_id", "group", "month", "detail"]

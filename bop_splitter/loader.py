@@ -64,6 +64,24 @@ MONTHLY_MEASURES = [
 ]
 MONTHLY_HEADER_ROW = 13                 # 0-indexed row that contains column headers
 
+# Logical name → actual column name in the Bible (Master SKU Mapping) sheet
+BIBLE_HIERARCHY_MAP: dict[str, str] = {
+    "SMO Category": "SMO Category",
+    "Brand":        "Brand",
+    "Sub Brand":    "Sub Brand",
+    "Form":         "Form",
+}
+BIBLE_SFU_V_COL = "SFU_v"               # SFU_v identifier in Bible
+BIBLE_SALIENCE_SFU_COL = "Salience SFU" # Alternative SFU identifier
+BIBLE_MATERIAL_COL = "Material"         # Material number
+BIBLE_GTIN_COL = "GTIN IT"              # GTIN identifier
+
+# Logical name → actual column name in the Stat DB export sheet
+STAT_DB_SFU_COL = "SFU"                 # SFU identifier
+STAT_DB_SFU_VERSION_COL = "SFU Version" # SFU Version
+STAT_DB_FORECAST_FROM_COL = "Forecast From"  # Start date for forecasting (dd-mm-yy)
+STAT_DB_FORECAST_TO_COL = "Forecast To"      # End date for forecasting (dd-mm-yy)
+
 
 # ---------------------------------------------------------------------------
 # Public helpers
@@ -118,6 +136,52 @@ def detect_bop_col_maps(sheets: dict[str, pd.DataFrame]) -> tuple[dict, dict]:
         if MONTHLY_SFU_V_COL in mdf.columns:
             entry["SFU_v"] = MONTHLY_SFU_V_COL
         col_maps[measure] = entry
+
+    # Bible (Master SKU Mapping) ----------------------------------------
+    # Try to detect Bible sheet by checking for characteristic columns
+    bible_candidates = [k for k in sheets.keys() if "bible" in k.lower()]
+    if bible_candidates:
+        bible_sheet_name = bible_candidates[0]
+        bible_df = sheets[bible_sheet_name]
+        sheet_map["Bible"] = bible_sheet_name
+        
+        # Map columns that exist in the Bible sheet
+        bible_col_map = {}
+        for logical, actual in BIBLE_HIERARCHY_MAP.items():
+            if actual in bible_df.columns:
+                bible_col_map[logical] = actual
+        
+        # Detect SFU_v column (try standard name first, then Salience SFU)
+        if BIBLE_SFU_V_COL in bible_df.columns:
+            bible_col_map["SFU_v"] = BIBLE_SFU_V_COL
+        elif BIBLE_SALIENCE_SFU_COL in bible_df.columns:
+            bible_col_map["SFU_v"] = BIBLE_SALIENCE_SFU_COL
+        
+        col_maps["Bible"] = bible_col_map
+
+    # Stat DB Export (Forecast Date Boundaries) -------------------------
+    # Try to detect Stat DB sheet by checking for characteristic columns
+    stat_db_candidates = [k for k in sheets.keys() if "stat" in k.lower() and "db" in k.lower()]
+    if not stat_db_candidates:
+        stat_db_candidates = [k for k in sheets.keys() if "stat db export" in k.lower()]
+    
+    if stat_db_candidates:
+        stat_db_sheet_name = stat_db_candidates[0]
+        stat_db_df = sheets[stat_db_sheet_name]
+        sheet_map["Stat_DB"] = stat_db_sheet_name
+        
+        # Map columns that exist in the Stat DB sheet
+        stat_db_col_map = {}
+        if STAT_DB_SFU_COL in stat_db_df.columns:
+            stat_db_col_map["SFU"] = STAT_DB_SFU_COL
+        if STAT_DB_SFU_VERSION_COL in stat_db_df.columns:
+            stat_db_col_map["SFU Version"] = STAT_DB_SFU_VERSION_COL
+        if STAT_DB_FORECAST_FROM_COL in stat_db_df.columns:
+            stat_db_col_map["Forecast From"] = STAT_DB_FORECAST_FROM_COL
+        if STAT_DB_FORECAST_TO_COL in stat_db_df.columns:
+            stat_db_col_map["Forecast To"] = STAT_DB_FORECAST_TO_COL
+        
+        col_maps["Stat_DB"] = stat_db_col_map
 
     return sheet_map, col_maps
 
