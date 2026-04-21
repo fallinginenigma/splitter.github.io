@@ -202,9 +202,15 @@ def detect_bop_col_maps(sheets: dict[str, pd.DataFrame]) -> tuple[dict, dict]:
             if actual in sellout_df.columns:
                 sellout_col_map[logical] = actual
         
-        # First column is SFU_v identifier
-        if len(sellout_df.columns) > 0:
-            sellout_col_map["SFU_v"] = sellout_df.columns[0]
+        # Detect SFU_v column: prefer a column whose name matches known SFU_v patterns,
+        # then fall back to the first column.
+        _sfuv_keywords = ("sfu_v", "sfu_sfu version", "apo product", "salience sfu", "material", "sku")
+        _sfuv_col = next(
+            (c for c in sellout_df.columns if any(kw in c.lower() for kw in _sfuv_keywords)),
+            sellout_df.columns[0] if len(sellout_df.columns) > 0 else None,
+        )
+        if _sfuv_col is not None:
+            sellout_col_map["SFU_v"] = _sfuv_col
         
         col_maps["Sellout"] = sellout_col_map
 

@@ -1047,8 +1047,7 @@ def step2_columns():
                     # Sellout sheet: prefer explicit SFU_v column if present
                     sku_guess = (
                         cmap.get("SFU_v")
-                        or _guess_col(cols_all, "SFU_v", "Salience SFU", "Material", "SKU")
-                        or (cols_all[0] if cols_all else "— auto —")
+                        or _guess_col(cols_all, "SFU_v", MONTHLY_SFU_VERSION_COL, MONTHLY_SFU_V_COL, "Salience SFU", "Material", "SKU")
                     )
                 elif role in ("Shipments", "Statistical Forecast", "Final Fcst to Finance", "Stat", "FFF"):
                     # For these BOP roles, prioritize MONTHLY_SFU_VERSION_COL ("SFU_SFU Version") as default
@@ -1060,10 +1059,10 @@ def step2_columns():
                 sku_sel = st.selectbox(sku_label, none_opt, index=sku_idx, key=f"col_{role}_SKU")
                 if sku_sel != "— auto —":
                     cmap["SKU"] = sku_sel if role != "Bible" else None
-                    cmap["SFU_v"] = sku_sel if role == "Bible" else (cmap.get("SFU_v") or sku_sel)
+                    cmap["SFU_v"] = sku_sel  # always update SFU_v to the current selection
                 else:
                     cmap.pop("SKU", None) if role != "Bible" else None
-                    cmap.pop("SFU_v", None) if role == "Bible" else None
+                    cmap.pop("SFU_v", None)
 
             # Stat_DB specific columns
             if role == "Stat_DB":
@@ -1448,11 +1447,16 @@ def step3_filters():
     bb_id_col = st.session_state.bb_id_col or "BB_ID"
     saved_bb_split_levels = st.session_state.get("bb_split_levels", {})
 
-    # Detect GBB Type column in SAS — use canonical variants from loader constants
-    _gbb_col = next(
-        (c for c in SAS_GBB_TYPE_VARIANTS if c in sas_df.columns),
-        None,
-    )
+    # Detect GBB Type column in SAS.
+    # Prefer the explicit Step 2 mapping, then fall back to known variants.
+    mapped_gbb_col = sas_cmap.get(SAS_GBB_TYPE_COL)
+    if mapped_gbb_col in sas_df.columns:
+        _gbb_col = mapped_gbb_col
+    else:
+        _gbb_col = next(
+            (c for c in SAS_GBB_TYPE_VARIANTS if c in sas_df.columns),
+            None,
+        )
 
     if _gbb_col:
         st.caption(
@@ -2848,7 +2852,16 @@ def step6_run():
             with st.spinner("Analyzing building block matches..."):
                 sfuv_id_col = hcm.get("SFU_v", hcm.get("SKU", "SKU"))
                 specific_sfuv_col = hcm.get("SFU_v") if "SFU_v" in hcm else None
-                
+
+                # Determine which sheet(s) provide the SFU_v / SKU data
+                _sku_source_role = "Bible" if "Bible" in st.session_state.sheet_map else next(
+                    (r for r in SKU_SHEETS if r in st.session_state.sheet_map and r != "Bible"), None
+                )
+                _sku_source_sheet = (
+                    st.session_state.sheet_map.get(_sku_source_role, _sku_source_role)
+                    if _sku_source_role else "SFU_v data"
+                )
+
                 diagnostic_results = []
                 for bb_idx, bb_row in sas_df.iterrows():
                     bb_id = str(bb_row.get(bb_id_col, f"BB_{bb_idx}"))
@@ -2893,7 +2906,7 @@ def step6_run():
                         # Check for missing columns
                         missing_cols = [col for col in bb_sas_keys if col not in sku_df.columns]
                         if missing_cols:
-                            status = f"❌ MISSING COLS: {', '.join(missing_cols)}"
+                            status = f"❌ MISSING COLS in '{_sku_source_sheet}': {', '.join(missing_cols)}"
                         elif match_count == 0:
                             status = "❌ NO MATCH"
                         else:
@@ -2941,8 +2954,8 @@ def step6_run():
                 if failed_bbs > 0:
                     st.markdown("### 💡 Troubleshooting Suggestions")
                     
-                    has_missing_cols = any("MISSING COLS" in status for status in diagnostic_results)
-                    has_no_match = any(status == "❌ NO MATCH" for status in diagnostic_results)
+                    has_missing_cols = any("MISSING COLS" in result["Status"] for result in diagnostic_results)
+                    has_no_match = any(result["Status"] == "❌ NO MATCH" for result in diagnostic_results)
                     has_pinned = any(result["Match_Type"] == "Pinned SFU_v" and "❌" in result["Status"] for result in diagnostic_results)
                     
                     if has_missing_cols:
