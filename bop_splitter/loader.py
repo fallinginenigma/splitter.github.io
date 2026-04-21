@@ -66,6 +66,7 @@ MONTHLY_HEADER_ROW = 13                 # 0-indexed row that contains column hea
 
 # Logical name → actual column name in the Bible (Master SKU Mapping) sheet
 BIBLE_HIERARCHY_MAP: dict[str, str] = {
+    "Ctry":         "Country",
     "SMO Category": "SMO Category",
     "Brand":        "Brand",
     "Sub Brand":    "Sub Brand",
@@ -151,11 +152,13 @@ def detect_bop_col_maps(sheets: dict[str, pd.DataFrame]) -> tuple[dict, dict]:
             if actual in bible_df.columns:
                 bible_col_map[logical] = actual
         
-        # Detect SFU_v column (try standard name first, then Salience SFU)
+        # Detect SFU_v column (try standard name first, then Salience SFU, then Material)
         if BIBLE_SFU_V_COL in bible_df.columns:
             bible_col_map["SFU_v"] = BIBLE_SFU_V_COL
         elif BIBLE_SALIENCE_SFU_COL in bible_df.columns:
             bible_col_map["SFU_v"] = BIBLE_SALIENCE_SFU_COL
+        elif BIBLE_MATERIAL_COL in bible_df.columns:
+            bible_col_map["SFU_v"] = BIBLE_MATERIAL_COL
         
         col_maps["Bible"] = bible_col_map
 
@@ -182,6 +185,28 @@ def detect_bop_col_maps(sheets: dict[str, pd.DataFrame]) -> tuple[dict, dict]:
             stat_db_col_map["Forecast To"] = STAT_DB_FORECAST_TO_COL
         
         col_maps["Stat_DB"] = stat_db_col_map
+
+    # Sellout (Historical Sellout Data) ---------------------------------
+    # Try to detect Sellout sheet
+    sellout_candidates = [k for k in sheets.keys() if "sellout" in k.lower() or "sell out" in k.lower() or "sell-out" in k.lower()]
+    
+    if sellout_candidates:
+        sellout_sheet_name = sellout_candidates[0]
+        sellout_df = sheets[sellout_sheet_name]
+        sheet_map["Sellout"] = sellout_sheet_name
+        
+        # For Sellout, the first column is typically the SFU_v identifier
+        # Map hierarchy columns if they exist
+        sellout_col_map = {}
+        for logical, actual in BIBLE_HIERARCHY_MAP.items():
+            if actual in sellout_df.columns:
+                sellout_col_map[logical] = actual
+        
+        # First column is SFU_v identifier
+        if len(sellout_df.columns) > 0:
+            sellout_col_map["SFU_v"] = sellout_df.columns[0]
+        
+        col_maps["Sellout"] = sellout_col_map
 
     return sheet_map, col_maps
 
@@ -267,6 +292,13 @@ def _load_bop_openpyxl(xl: pd.ExcelFile) -> dict[str, pd.DataFrame]:
 
     # --- Monthly ------------------------------------------------------------
     if "Monthly" not in xl.sheet_names:
+        # Also load any additional non-standard sheets
+        for sheet in xl.sheet_names:
+            if sheet in ("SAS", "Monthly"):
+                continue
+            df = xl.parse(sheet, header=0)
+            df.columns = [normalize_month_label(str(c)) for c in df.columns]
+            sheets[sheet] = df
         return sheets
 
     monthly_raw = xl.parse("Monthly", header=MONTHLY_HEADER_ROW)
@@ -306,6 +338,16 @@ def _load_bop_openpyxl(xl: pd.ExcelFile) -> dict[str, pd.DataFrame]:
     else:
         # Measure column absent — store everything under "Shipments"
         sheets["Shipments"] = monthly_raw.reset_index(drop=True)
+
+    # --- Additional sheets (Bible, Stat DB, Sellout, etc.) ------------------
+    for sheet in xl.sheet_names:
+        if sheet in ("SAS", "Monthly"):
+            continue
+        if sheet in sheets:
+            continue
+        df = xl.parse(sheet, header=0)
+        df.columns = [normalize_month_label(str(c)) for c in df.columns]
+        sheets[sheet] = df
 
     return sheets
 

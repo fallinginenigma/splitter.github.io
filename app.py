@@ -420,6 +420,29 @@ def _show_bop_load_summary(sheets: dict) -> None:
 
     st.success("✅ **SAP BEx BOP export detected** — sheets and columns have been auto-mapped.")
 
+    # Check for Bible, Stat_DB, and Sellout sheets
+    has_bible = "Bible" in st.session_state.sheet_map
+    has_stat_db = "Stat_DB" in st.session_state.sheet_map
+    has_sellout = "Sellout" in st.session_state.sheet_map
+    
+    if has_bible:
+        st.info(
+            "📚 **Bible sheet detected!** This sheet will be used as the authoritative source for "
+            "SFU hierarchy mappings (SMO Category, Brand, Sub Brand, Form)."
+        )
+    
+    if has_stat_db:
+        st.info(
+            "📅 **Stat DB export detected!** This sheet will be used to enforce forecast date boundaries. "
+            "Forecasts will only be created within the date range specified for each SFU."
+        )
+    
+    if has_sellout:
+        st.info(
+            "📊 **Sellout sheet detected!** This sheet can be used as a historical basis for salience "
+            "weighting in Step 4."
+        )
+
     # Entry Type check — warn if the SAS sheet does not appear to be a BOP file
     if not sas_df.empty and "Entry Type" in sas_df.columns:
         first_entry_type = sas_df["Entry Type"].dropna().iloc[0] if not sas_df["Entry Type"].dropna().empty else None
@@ -516,20 +539,32 @@ def step1_upload():
 
     # ── Already-loaded summary (navigated back) ────────────────────────────────
     if st.session_state.sheets and st.session_state.sheet_map:
-        src = st.session_state.data_source
-        src_label = {"excel": "Excel file", "databricks": "Azure Databricks"}.get(src, "file")
-        total_rows = sum(len(v) for v in st.session_state.sheets.values())
-        st.success(
-            f"**{src_label}** data already loaded — "
-            f"{', '.join(st.session_state.sheets.keys())} "
-            f"({total_rows:,} rows total). "
-            "Use the button below to continue, or load new data."
-        )
-        if st.button("Continue with current data →", type="primary"):
-            st.session_state.step = max(st.session_state.step, 2)
-            st.session_state.max_step = max(st.session_state.max_step, 2)
-            st.rerun()
-        st.divider()
+        # If BOP format, show full summary with Bible/Stat_DB/Sellout detection
+        if st.session_state.get("_is_bop"):
+            _show_bop_load_summary(st.session_state.sheets)
+            if st.button("Proceed to Column Mapping →", type="primary", key="bop_proceed_already_loaded"):
+                st.session_state.step = max(st.session_state.step, 2)
+                st.session_state.max_step = max(st.session_state.max_step, 2)
+                st.rerun()
+            st.divider()
+            st.caption("Or upload a new file below to replace the current data")
+            st.divider()
+        else:
+            # Generic format
+            src = st.session_state.data_source
+            src_label = {"excel": "Excel file", "databricks": "Azure Databricks"}.get(src, "file")
+            total_rows = sum(len(v) for v in st.session_state.sheets.values())
+            st.success(
+                f"**{src_label}** data already loaded — "
+                f"{', '.join(st.session_state.sheets.keys())} "
+                f"({total_rows:,} rows total). "
+                "Use the button below to continue, or load new data."
+            )
+            if st.button("Continue with current data →", type="primary", key="generic_continue"):
+                st.session_state.step = max(st.session_state.step, 2)
+                st.session_state.max_step = max(st.session_state.max_step, 2)
+                st.rerun()
+            st.divider()
 
     # ── Load options ───────────────────────────────────────────────────────────
     tab_excel, tab_db = st.tabs(["📂 Upload Excel", "🔗 Azure Databricks"])
@@ -572,7 +607,7 @@ def step1_upload():
         # ── BOP fast path: everything auto-mapped, no manual selection needed ──
         if st.session_state.get("_is_bop"):
             _show_bop_load_summary(sheets)
-            if st.button("Proceed to Column Mapping →", type="primary"):
+            if st.button("Proceed to Column Mapping →", type="primary", key="bop_proceed_new_upload"):
                 st.session_state.step = max(st.session_state.step, 2)
                 st.session_state.max_step = max(st.session_state.max_step, 2)
                 st.rerun()
@@ -580,6 +615,9 @@ def step1_upload():
 
         # ── Generic path: manual sheet-to-role mapping ─────────────────────────
         st.success(f"Loaded **{len(sheets)}** sheet(s): {', '.join(sheets.keys())}")
+        
+        # Get sheet names first (needed for detection below)
+        sheet_names = list(sheets.keys())
         
         # Check if Bible sheet is detected
         bible_detected = any("bible" in s.lower() for s in sheet_names)
@@ -600,7 +638,6 @@ def step1_upload():
             )
         
         st.subheader("Map Sheets to Roles")
-        sheet_names = list(sheets.keys())
         none_opt = ["— none —"] + sheet_names
         guesses = {
             "Shipments": _guess_sheet(sheet_names, ["ship"]),
@@ -990,7 +1027,10 @@ def step2_columns():
             if role != "Stat_DB":
                 hier_ui = st.columns(len(LOGICAL_HIER))
                 for j, lh in enumerate(LOGICAL_HIER):
-                    guess = cmap.get(lh) or _guess_col(cols_all, lh)
+                    if lh == "Ctry":
+                        guess = cmap.get(lh) or _guess_col(cols_all, "Ctry", "Country")
+                    else:
+                        guess = cmap.get(lh) or _guess_col(cols_all, lh)
                     idx = none_opt.index(guess) if guess in none_opt else 0
                     sel = hier_ui[j].selectbox(lh, none_opt, index=idx, key=f"col_{role}_{lh}")
                     if sel != "— auto —":
@@ -1004,8 +1044,12 @@ def step2_columns():
                     # Bible sheet: try SFU_v first, then Salience SFU
                     sku_guess = cmap.get("SFU_v") or cmap.get("SKU") or _guess_col(cols_all, "SFU_v", "Salience SFU", "Material", "SKU")
                 elif role == "Sellout":
-                    # Sellout sheet: first column is usually the SFU_v identifier
-                    sku_guess = cmap.get("SFU_v") or cmap.get("SKU") or (cols_all[0] if cols_all else "— auto —")
+                    # Sellout sheet: prefer explicit SFU_v column if present
+                    sku_guess = (
+                        cmap.get("SFU_v")
+                        or _guess_col(cols_all, "SFU_v", "Salience SFU", "Material", "SKU")
+                        or (cols_all[0] if cols_all else "— auto —")
+                    )
                 elif role in ("Shipments", "Statistical Forecast", "Final Fcst to Finance", "Stat", "FFF"):
                     # For these BOP roles, prioritize MONTHLY_SFU_VERSION_COL ("SFU_SFU Version") as default
                     sku_guess = cmap.get("SKU") or (MONTHLY_SFU_VERSION_COL if MONTHLY_SFU_VERSION_COL in cols_all else _guess_col(cols_all, "SFU_SFU Version", "APO Product", "SFU_v", "SKU"))
@@ -1721,9 +1765,29 @@ def _compute_bop_salience(sfu_configs: dict) -> pd.DataFrame | None:
 
     for (src_role, mode, selected_m), sfu_list in config_to_sfus.items():
         src_df = _get_df(src_role)
-        if src_df is None or MONTHLY_SFU_VERSION_COL not in src_df.columns:
+        if src_df is None:
             continue
-            
+
+        # Ensure SFU_SFU Version column exists; for Sellout use the mapped SFU_v column
+        if src_role == "Sellout":
+            cmap_sellout = st.session_state.col_maps.get("Sellout", {})
+            sfu_col = cmap_sellout.get("SFU_v") or cmap_sellout.get("SKU")
+            if not sfu_col or sfu_col not in src_df.columns:
+                continue
+            src_df = src_df.copy()
+            src_df[MONTHLY_SFU_VERSION_COL] = src_df[sfu_col].astype(str)
+
+            # Enrich Sellout with hierarchy columns from SKU/Bible data when missing
+            missing_group_cols = [k for k in valid_group_keys if k not in src_df.columns]
+            if missing_group_cols and sku_df is not None and MONTHLY_SFU_VERSION_COL in sku_df.columns:
+                hier_lookup = (
+                    sku_df[[MONTHLY_SFU_VERSION_COL] + [k for k in valid_group_keys if k in sku_df.columns]]
+                    .drop_duplicates()
+                )
+                src_df = src_df.merge(hier_lookup, on=MONTHLY_SFU_VERSION_COL, how="left")
+        elif MONTHLY_SFU_VERSION_COL not in src_df.columns:
+            continue
+
         cmap = st.session_state.col_maps.get(src_role, {})
         all_months = cmap.get("_months", detect_month_columns(src_df))
         
@@ -1750,7 +1814,8 @@ def _compute_bop_salience(sfu_configs: dict) -> pd.DataFrame | None:
         if not basis_cols:
             continue
             
-        sub = src_df[src_df[MONTHLY_SFU_VERSION_COL].isin(sfu_list)].copy()
+        sfu_list_str = [str(v) for v in sfu_list]
+        sub = src_df[src_df[MONTHLY_SFU_VERSION_COL].astype(str).isin(sfu_list_str)].copy()
         if sub.empty:
             continue
             
@@ -1921,20 +1986,27 @@ def step4_salience():
             if "Sellout" in st.session_state.sheets:
                 available_basis_sources.append("Sellout")
 
-            # Collect SFU versions from ALL available basis source sheets
-            all_sfu_versions: list = []
-            for _src in available_basis_sources:
-                _df_src = _get_df(_src)
-                if _df_src is not None:
-                    if _src == "Sellout":
-                        # Sellout sheet: get SFU_v from mapped column or first column
-                        _cmap_sellout = st.session_state.col_maps.get("Sellout", {})
-                        _sfuv_col = _cmap_sellout.get("SFU_v") or _cmap_sellout.get("SKU")
-                        if _sfuv_col and _sfuv_col in _df_src.columns:
-                            all_sfu_versions.extend(_df_src[_sfuv_col].dropna().unique().tolist())
-                    elif MONTHLY_SFU_VERSION_COL in _df_src.columns:
-                        all_sfu_versions.extend(_df_src[MONTHLY_SFU_VERSION_COL].dropna().unique().tolist())
-            sfu_versions = sorted(set(all_sfu_versions))
+            # Collect SFU versions from the filtered SKU dataset first (authoritative list)
+            sku_for_versions = st.session_state.sku_df_filtered
+            if sku_for_versions is not None and MONTHLY_SFU_VERSION_COL in sku_for_versions.columns:
+                sfu_versions = sorted(
+                    set(sku_for_versions[MONTHLY_SFU_VERSION_COL].dropna().astype(str).tolist())
+                )
+            else:
+                # Fallback: union of SFU identifiers from available sources
+                all_sfu_versions: list = []
+                for _src in available_basis_sources:
+                    _df_src = _get_df(_src)
+                    if _df_src is not None:
+                        if _src == "Sellout":
+                            # Sellout sheet: get SFU_v from mapped column or first column
+                            _cmap_sellout = st.session_state.col_maps.get("Sellout", {})
+                            _sfuv_col = _cmap_sellout.get("SFU_v") or _cmap_sellout.get("SKU")
+                            if _sfuv_col and _sfuv_col in _df_src.columns:
+                                all_sfu_versions.extend(_df_src[_sfuv_col].dropna().astype(str).tolist())
+                        elif MONTHLY_SFU_VERSION_COL in _df_src.columns:
+                            all_sfu_versions.extend(_df_src[MONTHLY_SFU_VERSION_COL].dropna().astype(str).tolist())
+                sfu_versions = sorted(set(all_sfu_versions))
 
             if not sfu_versions or not available_basis_sources:
                 st.info(
@@ -2169,9 +2241,10 @@ def step4_salience():
                     for lbl, actual_col in preview_col_map.items():
                         row_p[lbl] = _sfu_month_val(v, src_role, actual_col)
                     final_b = sfu_final_basis.get(v, float("nan"))
-                    row_p["Final Basis"] = round(final_b, 2) if not pd.isna(final_b) else None
-                    sal_pct = (final_b / total_basis * 100) if (total_basis > 0 and not pd.isna(final_b)) else None
-                    row_p["Salience %"] = round(sal_pct, 2) if sal_pct is not None else None
+                    final_b = 0.0 if pd.isna(final_b) else float(final_b)
+                    row_p["Final Basis"] = round(final_b, 2)
+                    sal_pct = (final_b / total_basis * 100) if total_basis > 0 else 0.0
+                    row_p["Salience %"] = round(sal_pct, 2)
                     row_p["Remarks"] = saved_remarks.get(v, "")
                     preview_rows.append(row_p)
 
@@ -2223,6 +2296,16 @@ def step4_salience():
                 exc_store_sal: ExceptionStore = st.session_state.exc_store
                 hcm_excl = hier_col_map_from_state()
                 sku_col_excl = hcm_excl.get("SKU", MONTHLY_SFU_V_COL)
+                if sku_df_excl is not None:
+                    candidate_cols = [
+                        sku_col_excl,
+                        MONTHLY_SFU_VERSION_COL,
+                        MONTHLY_SFU_V_COL,
+                        "SFU_v",
+                        "SKU",
+                        "APO Product",
+                    ]
+                    sku_col_excl = next((c for c in candidate_cols if c and c in sku_df_excl.columns), None)
 
                 # Try to get product description column from Monthly sheet
                 monthly_df = None
@@ -2271,7 +2354,7 @@ def step4_salience():
                 tab_excl_table, tab_excl_upload = st.tabs(["📋 Select Exclusions", "📤 Upload Exclusions + Volumes"])
 
                 with tab_excl_table:
-                    if sku_df_excl is not None and not sku_df_excl.empty:
+                    if sku_df_excl is not None and not sku_df_excl.empty and sku_col_excl:
                         # Build a display table of all APO Products with their SFU Version
                         excl_cols = []
                         if MONTHLY_SFU_VERSION_COL in sku_df_excl.columns:
@@ -2285,7 +2368,12 @@ def step4_salience():
                                 excl_cols.append(actual_h)
 
                         # Add product description if available
-                        if desc_col and monthly_df is not None and sku_col_excl in monthly_df.columns:
+                        if (
+                            desc_col
+                            and monthly_df is not None
+                            and sku_col_excl in monthly_df.columns
+                            and sku_col_excl in sku_df_excl.columns
+                        ):
                             desc_map = monthly_df.drop_duplicates(subset=[sku_col_excl]).set_index(sku_col_excl)[desc_col].to_dict()
                             sku_df_excl = sku_df_excl.copy()
                             sku_df_excl["Product Description"] = sku_df_excl[sku_col_excl].map(desc_map)
@@ -2388,7 +2476,13 @@ def step4_salience():
                         else:
                             st.info("No APO Product data available — complete Step 3 first.")
                     else:
-                        st.info("No SFU_v data loaded yet — complete Step 3 first.")
+                        if sku_df_excl is not None and not sku_df_excl.empty and not sku_col_excl:
+                            st.warning(
+                                "Could not find a valid SKU/SFU column in the filtered data. "
+                                "Please check column mappings in Step 2."
+                            )
+                        else:
+                            st.info("No SFU_v data loaded yet — complete Step 3 first.")
 
                 with tab_excl_upload:
                     st.markdown(
