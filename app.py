@@ -4,7 +4,10 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import pathlib
+import pickle
 import re
+import uuid
 from copy import deepcopy
 
 import numpy as np
@@ -25,6 +28,7 @@ from bop_splitter.loader import (
     SAS_SFU_V_COL,
     SAS_GBB_TYPE_COL,
     SAS_GBB_TYPE_VARIANTS,
+    find_gbb_type_column,
     BIBLE_HIERARCHY_MAP,
     BIBLE_SFU_V_COL,
     BIBLE_SALIENCE_SFU_COL,
@@ -66,6 +70,80 @@ st.set_page_config(
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Session persistence (survive browser refresh via URL session ID)
+# ──────────────────────────────────────────────────────────────────────────────
+_TMP_DIR = pathlib.Path(".tmp")
+_SESSION_TTL_HOURS = 24
+
+# Keys that must never be written to disk (security)
+_SKIP_PERSIST = {"db_token"}
+
+
+def _is_non_persistable_state_key(key: str) -> bool:
+    """Return True for session_state keys that should not be persisted/restored."""
+    # Streamlit does not allow assigning values to certain widget keys.
+    if key.endswith("_btn"):
+        return True
+    if key.endswith("_uploader"):  # file_uploader widgets
+        return True
+    return key in _SKIP_PERSIST
+
+def _session_id() -> str:
+    """Return the session ID from the URL query param, creating one if absent."""
+    sid = st.query_params.get("sid")
+    if not sid:
+        sid = uuid.uuid4().hex
+        st.query_params["sid"] = sid
+    return sid
+
+def _session_file(sid: str) -> pathlib.Path:
+    _TMP_DIR.mkdir(exist_ok=True)
+    return _TMP_DIR / f"{sid}.pkl"
+
+def _save_session(sid: str) -> None:
+    """Pickle the current session state to .tmp/{sid}.pkl."""
+    try:
+        data = {
+            k: v
+            for k, v in st.session_state.items()
+            if not _is_non_persistable_state_key(k)
+        }
+        with open(_session_file(sid), "wb") as f:
+            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        # Opportunistically clean up expired session files
+        cutoff = datetime.datetime.now() - datetime.timedelta(hours=_SESSION_TTL_HOURS)
+        for p in _TMP_DIR.glob("*.pkl"):
+            try:
+                if datetime.datetime.fromtimestamp(p.stat().st_mtime) < cutoff:
+                    p.unlink(missing_ok=True)
+            except Exception:
+                pass
+    except Exception:
+        pass  # persistence failure must never crash the app
+
+def _restore_session(sid: str) -> bool:
+    """Restore session state from disk. Returns True if successful."""
+    fpath = _session_file(sid)
+    if not fpath.exists():
+        return False
+    try:
+        with open(fpath, "rb") as f:
+            data = pickle.load(f)
+        for k, v in data.items():
+            if _is_non_persistable_state_key(k):
+                continue
+            try:
+                st.session_state[k] = v
+            except Exception:
+                # Some widget-managed keys (for example buttons/uploaders)
+                # cannot be assigned through session_state; skip them safely.
+                continue
+        return True
+    except Exception:
+        return False
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Session-state helpers
 # ──────────────────────────────────────────────────────────────────────────────
 def _init_state():
@@ -90,6 +168,7 @@ def _init_state():
         "sas_months_selected": [],
         "sas_forecast_months_selected": [],  # user-selected future forecast months
         "sfu_basis_sources": {},      # SFU_SFU Version -> basis config (source, mode, selected)
+        "sfu_basis_overrides": {},    # SFU_SFU Version -> optional manual final basis override
         "sfu_manual_months": [],      # Global manual month selector for SFU basis (legacy)
         "sfu_specific_months": {},    # SFU_SFU Version -> list[str] of manually chosen months
         "sfu_remarks": {},            # SFU_SFU Version -> user remarks string
@@ -97,6 +176,7 @@ def _init_state():
         "step": 1,
         "max_step": 1,
         "_loaded_file_id": None,
+        "_sas_scaled_once": False,
         "data_source": "none",       # "none" | "excel" | "databricks"
         "_is_bop": False,            # True when standard SAP BEx BOP export detected
         "db_host": "",
@@ -112,7 +192,16 @@ def _init_state():
         if k not in st.session_state:
             st.session_state[k] = v
 
-_init_state()
+# ── Restore session from disk if a session ID is present in the URL ───────────
+_sid = _session_id()
+if "step" not in st.session_state:
+    # Fresh Streamlit session — try to restore from the persisted pickle
+    _restored = _restore_session(_sid)
+    _init_state()  # fill any keys that aren't in the saved snapshot
+    if _restored and st.session_state.get("step", 1) > 1:
+        st.toast("✅ Session restored — welcome back!", icon="🔀")
+else:
+    _init_state()  # normal rerun — just fill missing defaults
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Sidebar – progress tracker
@@ -122,10 +211,9 @@ STEPS = [
     "2. Map Columns",
     "3. Filters & Split Level",
     "4. Basis & Salience",
-    "5. Exceptions",
-    "6. Run Split",
-    "7. Reasonability Check",
-    "8. Download",
+    "5. Run Split",
+    "6. Reasonability Check",
+    "7. Download",
 ]
 
 with st.sidebar:
@@ -224,7 +312,7 @@ SKU_SHEETS = [
     "Bible",  # Can also serve as SKU source
     "Sellout",  # Sellout data with SFU_v identifier
 ]
-LOGICAL_HIER = HIERARCHY_LEVELS  # Ctry, SMO Category, Brand, Sub Brand, Form
+LOGICAL_HIER = HIERARCHY_LEVELS  # Country, SMO Category, Brand, Sub Brand, Form
 ALL_LOGICAL = LOGICAL_HIER + ["SFU_v"]
 
 
@@ -298,7 +386,7 @@ def _sku_merged() -> pd.DataFrame | None:
             continue
         cmap = st.session_state.col_maps.get(role, {})
         hier_actual = [cmap.get(h) for h in LOGICAL_HIER if cmap.get(h)]
-        sku_actual = cmap.get("SKU") or cmap.get("SFU_v")
+        sku_actual = cmap.get("SFU_v") or cmap.get("SKU")
         if not sku_actual or not hier_actual:
             continue
         keep = hier_actual + [sku_actual]
@@ -462,7 +550,10 @@ def _show_bop_load_summary(sheets: dict) -> None:
     for i, measure in enumerate(MONTHLY_MEASURES, 1):
         if measure in sheets:
             mdf = sheets[measure]
-            n_sku = mdf[MONTHLY_SFU_V_COL].nunique() if MONTHLY_SFU_V_COL in mdf.columns else "?"
+            if MONTHLY_SFU_VERSION_COL in mdf.columns:
+                n_sku = mdf[MONTHLY_SFU_VERSION_COL].nunique()
+            else:
+                n_sku = "?"
             m_cols[min(i, 3)].metric(measure, f"{len(mdf):,} rows")
             m_cols[min(i, 3)].caption(f"{n_sku:,} unique SFU_vs")
 
@@ -479,13 +570,11 @@ def _show_bop_load_summary(sheets: dict) -> None:
         mapping_rows.append({
             "Logical Level": "SFU_v",
             "SAS column": "Specific SFU_v (optional — pinned BBs only)",
-            "Monthly column → renamed to SAS name": MONTHLY_SFU_V_COL,
+            "Monthly column → renamed to SAS name": MONTHLY_SFU_VERSION_COL,
         })
 
-        # GBB Type — detect which variant is present in the SAS sheet
-        gbb_col_found = next(
-            (c for c in SAS_GBB_TYPE_VARIANTS if c in sas_df.columns), None
-        )
+        # GBB Type — detect using resilient header matching
+        gbb_col_found = find_gbb_type_column(sas_df.columns)
         mapping_rows.append({
             "Logical Level": "GBB Type",
             "SAS column": gbb_col_found if gbb_col_found else "⚠️ not found in SAS sheet",
@@ -515,9 +604,7 @@ def _show_bop_load_summary(sheets: dict) -> None:
     if not sas_df.empty:
         with st.expander("Preview SAS (Building Blocks) — first 5 rows"):
             # Pin GBB Type column first in the preview if it exists
-            gbb_preview_col = next(
-                (c for c in SAS_GBB_TYPE_VARIANTS if c in sas_df.columns), None
-            )
+            gbb_preview_col = find_gbb_type_column(sas_df.columns)
             if gbb_preview_col:
                 priority_cols = [gbb_preview_col] + [c for c in sas_df.columns if c != gbb_preview_col]
                 st.dataframe(sas_df[priority_cols].head(5), width='stretch')
@@ -588,6 +675,7 @@ def step1_upload():
                 is_bop = _is_bop_sheets(sheets)
                 st.session_state.sheets = sheets
                 st.session_state["_loaded_file_id"] = file_id
+                st.session_state["_sas_scaled_once"] = False
                 st.session_state.data_source = "excel"
                 st.session_state["_is_bop"] = is_bop
                 if is_bop:
@@ -782,6 +870,7 @@ def step1_upload():
                     st.session_state.sheets = loaded_sheets
                     st.session_state.sheet_map = {r: r for r in loaded_sheets}
                     st.session_state["_loaded_file_id"] = None
+                    st.session_state["_sas_scaled_once"] = False
                     st.session_state.data_source = "databricks"
                     st.session_state.step = max(st.session_state.step, 2)
                     st.session_state.max_step = max(st.session_state.max_step, 2)
@@ -1027,8 +1116,8 @@ def step2_columns():
             if role != "Stat_DB":
                 hier_ui = st.columns(len(LOGICAL_HIER))
                 for j, lh in enumerate(LOGICAL_HIER):
-                    if lh == "Ctry":
-                        guess = cmap.get(lh) or _guess_col(cols_all, "Ctry", "Country")
+                    if lh == "Country":
+                        guess = cmap.get(lh) or _guess_col(cols_all, "Country")
                     else:
                         guess = cmap.get(lh) or _guess_col(cols_all, lh)
                     idx = none_opt.index(guess) if guess in none_opt else 0
@@ -1047,13 +1136,16 @@ def step2_columns():
                     # Sellout sheet: prefer explicit SFU_v column if present
                     sku_guess = (
                         cmap.get("SFU_v")
-                        or _guess_col(cols_all, "SFU_v", MONTHLY_SFU_VERSION_COL, MONTHLY_SFU_V_COL, "Salience SFU", "Material", "SKU")
+                        or _guess_col(cols_all, "SFU_v", MONTHLY_SFU_VERSION_COL, "Salience SFU", "Material", "SKU")
                     )
                 elif role in ("Shipments", "Statistical Forecast", "Final Fcst to Finance", "Stat", "FFF"):
                     # For these BOP roles, prioritize MONTHLY_SFU_VERSION_COL ("SFU_SFU Version") as default
-                    sku_guess = cmap.get("SKU") or (MONTHLY_SFU_VERSION_COL if MONTHLY_SFU_VERSION_COL in cols_all else _guess_col(cols_all, "SFU_SFU Version", "APO Product", "SFU_v", "SKU"))
+                    sku_guess = cmap.get("SFU_v") or cmap.get("SKU") or (
+                        MONTHLY_SFU_VERSION_COL if MONTHLY_SFU_VERSION_COL in cols_all
+                        else _guess_col(cols_all, "SFU_SFU Version", "SFU_v", "SKU")
+                    )
                 else:
-                    sku_guess = cmap.get("SKU") or cmap.get("SFU_v") or _guess_col(cols_all, "APO Product", "SFU_v", "SKU")
+                    sku_guess = cmap.get("SFU_v") or cmap.get("SKU") or _guess_col(cols_all, "SFU_v", "SKU")
                 sku_idx = none_opt.index(sku_guess) if sku_guess in none_opt else 0
                 sku_label = "SFU_v column" if role == "Bible" else "SFU_v column"
                 sku_sel = st.selectbox(sku_label, none_opt, index=sku_idx, key=f"col_{role}_SKU")
@@ -1124,9 +1216,7 @@ def step2_columns():
                 # ── GBB Type column mapping (SAS only) ──────────────────────
                 st.markdown("**GBB Type column**")
                 # Auto-detect from known variants; allow user to override
-                auto_gbb = cmap.get("GBB Type") or next(
-                    (c for c in SAS_GBB_TYPE_VARIANTS if c in cols_all), None
-                )
+                auto_gbb = cmap.get("GBB Type") or find_gbb_type_column(cols_all)
                 gbb_opts = ["— not present —"] + cols_all
                 gbb_idx = gbb_opts.index(auto_gbb) if auto_gbb in gbb_opts else 0
                 gbb_sel = st.selectbox(
@@ -1225,10 +1315,10 @@ def _compute_sfuv_aggregates() -> pd.DataFrame | None:
 
     last_12 = past_months[-12:] if past_months else []
 
-    # ── Groupby key: hierarchy + SFU_SFU Version + APO Product ────────────────
+    # ── Groupby key: hierarchy + SFU_SFU Version ─────────────────────────────
     # Use the first available measure sheet to discover columns
     sample_df = st.session_state.sheets.get(MONTHLY_MEASURES[0], pd.DataFrame())
-    hier_cols = [c for c in ["Ctry", "SMO Category", "Brand", "Sub Brand", "Form"]
+    hier_cols = [c for c in ["Country", "SMO Category", "Brand", "Sub Brand", "Form"]
                  if c in sample_df.columns]
 
     measure_months = {
@@ -1250,7 +1340,7 @@ def _compute_sfuv_aggregates() -> pd.DataFrame | None:
         if not available:
             continue
 
-        # Aggregate at SFU_SFU Version level (not APO Product) across month columns
+        # Aggregate at SFU_SFU Version level across month columns
         group_cols = [c for c in hier_cols + [MONTHLY_SFU_VERSION_COL]
                       if c in df.columns]
         if not group_cols:
@@ -1320,6 +1410,13 @@ def step3_filters():
         month_cols = detect_month_columns(sas_df)
         if month_cols:
             month_col_set = set(month_cols)
+            # Preserve GBB Type through aggregation (it can be non-object in some files).
+            mapped_gbb_col = sas_cmap.get(SAS_GBB_TYPE_COL)
+            gbb_col_for_group = (
+                mapped_gbb_col
+                if mapped_gbb_col in sas_df.columns
+                else find_gbb_type_column(sas_df.columns)
+            )
             # Include all non-month, non-numeric metadata columns in the groupby
             # so they are preserved after aggregation (e.g. GBB Type, Entry Type, Plan Name)
             meta_cols = [
@@ -1328,14 +1425,19 @@ def step3_filters():
                 and c not in group_keys
                 and sas_df[c].dtype == object  # string/categorical metadata
             ]
+            if gbb_col_for_group and gbb_col_for_group not in group_keys and gbb_col_for_group not in meta_cols:
+                meta_cols.append(gbb_col_for_group)
             full_group_keys = group_keys + meta_cols
 
             # Ensure all month columns are numeric for summation
             sas_df[month_cols] = sas_df[month_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
             # Group and sum — metadata columns are part of the key so they survive
             sas_df = sas_df.groupby(full_group_keys, as_index=False, dropna=False)[month_cols].sum()
-            # C-903: SAS values are stored /1000 in the source file — multiply back to real SU volume
-            sas_df[month_cols] = sas_df[month_cols] * 1000
+            # C-903: SAS values are stored /1000 in the source file — multiply back
+            # to real SU volume once per loaded dataset, not on every rerun.
+            if not st.session_state.get("_sas_scaled_once", False):
+                sas_df[month_cols] = sas_df[month_cols] * 1000
+                st.session_state["_sas_scaled_once"] = True
             # Update session state with aggregated data
             st.session_state.sheets[st.session_state.sheet_map["SAS"]] = sas_df
 
@@ -1440,7 +1542,7 @@ def step3_filters():
     
     st.info(
         "👉 **How to customize:** Click any cell in the **Split Level ▾** or **Action ▾** columns below to open a dropdown menu.\n\n"
-        "- **Split Level**: Choose granularity (Ctry, SMO Category, Brand, Sub Brand, Form, or SFU_v)\n"
+        "- **Split Level**: Choose granularity (Country, SMO Category, Brand, Sub Brand, Form, or SFU_v)\n"
         "- **Action**: Choose 'split' (normal), 'exceptions' (route to exception list), or 'ignore' (exclude from split)"
     )
 
@@ -1453,10 +1555,7 @@ def step3_filters():
     if mapped_gbb_col in sas_df.columns:
         _gbb_col = mapped_gbb_col
     else:
-        _gbb_col = next(
-            (c for c in SAS_GBB_TYPE_VARIANTS if c in sas_df.columns),
-            None,
-        )
+        _gbb_col = find_gbb_type_column(sas_df.columns)
 
     if _gbb_col:
         st.caption(
@@ -1632,7 +1731,9 @@ def step3_filters():
     if st.button("Confirm Months & Split Level →", type="primary", disabled=bool(sku_problem)):
         # Save per-BB split levels
         if edited_bb is not None and bb_id_col in edited_bb.columns:
-            new_bb_split_levels = dict(zip(edited_bb[bb_id_col], edited_bb["Split Level"]))
+            new_bb_split_levels = {
+                str(bid): lvl for bid, lvl in zip(edited_bb[bb_id_col], edited_bb["Split Level"])
+            }
             st.session_state.bb_split_levels = new_bb_split_levels
             # Use the most common level as the global default (for display purposes)
             if new_bb_split_levels:
@@ -1644,7 +1745,7 @@ def step3_filters():
             gbb_types: dict[str, str] = {}
             if "Action" in edited_bb.columns and "GBB Type" in edited_bb.columns:
                 for _, row in edited_bb.iterrows():
-                    bid = row[bb_id_col]
+                    bid = str(row[bb_id_col])
                     gbb_actions[bid] = str(row.get("Action", "split"))
                     gbb_types[bid] = str(row.get("GBB Type", ""))
             st.session_state.gbb_actions = gbb_actions
@@ -1658,7 +1759,16 @@ def step3_filters():
         sas_out = sas_df.reset_index(drop=True)
         sku_out = sku_merged.reset_index(drop=True)
 
-        # C-302: Only retain SFU_vs that have at least one non-zero FFF value in future months
+        # Canonicalize runtime SFU identifier to SFU_SFU Version across the app.
+        sfu_source_col = next(
+            (c for c in [MONTHLY_SFU_VERSION_COL, "SFU_v", "SKU"] if c in sku_out.columns),
+            None,
+        )
+        if sfu_source_col and sfu_source_col != MONTHLY_SFU_VERSION_COL:
+            sku_out[MONTHLY_SFU_VERSION_COL] = sku_out[sfu_source_col].astype(str).str.strip()
+
+        # Keep all SFU_vs for salience setup; basis can come from Shipments / Sellout / other metrics.
+        # We still compute and show FFF coverage as an informational hint only.
         fff_df = _get_df("Final Fcst to Finance")
         if fff_df is not None and not fff_df.empty and MONTHLY_SFU_VERSION_COL in fff_df.columns:
             fff_months = detect_month_columns(fff_df)
@@ -1667,22 +1777,19 @@ def step3_filters():
                 m for m in fff_months
                 if (parse_month_to_date(m) or pd.Timestamp.min) >= current_month_start_filter
             ]
-            if future_fff_months:
+            if future_fff_months and MONTHLY_SFU_VERSION_COL in sku_out.columns:
                 fff_numeric = fff_df[future_fff_months].apply(pd.to_numeric, errors="coerce").fillna(0)
                 fff_df = fff_df.copy()
                 fff_df["_has_fff"] = fff_numeric.sum(axis=1) > 0
                 sfus_with_fff = set(
                     fff_df.loc[fff_df["_has_fff"], MONTHLY_SFU_VERSION_COL].dropna().astype(str).tolist()
                 )
-                if sfus_with_fff and MONTHLY_SFU_VERSION_COL in sku_out.columns:
-                    original_count = len(sku_out[MONTHLY_SFU_VERSION_COL].unique())
-                    sku_out = sku_out[sku_out[MONTHLY_SFU_VERSION_COL].astype(str).isin(sfus_with_fff)].reset_index(drop=True)
-                    filtered_count = len(sku_out[MONTHLY_SFU_VERSION_COL].unique())
-                    if filtered_count < original_count:
-                        st.info(
-                            f"ℹ️ Filtered to **{filtered_count}** SFU_vs with future FFF "
-                            f"(removed {original_count - filtered_count} with no future Final Forecast to Finance)."
-                        )
+                total_sfus = len(sku_out[MONTHLY_SFU_VERSION_COL].astype(str).unique())
+                covered_sfus = len(set(sku_out[MONTHLY_SFU_VERSION_COL].astype(str).tolist()) & sfus_with_fff)
+                st.info(
+                    f"ℹ️ Future FFF coverage: **{covered_sfus}/{total_sfus}** SFU_vs have non-zero FFF. "
+                    "All SFU_vs are kept for Step 4 salience configuration."
+                )
 
         st.session_state.sas_df_filtered = sas_out
         st.session_state.sku_df_filtered = sku_out
@@ -1698,7 +1805,7 @@ def step3_filters():
 
         # Compute equal salience per unique split level used across BBs
         hcm = hier_col_map_from_state()
-        sku_col = hcm.get("SKU", "SKU")
+        sku_col = hcm.get("SFU_v", hcm.get("SKU", "SKU"))
         global_exclusions = st.session_state.exc_store.global_exclusions
 
         unique_levels = set(new_bb_split_levels.values()) if new_bb_split_levels else {st.session_state.split_level}
@@ -1733,25 +1840,23 @@ def _build_exclusion_upload_template(sku_col: str, months: list[str]) -> bytes:
     return buf.getvalue()
 
 
-def _compute_bop_salience(sfu_configs: dict) -> pd.DataFrame | None:
+def _compute_bop_salience_for_level(
+    split_level: str,
+    sfu_configs: dict,
+    basis_overrides: dict[str, float],
+    hcm: dict,
+    sku_df: pd.DataFrame,
+    current_month_start: pd.Timestamp,
+) -> pd.DataFrame | None:
     """
-    Compute BOP salience at SFU_SFU Version level.
-
-    sfu_configs: dict {SFU_version: {"source": str, "mode": str, "selected": list[str]}}
+    Compute BOP salience for a specific split level.
+    
+    Returns DataFrame with columns: group_keys + [sku_col, 'basis', 'salience', 'flag']
     """
-    sku_df = st.session_state.sku_df_filtered
-    if sku_df is None or sku_df.empty:
-        st.error("No SFU_v data — complete Step 3 first.")
-        return None
-
-    hcm = hier_col_map_from_state()
-    split_level = st.session_state.split_level
-    group_keys_logical = [k for k in SPLIT_KEYS[split_level] if k != "SKU"]
+    group_keys_logical = [k for k in SPLIT_KEYS[split_level] if k != "SFU_v"]
     group_keys = [hcm.get(k, k) for k in group_keys_logical]
     valid_group_keys = [k for k in group_keys if k in sku_df.columns]
-    sku_col = hcm.get("SKU", MONTHLY_SFU_V_COL)
-
-    current_month_start = pd.Timestamp.now().normalize().replace(day=1)
+    sku_col = hcm.get("SFU_v", MONTHLY_SFU_VERSION_COL)
 
     # Step 1: build {(group_vals..., SFU_version): total_SFU_basis}
     sfu_basis: dict[tuple, float] = {}
@@ -1780,17 +1885,16 @@ def _compute_bop_salience(sfu_configs: dict) -> pd.DataFrame | None:
                 continue
             src_df = src_df.copy()
             src_df[MONTHLY_SFU_VERSION_COL] = src_df[sfu_col].astype(str)
-
-            # Enrich Sellout with hierarchy columns from SKU/Bible data when missing
-            missing_group_cols = [k for k in valid_group_keys if k not in src_df.columns]
-            if missing_group_cols and sku_df is not None and MONTHLY_SFU_VERSION_COL in sku_df.columns:
-                hier_lookup = (
-                    sku_df[[MONTHLY_SFU_VERSION_COL] + [k for k in valid_group_keys if k in sku_df.columns]]
-                    .drop_duplicates()
-                )
-                src_df = src_df.merge(hier_lookup, on=MONTHLY_SFU_VERSION_COL, how="left")
         elif MONTHLY_SFU_VERSION_COL not in src_df.columns:
             continue
+
+        # Enrich any source with missing hierarchy columns from SKU/Bible mapping so
+        # basis aggregation keys always match the split-level keys.
+        missing_group_cols = [k for k in valid_group_keys if k not in src_df.columns]
+        if missing_group_cols and MONTHLY_SFU_VERSION_COL in sku_df.columns:
+            hier_lookup_cols = [MONTHLY_SFU_VERSION_COL] + [k for k in valid_group_keys if k in sku_df.columns]
+            hier_lookup = sku_df[hier_lookup_cols].drop_duplicates()
+            src_df = src_df.merge(hier_lookup, on=MONTHLY_SFU_VERSION_COL, how="left")
 
         cmap = st.session_state.col_maps.get(src_role, {})
         all_months = cmap.get("_months", detect_month_columns(src_df))
@@ -1836,20 +1940,19 @@ def _compute_bop_salience(sfu_configs: dict) -> pd.DataFrame | None:
             val = row["_row_basis"]
             sfu_basis[grp_vals] = float(val) if not pd.isna(val) else 0.0
 
-    # Step 2: count APO Products per (group + SFU) in sku_df
-    sfu_n: dict[tuple, int] = {}
-    if sku_col in sku_df.columns and MONTHLY_SFU_VERSION_COL in sku_df.columns:
-        agg_keys_sku = [k for k in valid_group_keys if k in sku_df.columns] + [MONTHLY_SFU_VERSION_COL]
-        for grp_vals, grp in sku_df.groupby(agg_keys_sku, sort=False, dropna=False):
-            if not isinstance(grp_vals, tuple):
-                grp_vals = (grp_vals,)
-            sfu_n[grp_vals] = max(1, grp[sku_col].nunique())
+    # Apply optional manual Final Basis overrides from Live Preview.
+    if basis_overrides:
+        for sfu_key, basis_val in list(sfu_basis.items()):
+            sfu_ver = str(sfu_key[-1]) if sfu_key else ""
+            if sfu_ver in basis_overrides:
+                sfu_basis[sfu_key] = float(basis_overrides[sfu_ver])
 
     n_gk = len(valid_group_keys)
 
-    # Step 3: per split group → normalise SFU bases, compute per-APO salience
+    # Step 3: per split group → normalise SFU bases, compute one salience per SFU_v
     rows = []
-    for grp_vals, grp in sku_df.groupby(valid_group_keys, sort=False, dropna=False):
+    sfu_rows = sku_df[[k for k in valid_group_keys if k in sku_df.columns] + ([sku_col] if sku_col in sku_df.columns else [])].drop_duplicates()
+    for grp_vals, grp in sfu_rows.groupby(valid_group_keys, sort=False, dropna=False):
         if not isinstance(grp_vals, tuple):
             grp_vals = (grp_vals,)
         group_id = dict(zip(valid_group_keys, grp_vals))
@@ -1857,22 +1960,56 @@ def _compute_bop_salience(sfu_configs: dict) -> pd.DataFrame | None:
         total_group_basis = sum(v for k, v in sfu_basis.items() if k[:n_gk] == grp_vals)
 
         for _, row in grp.iterrows():
-            sku_val = str(row.get(sku_col, "")) if sku_col in grp.columns else ""
-            sfu_ver = row.get(MONTHLY_SFU_VERSION_COL, "") if MONTHLY_SFU_VERSION_COL in grp.columns else ""
+            sfu_ver = row.get(sku_col, "") if sku_col in grp.columns else ""
             sfu_key = grp_vals + (sfu_ver,)
             sfu_b = sfu_basis.get(sfu_key, 0.0)
-            n = sfu_n.get(sfu_key, 1)
 
             if total_group_basis > 0 and sfu_b > 0:
-                sal = sfu_b / (total_group_basis * n)
+                sal = sfu_b / total_group_basis
                 flag = "computed"
             else:
                 sal = 0.0
                 flag = "blocked"
 
-            rows.append({**group_id, MONTHLY_SFU_VERSION_COL: sfu_ver, sku_col: sku_val, "basis": sfu_b, "salience": sal, "flag": flag})
+            rows.append({**group_id, sku_col: sfu_ver, "basis": sfu_b, "salience": sal, "flag": flag})
 
     return pd.DataFrame(rows) if rows else None
+
+
+def _compute_bop_salience(sfu_configs: dict, basis_overrides: dict[str, float] | None = None) -> pd.DataFrame | None:
+    """
+    Compute BOP salience at SFU_SFU Version level, respecting per-BB split levels.
+
+    sfu_configs: dict {SFU_version: {"source": str, "mode": str, "selected": list[str]}}
+    Returns DataFrame with _split_level column for each row.
+    """
+    sku_df = st.session_state.sku_df_filtered
+    basis_overrides = basis_overrides or {}
+    if sku_df is None or sku_df.empty:
+        st.error("No SFU_v data — complete Step 3 first.")
+        return None
+
+    hcm = hier_col_map_from_state()
+    bb_split_levels = st.session_state.get("bb_split_levels", {})
+    global_split_level = st.session_state.split_level
+    current_month_start = pd.Timestamp.now().normalize().replace(day=1)
+
+    # Determine unique split levels (respect per-BB overrides)
+    unique_levels = set(bb_split_levels.values()) if bb_split_levels else {global_split_level}
+
+    sal_parts = []
+    for level in sorted(unique_levels):  # Sort for deterministic order
+        part = _compute_bop_salience_for_level(
+            level, sfu_configs, basis_overrides, hcm, sku_df, current_month_start
+        )
+        if part is not None and not part.empty:
+            part["_split_level"] = level
+            sal_parts.append(part)
+
+    if sal_parts:
+        return pd.concat(sal_parts, ignore_index=True)
+    else:
+        return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1896,10 +2033,10 @@ def step4_salience():
 
     if sal_df is not None and not sal_df.empty:
         display_sal = sal_df.drop(columns=["_split_level"], errors="ignore").copy()
-        # Aggregate strictly to SFU_SFU Version level (drop SKU/APO Product from group keys)
+        # Aggregate strictly to SFU_SFU Version level.
         if MONTHLY_SFU_VERSION_COL in display_sal.columns:
             group_disp = [MONTHLY_SFU_VERSION_COL]
-            # Optionally add hierarchy columns if needed (but not SKU/APO Product)
+            # Optionally add hierarchy columns if needed.
             for h in HIERARCHY_LEVELS:
                 col = hcm.get(h)
                 if col and col in display_sal.columns and col != hcm.get("SKU"):
@@ -1911,60 +2048,23 @@ def step4_salience():
             )
             display_sal = agg_disp
 
-        # Build pivot table: SFU_SFU_version × months
-        # Per-month salience columns (named by month) in salience_df take precedence over
-        # the scalar 'salience' column; users can override any cell independently.
-        sas_months = st.session_state.get("sas_months_selected", [])
-        sfuv_col = MONTHLY_SFU_VERSION_COL if MONTHLY_SFU_VERSION_COL in display_sal.columns else None
-        if sfuv_col and sas_months:
-            scalar_pct = (pd.to_numeric(display_sal["salience"], errors="coerce") * 100).round(2)
-            pivot_rows = []
-            for row_idx, row in display_sal.iterrows():
-                default_pct = round(float(scalar_pct.at[row_idx]), 2)
-                entry = {"SFU_SFU_version": row[sfuv_col]}
-                for m in sas_months:
-                    # Use existing per-month column if already set (value stored as 0-1 fraction)
-                    if m in display_sal.columns:
-                        entry[m] = round(float(pd.to_numeric(row[m], errors="coerce")) * 100, 2)
-                    else:
-                        entry[m] = default_pct
-                pivot_rows.append(entry)
-            pivot_df = pd.DataFrame(pivot_rows).set_index("SFU_SFU_version")
-            pivot_df = pivot_df[~pivot_df.index.duplicated(keep="first")]
-            st.subheader(f"Current Salience Table — {len(pivot_df)} SFU_SFU versions (editable per month)")
-            st.caption(
-                "Salience % per SFU_SFU version × month. "
-                "Default is the same weight across all months — edit any cell to override a specific month. "
-                "Click **Apply** to save changes."
-            )
-            col_cfg = {m: st.column_config.NumberColumn(m, format="%.2f %%") for m in sas_months}
-            edited_pivot = st.data_editor(
-                pivot_df,
-                width='stretch',
-                height=min(400, 50 + 35 * len(pivot_df)),
-                column_config=col_cfg,
-                num_rows="fixed",
-            )
-            # Write per-month salience back into salience_df as fractional columns
-            if st.button("Apply Salience Overrides from Table"):
-                updated_sal = st.session_state.salience_df.copy()
-                for m in sas_months:
-                    updated_sal[m] = updated_sal[MONTHLY_SFU_VERSION_COL].map(
-                        lambda v, _m=m: float(edited_pivot.at[v, _m]) / 100.0
-                        if v in edited_pivot.index else np.nan
-                    )
-                st.session_state.salience_df = updated_sal
-                st.success("Per-month salience saved — will be used in the split.")
-                st.rerun()
-        else:
-            # Fallback: long-format display (no SAS months available yet)
-            if "salience" in display_sal.columns:
-                display_sal["Salience %"] = (pd.to_numeric(display_sal["salience"], errors="coerce") * 100).round(2)
-                display_sal = display_sal.drop(columns=["salience"])
-            elif "salience %" in display_sal.columns:
-                display_sal = display_sal.rename(columns={"salience %": "Salience %"})
-                display_sal["Salience %"] = pd.to_numeric(display_sal["Salience %"], errors="coerce").round(2)
+        # Display one salience value per SFU_SFU Version (no monthly salience overrides).
+        if "salience" in display_sal.columns:
+            display_sal["Salience %"] = (pd.to_numeric(display_sal["salience"], errors="coerce") * 100).round(2)
+            display_sal = display_sal.drop(columns=["salience"])
+        elif "salience %" in display_sal.columns:
+            display_sal = display_sal.rename(columns={"salience %": "Salience %"})
+            display_sal["Salience %"] = pd.to_numeric(display_sal["Salience %"], errors="coerce").round(2)
+
+        show_current_salience = st.checkbox(
+            "Show Current Salience Table",
+            value=False,
+            key="show_current_salience_table",
+            help="Optional QA view. Split logic is unchanged whether this table is shown or hidden.",
+        )
+        if show_current_salience:
             st.subheader(f"Current Salience Table — {len(display_sal)} rows (at SFU_SFU Version level)")
+            st.caption("This salience is applied consistently across all selected SAS forecast months.")
             st.dataframe(
                 display_sal,
                 width='stretch',
@@ -2012,6 +2112,71 @@ def step4_salience():
                             all_sfu_versions.extend(_df_src[MONTHLY_SFU_VERSION_COL].dropna().astype(str).tolist())
                 sfu_versions = sorted(set(all_sfu_versions))
 
+            # ── Step 4 exclusions before basis selection ───────────────────
+            sku_col_for_quick = hcm.get("SFU_v", MONTHLY_SFU_VERSION_COL)
+            sfu_versions_all = list(sfu_versions)
+            if (
+                sku_for_versions is not None
+                and MONTHLY_SFU_VERSION_COL in sku_for_versions.columns
+                and sku_col_for_quick in sku_for_versions.columns
+            ):
+                st.markdown("#### Step 4 — Exclusions (Fixed Promo volumes, Initiatives)")
+                st.caption(
+                    "Exclude SFU_v values first to reduce the list shown in Live Preview. "
+                    "Excluded items will receive salience 0 and be skipped in split allocation."
+                )
+
+                quick_scope_cols = list(dict.fromkeys([MONTHLY_SFU_VERSION_COL, sku_col_for_quick]))
+                quick_scope = sku_for_versions[quick_scope_cols].copy()
+                quick_scope[MONTHLY_SFU_VERSION_COL] = quick_scope[MONTHLY_SFU_VERSION_COL].astype(str).str.strip()
+                if sku_col_for_quick != MONTHLY_SFU_VERSION_COL:
+                    quick_scope[sku_col_for_quick] = quick_scope[sku_col_for_quick].astype(str).str.strip()
+                quick_scope = quick_scope[(quick_scope[MONTHLY_SFU_VERSION_COL] != "") & (quick_scope[sku_col_for_quick] != "")]
+
+                all_quick_skus = sorted(quick_scope[sku_col_for_quick].dropna().unique().tolist())
+                current_excl = st.session_state.exc_store.global_exclusions
+                quick_default = [s for s in all_quick_skus if s in current_excl]
+                quick_selected = st.multiselect(
+                    "Exclude SFU_v values (applied before basis selection)",
+                    all_quick_skus,
+                    default=quick_default,
+                    key="quick_pre_basis_exclusions",
+                )
+
+                if st.button("Apply Quick Exclusions", key="apply_quick_pre_basis_exclusions"):
+                    exc_store_quick = st.session_state.exc_store
+                    quick_scope_skus = set(all_quick_skus)
+                    exc_store_quick.global_exclusions -= quick_scope_skus
+                    for _sku in quick_selected:
+                        exc_store_quick.add_global_exclusion(
+                            str(_sku),
+                            notes="Excluded before basis selection (Step 4 quick filter)",
+                        )
+                    st.session_state.exc_store = exc_store_quick
+                    st.rerun()
+
+                # Reduce visible SFU list to those not globally excluded.
+                # Keep SFU_vs that have BB-specific includes, even if globally excluded elsewhere.
+                exc_store_for_filter = st.session_state.exc_store
+                bb_included_skus = set()
+                for bb_id, bb_exc in exc_store_for_filter.bb_exceptions.items():
+                    bb_included_skus.update(bb_exc.get("include", set()))
+                
+                # Keep SKU if: (1) not globally excluded, OR (2) has a BB-specific include
+                mask = ~quick_scope[sku_col_for_quick].isin(exc_store_for_filter.global_exclusions) | \
+                       quick_scope[sku_col_for_quick].isin(bb_included_skus)
+                eligible_scope = quick_scope[mask]
+                sfu_versions = sorted(eligible_scope[MONTHLY_SFU_VERSION_COL].dropna().unique().tolist())
+
+                st.caption(
+                    f"Visible in Live Preview: **{len(sfu_versions)}** / **{len(sfu_versions_all)}** SFU_v "
+                    "after quick exclusions."
+                )
+
+            # Merged exceptions controls so users can finish all exclusions in Step 4.
+            with st.expander("Advanced Exceptions (Per-BB include/exclude, fixed qty, log)", expanded=False):
+                render_exceptions_panel()
+
             if not sfu_versions or not available_basis_sources:
                 st.info(
                     f"BOP auto-salience requires at least one measure sheet "
@@ -2033,8 +2198,11 @@ def step4_salience():
                 )
                 # Last 6 past months for preview columns
                 preview_months = all_past_months_sorted[-6:] if len(all_past_months_sorted) >= 6 else all_past_months_sorted
-                # Friendly display labels P6M … P1M (oldest → newest)
-                preview_labels = [f"P{len(preview_months) - i}M" for i in range(len(preview_months))]
+                # Friendly display labels with explicit month names, e.g. "P6M (Jan-26)"
+                preview_labels = [
+                    f"P{len(preview_months) - i}M ({m})"
+                    for i, m in enumerate(preview_months)
+                ]
                 preview_col_map = dict(zip(preview_labels, preview_months))  # label → actual col name
 
                 # ── Basis window options ─────────────────────────────────────
@@ -2049,24 +2217,26 @@ def step4_salience():
 
                 # ── Restore saved configs ────────────────────────────────────
                 saved_sfu_configs = st.session_state.get("sfu_basis_sources", {})
+                saved_basis_overrides: dict[str, float] = st.session_state.get("sfu_basis_overrides", {})
                 saved_remarks: dict = st.session_state.get("sfu_remarks", {})
 
                 # ── Helper: compute basis value for one SFU from a source df ─
-                def _sfu_basis_value(sfu_ver: str, src_role: str, mode_key: str, sel_months: list[str]) -> float:
+                def _sfu_basis_with_reason(sfu_ver: str, src_role: str, mode_key: str, sel_months: list[str]) -> tuple[float, str]:
                     src_df = _get_df(src_role)
                     if src_df is None:
-                        return float("nan")
+                        return float("nan"), "source not loaded"
+                    sfu_ver_norm = str(sfu_ver).strip()
                     
                     # Handle Sellout sheet differently
                     if src_role == "Sellout":
                         cmap_sellout = st.session_state.col_maps.get("Sellout", {})
                         sfuv_col = cmap_sellout.get("SFU_v") or cmap_sellout.get("SKU")
                         if not sfuv_col or sfuv_col not in src_df.columns:
-                            return float("nan")
+                            return float("nan"), "Sellout SFU column missing"
                         sfu_col = sfuv_col
                     else:
                         if MONTHLY_SFU_VERSION_COL not in src_df.columns:
-                            return float("nan")
+                            return float("nan"), f"{MONTHLY_SFU_VERSION_COL} column missing"
                         sfu_col = MONTHLY_SFU_VERSION_COL
                     
                     cmap_s = st.session_state.col_maps.get(src_role, {})
@@ -2075,6 +2245,8 @@ def step4_salience():
                                if (parse_month_to_date(m) or pd.Timestamp.max) < current_month_start_sal]
                     if mode_key == "selected":
                         cols = [m for m in sel_months if m in src_df.columns]
+                        if not sel_months:
+                            return float("nan"), "no months selected"
                     elif mode_key.startswith("last_"):
                         n = int(mode_key.split("_")[1])
                         cols = past_m[-n:] if len(past_m) >= n else past_m
@@ -2082,17 +2254,27 @@ def step4_salience():
                         cols = past_m
                     cols = [c for c in cols if c in src_df.columns]
                     if not cols:
-                        return float("nan")
-                    sub = src_df[src_df[sfu_col] == sfu_ver]
+                        return float("nan"), "no matching month columns"
+                    sub = src_df[src_df[sfu_col].astype(str).str.strip() == sfu_ver_norm]
                     if sub.empty:
-                        return float("nan")
-                    return float(sub[cols].apply(pd.to_numeric, errors="coerce").values.mean())
+                        return float("nan"), "no SFU match in source"
+                    num_vals = sub[cols].replace({",": ""}, regex=True).apply(pd.to_numeric, errors="coerce")
+                    arr = num_vals.to_numpy(dtype=float)
+                    valid = arr[np.isfinite(arr)]
+                    if valid.size == 0:
+                        return float("nan"), "no valid numeric data"
+                    return float(valid.mean()), "ok"
+
+                def _sfu_basis_value(sfu_ver: str, src_role: str, mode_key: str, sel_months: list[str]) -> float:
+                    val, _ = _sfu_basis_with_reason(sfu_ver, src_role, mode_key, sel_months)
+                    return val
 
                 # ── Helper: get preview month value for one SFU ──────────────
                 def _sfu_month_val(sfu_ver: str, src_role: str, month_col: str) -> float:
                     src_df = _get_df(src_role)
                     if src_df is None or month_col not in src_df.columns:
                         return float("nan")
+                    sfu_ver_norm = str(sfu_ver).strip()
                     
                     # Handle Sellout sheet differently
                     if src_role == "Sellout":
@@ -2106,129 +2288,62 @@ def step4_salience():
                             return float("nan")
                         sfu_col = MONTHLY_SFU_VERSION_COL
                     
-                    sub = src_df[src_df[sfu_col] == sfu_ver]
+                    sub = src_df[src_df[sfu_col].astype(str).str.strip() == sfu_ver_norm]
                     if sub.empty:
                         return float("nan")
-                    return float(pd.to_numeric(sub[month_col], errors="coerce").sum(min_count=1))
-
-                # ── Build config table rows ──────────────────────────────────
-                sfu_table_rows = []
-                for v in sfu_versions:
-                    cfg = saved_sfu_configs.get(v, {})
-                    if isinstance(cfg, str):
-                        cfg = {"source": cfg, "mode": "last_3", "selected": []}
-                    default_src = "Shipments" if "Shipments" in available_basis_sources else available_basis_sources[0]
-                    src = cfg.get("source", default_src)
-                    raw_mode = cfg.get("mode", "last_3")
-                    # Reverse-map internal mode → display label
-                    window_label = next((k for k, mv in basis_window_mode_map.items() if mv == raw_mode), "P3M")
-                    row_d: dict = {
-                        MONTHLY_SFU_VERSION_COL: v,
-                        "Basis / Metric": src,
-                        "Basis Window": window_label,
-                    }
-                    sfu_table_rows.append(row_d)
-
-                sfu_config_df = pd.DataFrame(sfu_table_rows)
-
-                # ── Step 1: editable config table ───────────────────────────
-                st.markdown("#### Step 1 — Set Basis / Metric and Window per SFU Version")
-                edited_sfu = st.data_editor(
-                    sfu_config_df,
-                    column_config={
-                        MONTHLY_SFU_VERSION_COL: st.column_config.TextColumn("SFU_SFU Version", disabled=True),
-                        "Basis / Metric": st.column_config.SelectboxColumn(
-                            "Basis / Metric ▾",
-                            options=available_basis_sources,
-                            required=True,
-                            help="Click a cell to open the dropdown and select which historical data sheet to use as the basis for this SFU version.",
-                        ),
-                        "Basis Window": st.column_config.SelectboxColumn(
-                            "Basis Window ▾",
-                            options=basis_window_options,
-                            required=True,
-                            help="Click a cell to open the dropdown. P3M = avg last 3 months, P6M = avg last 6 months, etc. 'specific months' = manual pick below.",
-                        ),
-                    },
-                    disabled=[MONTHLY_SFU_VERSION_COL],
-                    width='stretch',
-                    key="sfu_basis_editor",
-                    height=min(450, 60 + len(sfu_config_df) * 35),
-                )
-                st.caption("💡 **Tip:** Click any cell in the **Basis / Metric ▾** or **Basis Window ▾** columns to open a dropdown and change the value.")
-
-                # ── Step 2: per-SFU manual month selection (only for "specific months" rows) ──
-                specific_sfu_rows = [
-                    r for _, r in edited_sfu.iterrows()
-                    if str(r.get("Basis Window", "")) == "specific months"
-                ]
-                saved_specific: dict = st.session_state.get("sfu_specific_months", {})
-
-                if specific_sfu_rows:
-                    st.markdown("#### Step 2 — Manual Month Selection per SFU Version")
-                    st.caption(
-                        "For each SFU Version set to *specific months*, pick the exact months "
-                        "to use as basis. Expand a row to configure it."
+                    return float(
+                        pd.to_numeric(sub[month_col].replace({",": ""}, regex=True), errors="coerce").sum(min_count=1)
                     )
-                    # Render one expander per SFU that needs manual months
-                    new_specific: dict = {}
-                    for r in specific_sfu_rows:
-                        v = r[MONTHLY_SFU_VERSION_COL]
-                        src_for_months = str(r.get("Basis / Metric", available_basis_sources[0]))
-                        # Offer months from the SFU's own chosen source sheet first, fallback to all
-                        src_df_m = _get_df(src_for_months)
-                        if src_df_m is not None:
-                            cmap_m = st.session_state.col_maps.get(src_for_months, {})
-                            src_months = sorted(
-                                [m for m in cmap_m.get("_months", detect_month_columns(src_df_m))
-                                 if (parse_month_to_date(m) or pd.Timestamp.max) < current_month_start_sal],
-                                key=lambda x: parse_month_to_date(x) or pd.Timestamp.min,
-                            )
-                        else:
-                            src_months = all_past_months_sorted
-                        prev_sel = saved_specific.get(v, [])
-                        # Filter previous selection to only valid months for this source
-                        valid_prev = [m for m in prev_sel if m in src_months]
-                        with st.expander(f"📅 {v}  ({src_for_months})", expanded=(not valid_prev)):
-                            chosen = st.multiselect(
-                                f"Months for **{v}**:",
-                                src_months,
-                                default=valid_prev,
-                                key=f"sfu_specific_{v}",
-                            )
-                        new_specific[v] = chosen
-                    st.session_state.sfu_specific_months = new_specific
-                else:
-                    new_specific = st.session_state.get("sfu_specific_months", {})
 
-                # ── Step 3: live preview table ───────────────────────────────
-                st.markdown("#### Step 3 — Preview: Basis Values and Salience")
+                # ── Live preview table ────────────────────────────────────────
+                st.markdown("#### Live Preview — Basis Values and Salience")
                 st.caption(
-                    "The table below shows the actual historical values for the **last 6 months** (P6M→P1M) "
+                    "Set **Basis / Metric** and **Basis Window** directly in this table. "
+                    "The table shows actual historical values for the **last 6 months** (P6M→P1M) "
                     "pulled from the selected Basis / Metric sheet for each SFU Version, "
                     "plus the **Final Basis** (avg over the chosen window) and the resulting **Salience %**. "
                     "Edit **Remarks** directly in the table."
                 )
 
-                # Build per-SFU config dict from edited table
+                saved_specific: dict = st.session_state.get("sfu_specific_months", {})
+
+                # Build per-SFU config dict from saved state (live edits are persisted below)
                 preview_configs: dict[str, dict] = {}
-                for _, r in edited_sfu.iterrows():
-                    v = r[MONTHLY_SFU_VERSION_COL]
-                    window_lbl = str(r.get("Basis Window", "P3M"))
+                for v in sfu_versions:
+                    cfg = saved_sfu_configs.get(v, {})
+                    if isinstance(cfg, str):
+                        cfg = {"source": cfg, "mode": "last_3", "selected": []}
+                    default_src = "Shipments" if "Shipments" in available_basis_sources else available_basis_sources[0]
+                    src = str(cfg.get("source", default_src))
+                    if src not in available_basis_sources:
+                        src = default_src
+                    mode_val = str(cfg.get("mode", "last_3"))
                     preview_configs[v] = {
-                        "source": str(r.get("Basis / Metric", available_basis_sources[0])),
-                        "mode": basis_window_mode_map.get(window_lbl, "last_3"),
-                        "selected": new_specific.get(v, []) if window_lbl == "specific months" else [],
+                        "source": src,
+                        "mode": mode_val,
+                        "selected": saved_specific.get(v, []) if mode_val == "selected" else [],
                     }
 
                 # Compute Final Basis for each SFU for salience % calculation
                 sfu_final_basis: dict[str, float] = {}
+                sfu_basis_reason: dict[str, str] = {}
                 for v, cfg_p in preview_configs.items():
-                    sfu_final_basis[v] = _sfu_basis_value(v, cfg_p["source"], cfg_p["mode"], cfg_p["selected"])
+                    basis_val, basis_reason = _sfu_basis_with_reason(v, cfg_p["source"], cfg_p["mode"], cfg_p["selected"])
+                    sfu_final_basis[v] = basis_val
+                    sfu_basis_reason[v] = basis_reason
+
+                # Apply manual override values (if any) for preview and salience %.
+                sfu_effective_basis: dict[str, float] = {}
+                for v, auto_basis in sfu_final_basis.items():
+                    ovr = pd.to_numeric(saved_basis_overrides.get(v), errors="coerce")
+                    if pd.notna(ovr):
+                        sfu_effective_basis[v] = float(ovr)
+                    else:
+                        sfu_effective_basis[v] = auto_basis
 
                 # Normalize to salience % within each SFU version group
                 # (each SFU's share = its basis / sum of all SFU bases)
-                total_basis = sum(b for b in sfu_final_basis.values() if not pd.isna(b))
+                total_basis = sum(b for b in sfu_effective_basis.values() if not pd.isna(b))
 
                 # Build preview rows
                 preview_rows = []
@@ -2244,10 +2359,18 @@ def step4_salience():
                     }
                     for lbl, actual_col in preview_col_map.items():
                         row_p[lbl] = _sfu_month_val(v, src_role, actual_col)
-                    final_b = sfu_final_basis.get(v, float("nan"))
-                    final_b = 0.0 if pd.isna(final_b) else float(final_b)
-                    row_p["Final Basis"] = round(final_b, 2)
-                    sal_pct = (final_b / total_basis * 100) if total_basis > 0 else 0.0
+                    final_b = sfu_effective_basis.get(v, float("nan"))
+                    ovr_val = pd.to_numeric(saved_basis_overrides.get(v), errors="coerce")
+                    row_p["Final Basis"] = float(final_b) if not pd.isna(final_b) else np.nan
+                    basis_status = sfu_basis_reason.get(v, "ok")
+                    if pd.notna(ovr_val):
+                        basis_status = f"overridden | {basis_status}"
+                    if cfg_p.get("mode") == "selected":
+                        sel_months = cfg_p.get("selected", []) or []
+                        sel_txt = ", ".join(sel_months) if sel_months else "none"
+                        basis_status = f"specific months [{sel_txt}] | {basis_status}"
+                    row_p["Basis Status"] = basis_status
+                    sal_pct = (float(final_b) / total_basis * 100) if (total_basis > 0 and not pd.isna(final_b)) else 0.0
                     row_p["Salience %"] = round(sal_pct, 2)
                     row_p["Remarks"] = saved_remarks.get(v, "")
                     preview_rows.append(row_p)
@@ -2257,9 +2380,28 @@ def step4_salience():
                 # Build column config for preview table
                 preview_col_cfg: dict = {
                     "SFU_SFU Version": st.column_config.TextColumn("SFU_SFU Version", disabled=True),
-                    "Basis / Metric": st.column_config.TextColumn("Basis / Metric", disabled=True),
-                    "Basis Window": st.column_config.TextColumn("Basis Window", disabled=True),
-                    "Final Basis": st.column_config.NumberColumn("Final Basis Calculated", format="%.2f", disabled=True),
+                    "Basis / Metric": st.column_config.SelectboxColumn(
+                        "Basis / Metric ▾",
+                        options=available_basis_sources,
+                        required=True,
+                        help="Select which historical data sheet to use as basis for this SFU version.",
+                    ),
+                    "Basis Window": st.column_config.SelectboxColumn(
+                        "Basis Window ▾",
+                        options=basis_window_options,
+                        required=True,
+                        help="P3M/P6M/P9M/P12M = average over latest past months. specific months = choose exact months below.",
+                    ),
+                    "Final Basis": st.column_config.NumberColumn(
+                        "Final Basis",
+                        format="%.2f",
+                        help="Editable. Change this value to override the computed final basis for this SFU_v.",
+                    ),
+                    "Basis Status": st.column_config.TextColumn(
+                        "Basis Status",
+                        disabled=True,
+                        help="Reason when Final Basis is N/A (for example: no months selected, no SFU match, no valid numeric data).",
+                    ),
                     "Salience %": st.column_config.NumberColumn("Salience %", format="%.2f %%", disabled=True),
                     "Remarks": st.column_config.TextColumn("Remarks", help="Add any notes about this SFU version's basis choice."),
                 }
@@ -2275,60 +2417,116 @@ def step4_salience():
                 ordered_cols = (
                     ["SFU_SFU Version", "Basis / Metric", "Basis Window"]
                     + preview_labels
-                    + ["Final Basis", "Salience %", "Remarks"]
+                    + ["Final Basis", "Basis Status", "Salience %", "Remarks"]
                 )
                 ordered_cols = [c for c in ordered_cols if c in preview_df.columns]
 
                 edited_preview = st.data_editor(
                     preview_df[ordered_cols],
                     column_config=preview_col_cfg,
+                    disabled=[c for c in ordered_cols if c not in ("Basis / Metric", "Basis Window", "Final Basis", "Remarks")],
                     width='stretch',
                     key="sfu_preview_editor",
                     height=min(500, 60 + len(preview_df) * 35),
                     num_rows="fixed",
                 )
 
-                # ── Step 4: Exclusions before salience ──────────────────────
-                st.markdown("#### Step 4 — Exclusions (Fixed Promo volumes, Initiatives)")
+                # Persist live config edits from preview table so calculated columns refresh.
+                edited_configs: dict[str, dict] = {}
+                for _, r in edited_preview.iterrows():
+                    v = str(r.get("SFU_SFU Version", ""))
+                    if not v:
+                        continue
+                    window_lbl = str(r.get("Basis Window", "P3M"))
+                    mode_val = basis_window_mode_map.get(window_lbl, "last_3")
+                    edited_configs[v] = {
+                        "source": str(r.get("Basis / Metric", available_basis_sources[0])),
+                        "mode": mode_val,
+                        "selected": saved_specific.get(v, []) if mode_val == "selected" else [],
+                    }
+
+                if edited_configs != preview_configs:
+                    st.session_state.sfu_basis_sources = edited_configs
+                    st.rerun()
+
+                # Persist manual final basis overrides from preview table edits.
+                edited_basis_overrides: dict[str, float] = {}
+                for _, r in edited_preview.iterrows():
+                    v = str(r.get("SFU_SFU Version", ""))
+                    if not v:
+                        continue
+                    edited_basis = pd.to_numeric(r.get("Final Basis"), errors="coerce")
+                    auto_basis = pd.to_numeric(sfu_final_basis.get(v), errors="coerce")
+                    if pd.notna(edited_basis):
+                        if pd.isna(auto_basis) or abs(float(edited_basis) - float(auto_basis)) > 1e-9:
+                            edited_basis_overrides[v] = float(edited_basis)
+
+                if edited_basis_overrides != saved_basis_overrides:
+                    st.session_state.sfu_basis_overrides = edited_basis_overrides
+                    st.rerun()
+
+                # ── Optional manual month selection ──────────────────────────
+                specific_sfu_rows = [
+                    r for _, r in edited_preview.iterrows()
+                    if str(r.get("Basis Window", "")) == "specific months"
+                ]
+
+                if specific_sfu_rows:
+                    st.markdown("#### Optional — Manual Month Selection per SFU Version")
+                    st.caption(
+                        "For each SFU Version set to *specific months*, pick the exact months "
+                        "to use as basis. The live preview will refresh automatically."
+                    )
+                    new_specific: dict = {}
+                    for r in specific_sfu_rows:
+                        v = r[MONTHLY_SFU_VERSION_COL]
+                        src_for_months = str(r.get("Basis / Metric", available_basis_sources[0]))
+                        src_df_m = _get_df(src_for_months)
+                        if src_df_m is not None:
+                            cmap_m = st.session_state.col_maps.get(src_for_months, {})
+                            src_months = sorted(
+                                [m for m in cmap_m.get("_months", detect_month_columns(src_df_m))
+                                 if (parse_month_to_date(m) or pd.Timestamp.max) < current_month_start_sal],
+                                key=lambda x: parse_month_to_date(x) or pd.Timestamp.min,
+                            )
+                        else:
+                            src_months = all_past_months_sorted
+                        prev_sel = saved_specific.get(v, [])
+                        valid_prev = [m for m in prev_sel if m in src_months]
+                        with st.expander(f"📅 {v}  ({src_for_months})", expanded=(not valid_prev)):
+                            chosen = st.multiselect(
+                                f"Months for **{v}**:",
+                                src_months,
+                                default=valid_prev,
+                                key=f"sfu_specific_{v}",
+                            )
+                        new_specific[v] = chosen
+                    st.session_state.sfu_specific_months = new_specific
+                else:
+                    new_specific = st.session_state.get("sfu_specific_months", {})
+
+                # ── Additional exclusion tools (detailed table + upload) ───
+                st.markdown("#### Additional Exclusion Tools")
                 st.caption(
-                    "Select any **SFU Versions or APO Products** to exclude before salience is calculated. "
+                    "Select any **SFU_v values** to exclude before salience is calculated. "
                     "Excluded items will receive a salience weight of **0** and will not participate in the split. "
-                    "SKUs with fewer than 3 months of shipments are flagged automatically and pre-checked for exclusion."
+                    "SFU_v values with fewer than 3 months of shipments are flagged automatically and pre-checked for exclusion."
                 )
 
                 sku_df_excl = st.session_state.sku_df_filtered
                 exc_store_sal: ExceptionStore = st.session_state.exc_store
                 hcm_excl = hier_col_map_from_state()
-                sku_col_excl = hcm_excl.get("SKU", MONTHLY_SFU_V_COL)
+                sku_col_excl = hcm_excl.get("SFU_v", MONTHLY_SFU_VERSION_COL)
                 if sku_df_excl is not None:
                     candidate_cols = [
                         sku_col_excl,
                         MONTHLY_SFU_VERSION_COL,
-                        MONTHLY_SFU_V_COL,
                         "SFU_v",
                         "SKU",
-                        "APO Product",
                     ]
                     sku_col_excl = next((c for c in candidate_cols if c and c in sku_df_excl.columns), None)
 
-                # Try to get product description column from Monthly sheet
-                monthly_df = None
-                for sheet_name in ["Shipments", "Consumption", "Monthly"]:
-                    df = _get_df(sheet_name)
-                    if df is not None and not df.empty:
-                        monthly_df = df
-                        break
-                desc_col = None
-                if monthly_df is not None:
-                    for cand in ["Product Description", "Description", "Desc"]:
-                        for c in monthly_df.columns:
-                            if cand.lower() in c.lower():
-                                desc_col = c
-                                break
-                        if desc_col:
-                            break
-
-                # ── Detect SKUs with < 3 months of shipments ─────────────────
+                # ── Detect SFU_v values with < 3 months of shipments ─────────
                 sparse_skus: set[str] = set()
                 shipments_df = _get_df("Shipments")
                 if shipments_df is not None and sku_col_excl in (shipments_df.columns if shipments_df is not None else []):
@@ -2348,9 +2546,9 @@ def step4_salience():
 
                 if sparse_skus:
                     st.warning(
-                        f"⚠️ **{len(sparse_skus)} APO Product(s) have fewer than 3 months of shipments** "
+                        f"⚠️ **{len(sparse_skus)} SFU_v value(s) have fewer than 3 months of shipments** "
                         "and are pre-checked for exclusion below. "
-                        "Please confirm whether these are **Initiatives** or new SKUs before saving exclusions: "
+                        "Please confirm whether these are **Initiatives** or new SFU_v values before saving exclusions: "
                         f"`{'`, `'.join(sorted(sparse_skus))}`"
                     )
 
@@ -2359,7 +2557,7 @@ def step4_salience():
 
                 with tab_excl_table:
                     if sku_df_excl is not None and not sku_df_excl.empty and sku_col_excl:
-                        # Build a display table of all APO Products with their SFU Version
+                        # Build a display table of unique SFU_v values.
                         excl_cols = []
                         if MONTHLY_SFU_VERSION_COL in sku_df_excl.columns:
                             excl_cols.append(MONTHLY_SFU_VERSION_COL)
@@ -2370,19 +2568,6 @@ def step4_salience():
                             actual_h = hcm_excl.get(h)
                             if actual_h and actual_h in sku_df_excl.columns and actual_h not in excl_cols:
                                 excl_cols.append(actual_h)
-
-                        # Add product description if available
-                        if (
-                            desc_col
-                            and monthly_df is not None
-                            and sku_col_excl in monthly_df.columns
-                            and sku_col_excl in sku_df_excl.columns
-                        ):
-                            desc_map = monthly_df.drop_duplicates(subset=[sku_col_excl]).set_index(sku_col_excl)[desc_col].to_dict()
-                            sku_df_excl = sku_df_excl.copy()
-                            sku_df_excl["Product Description"] = sku_df_excl[sku_col_excl].map(desc_map)
-                            if "Product Description" not in excl_cols:
-                                excl_cols.append("Product Description")
 
                         if excl_cols:
                             excl_display = (
@@ -2416,25 +2601,23 @@ def step4_salience():
                             excl_col_cfg: dict = {
                                 "Exclude": st.column_config.CheckboxColumn(
                                     "Exclude",
-                                    help="Check to exclude this APO Product from salience calculation.",
+                                    help="Check to exclude this SFU_v value from salience calculation.",
                                 ),
                                 "⚠️ < 3 months data": st.column_config.TextColumn(
                                     "< 3 months shipments",
                                     disabled=True,
-                                    help="SKUs with fewer than 3 non-zero shipment months — likely Initiatives.",
+                                    help="SFU_v values with fewer than 3 non-zero shipment months — likely Initiatives.",
                                 ),
                                 "📌 Status": st.column_config.TextColumn(
                                     "Current Status",
                                     disabled=True,
-                                    help="Whether this SKU is currently in the global exclusions list.",
+                                    help="Whether this SFU_v value is currently in the global exclusions list.",
                                 ),
                             }
                             if MONTHLY_SFU_VERSION_COL in excl_display.columns:
-                                excl_col_cfg[MONTHLY_SFU_VERSION_COL] = st.column_config.TextColumn("SFU Version", disabled=True)
+                                excl_col_cfg[MONTHLY_SFU_VERSION_COL] = st.column_config.TextColumn("SFU_v", disabled=True)
                             if sku_col_excl in excl_display.columns:
-                                excl_col_cfg[sku_col_excl] = st.column_config.TextColumn("APO Product", disabled=True)
-                            if "Product Description" in excl_display.columns:
-                                excl_col_cfg["Product Description"] = st.column_config.TextColumn("Product Description", disabled=True)
+                                excl_col_cfg[sku_col_excl] = st.column_config.TextColumn("SFU_v", disabled=True)
 
                             edited_excl = st.data_editor(
                                 excl_display[excl_ordered],
@@ -2461,9 +2644,9 @@ def step4_salience():
                                             newly_excluded.add(sku_val)
                                 st.session_state.exc_store = exc_store_sal
                                 if newly_excluded:
-                                    st.success(f"✅ {len(newly_excluded)} APO Product(s) marked for exclusion: {', '.join(sorted(newly_excluded))}")
+                                    st.success(f"✅ {len(newly_excluded)} SFU_v value(s) marked for exclusion: {', '.join(sorted(newly_excluded))}")
                                 else:
-                                    st.info("No exclusions set — all APO Products will be included in salience.")
+                                    st.info("No exclusions set — all SFU_v values will be included in salience.")
                                 st.rerun()
 
                             # Summary of currently excluded SKUs
@@ -2473,12 +2656,12 @@ def step4_salience():
                             )
                             if current_excl:
                                 st.warning(
-                                    f"⚠️ **{len(current_excl)} APO Product(s) currently excluded** "
+                                    f"⚠️ **{len(current_excl)} SFU_v value(s) currently excluded** "
                                     f"(will be skipped in salience): "
                                     f"{', '.join(sorted(current_excl))}"
                                 )
                         else:
-                            st.info("No APO Product data available — complete Step 3 first.")
+                            st.info("No SFU_v data available — complete Step 3 first.")
                     else:
                         if sku_df_excl is not None and not sku_df_excl.empty and not sku_col_excl:
                             st.warning(
@@ -2490,11 +2673,11 @@ def step4_salience():
 
                 with tab_excl_upload:
                     st.markdown(
-                        "Upload an **Excel file** with excluded SKUs and their volumes. "
+                        "Upload an **Excel file** with excluded SFU_v values and their volumes. "
                         "The file must have:\n"
-                        "- A column named **`APO Product`** (or the SKU column name for your data)\n"
+                        "- A column named **`SFU_v`** (or the mapped SFU_v column name for your data)\n"
                         "- Month columns in `Mmm-YY` format (e.g. `Jan-26`, `Feb-26`) with the volumes to allocate\n\n"
-                        "These SKUs will be **globally excluded from the salience split** and their volumes will be "
+                        "These SFU_v values will be **globally excluded from the salience split** and their volumes will be "
                         "loaded as **fixed allocations** in the exception store."
                     )
                     st.download_button(
@@ -2512,7 +2695,7 @@ def step4_salience():
                         try:
                             excl_up_df = pd.read_excel(excl_upload_file)
                             # Normalise SKU column name
-                            sku_col_candidates = [sku_col_excl, "APO Product", "SKU", "GCAS", "FPC"]
+                            sku_col_candidates = [sku_col_excl, MONTHLY_SFU_VERSION_COL, "SFU_v", "SKU"]
                             found_sku_col = next((c for c in sku_col_candidates if c in excl_up_df.columns), None)
                             if found_sku_col is None:
                                 st.error(f"Could not find a SKU column in the uploaded file. Expected one of: {sku_col_candidates}")
@@ -2573,24 +2756,56 @@ def step4_salience():
                     # Persist per-SFU specific month selections
                     st.session_state.sfu_specific_months = new_specific
 
-                    # Save configs
+                    # Save configs from the live preview table edits
                     new_sfu_configs: dict = {}
-                    for v, cfg_p in preview_configs.items():
-                        new_sfu_configs[v] = cfg_p
+                    for _, pr in edited_preview.iterrows():
+                        v = str(pr.get("SFU_SFU Version", ""))
+                        if not v:
+                            continue
+                        window_lbl = str(pr.get("Basis Window", "P3M"))
+                        mode_val = basis_window_mode_map.get(window_lbl, "last_3")
+                        new_sfu_configs[v] = {
+                            "source": str(pr.get("Basis / Metric", available_basis_sources[0])),
+                            "mode": mode_val,
+                            "selected": new_specific.get(v, []) if mode_val == "selected" else [],
+                        }
                     st.session_state.sfu_basis_sources = new_sfu_configs
 
+                    # Save manual final basis overrides from the preview table edits.
+                    new_basis_overrides: dict[str, float] = {}
+                    for _, pr in edited_preview.iterrows():
+                        v = str(pr.get("SFU_SFU Version", ""))
+                        if not v:
+                            continue
+                        edited_basis = pd.to_numeric(pr.get("Final Basis"), errors="coerce")
+                        auto_basis = pd.to_numeric(sfu_final_basis.get(v), errors="coerce")
+                        if pd.notna(edited_basis):
+                            if pd.isna(auto_basis) or abs(float(edited_basis) - float(auto_basis)) > 1e-9:
+                                new_basis_overrides[v] = float(edited_basis)
+                    st.session_state.sfu_basis_overrides = new_basis_overrides
+
                     with st.spinner("Computing BOP salience…"):
-                        bop_sal = _compute_bop_salience(new_sfu_configs)
+                        bop_sal = _compute_bop_salience(new_sfu_configs, basis_overrides=new_basis_overrides)
                     if bop_sal is not None and not bop_sal.empty:
                         st.session_state.salience_df = bop_sal
                         st.session_state.blocking_groups = []
-                        st.success(f"✅ BOP salience computed — {len(bop_sal):,} rows.")
+                        src_rows = len(sku_filtered) if sku_filtered is not None else 0
+                        src_unique_sfuv = (
+                            sku_filtered[MONTHLY_SFU_VERSION_COL].astype(str).nunique()
+                            if (sku_filtered is not None and MONTHLY_SFU_VERSION_COL in sku_filtered.columns)
+                            else 0
+                        )
+                        st.success(
+                            f"✅ BOP salience computed: {len(bop_sal):,} salience row(s) "
+                            f"from {src_rows:,} input row(s), {src_unique_sfuv:,} unique SFU_v value(s)."
+                        )
                         st.rerun()
                     else:
                         st.error(
                             "Could not compute BOP salience. "
-                            "Ensure the selected source sheets have enough past months "
-                            "and the data matches the SFU versions."
+                            "Ensure the selected source sheets have enough past months, "
+                            "the data matches the SFU versions, "
+                            "and per-BB split levels are properly configured."
                         )
 
     # ── Blocked groups ────────────────────────────────────────────────────────
@@ -2636,27 +2851,57 @@ def step4_salience():
 def hier_col_map_from_state() -> dict[str, str]:
     """Build logical->actual col map from session state."""
     hcm = {}
-    for lh in LOGICAL_HIER + ["SKU"]:
+    for lh in LOGICAL_HIER + ["SFU_v", "SKU"]:
         for role in SKU_SHEETS + ["SAS"]:
             rc = st.session_state.col_maps.get(role, {}).get(lh)
             if rc:
                 hcm[lh] = rc
                 break
+
+    # Best-effort fallback so split engine can always resolve SFU_v identifier.
+    sku_df = st.session_state.get("sku_df_filtered")
+    if sku_df is not None and not sku_df.empty and MONTHLY_SFU_VERSION_COL in sku_df.columns:
+        hcm["SFU_v"] = MONTHLY_SFU_VERSION_COL
+
+    # Fallback if canonical column is unavailable.
+    if "SFU_v" not in hcm:
+        if sku_df is not None and not sku_df.empty:
+            for cand in [MONTHLY_SFU_VERSION_COL, "SFU_v", "SKU"]:
+                if cand in sku_df.columns:
+                    hcm["SFU_v"] = cand
+                    break
     return hcm
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# STEP 5 – Exceptions
+# Exceptions panel (merged into Step 4)
 # ──────────────────────────────────────────────────────────────────────────────
-def step5_exceptions():
-    st.header("Step 5 — Exceptions")
+def render_exceptions_panel():
+    st.markdown("#### Per-BB Exceptions & Log (formerly Step 5)")
     exc_store: ExceptionStore = st.session_state.exc_store
     hcm = hier_col_map_from_state()
-    sku_col = hcm.get("SKU", "SKU")
+    sku_col = hcm.get("SFU_v") or hcm.get("SKU") or MONTHLY_SFU_VERSION_COL
 
     sku_filtered = st.session_state.sku_df_filtered
     sas_filtered = st.session_state.sas_df_filtered
-    all_skus = sorted(sku_filtered[sku_col].dropna().astype(str).unique().tolist()) if (sku_filtered is not None and sku_col in (sku_filtered.columns if sku_filtered is not None else [])) else []
+    all_skus: list[str] = []
+    resolved_sku_col: str | None = None
+    if sku_filtered is not None and not sku_filtered.empty:
+        sku_col_candidates = [
+            sku_col,
+            hcm.get("SFU_v"),
+            MONTHLY_SFU_VERSION_COL,
+            "SFU_v",
+            "SKU",
+        ]
+        resolved_sku_col = next((c for c in sku_col_candidates if c and c in sku_filtered.columns), None)
+        if resolved_sku_col:
+            all_skus = sorted(sku_filtered[resolved_sku_col].dropna().astype(str).unique().tolist())
+
+    if resolved_sku_col:
+        st.caption(f"Exceptions status: resolved SFU_v column = {resolved_sku_col} ({len(all_skus)} unique values)")
+    else:
+        st.caption("Exceptions status: no SFU_v column resolved from filtered data")
 
     # ── GBB action banners ────────────────────────────────────────────────────
     gbb_actions: dict[str, str] = st.session_state.get("gbb_actions", {})
@@ -2669,22 +2914,57 @@ def step5_exceptions():
             if ignore_bbs:
                 st.error(
                     f"**{len(ignore_bbs)} Building Block(s) flagged as *Ignore* (Initiatives):** "
-                    "These BBs will not be split. Add them to the exception list with a note or provide manual inputs. "
+                    "Select which SFU_v values should be **included** for BB split handling for each Initiative BB. "
                     f"BBs: `{'`, `'.join(ignore_bbs)}`"
                 )
-                if st.button("Add Initiatives BBs to exception log", key="gbb_add_ignore"):
-                    for bid in ignore_bbs:
-                        note = f"Initiatives BB — excluded from split. GBB Type: {gbb_types.get(bid, 'Initiatives')}"
+                if all_skus:
+                    sel_ignore_bb = st.selectbox(
+                        "Select Initiative BB",
+                        ignore_bbs,
+                        key="ignore_bb_selector",
+                    )
+                    cur_ignore_inc = sorted([
+                        s for s in exc_store.bb_exceptions.get(sel_ignore_bb, {}).get("include", set())
+                        if s in all_skus
+                    ])
+                    selected_ignore_include_skus = st.multiselect(
+                        "SFU_v values to include for this Initiative BB split",
+                        all_skus,
+                        default=cur_ignore_inc,
+                        key="ignore_bb_sku_selector",
+                        help="Selected SFU_v values are saved as BB-specific includes for this Initiative BB and will be excluded from the global split.",
+                    )
+                    if st.button("Save Initiative Includes", key="gbb_add_ignore"):
+                        note = (
+                            f"Initiatives BB — include for BB split handling. "
+                            f"GBB Type: {gbb_types.get(sel_ignore_bb, 'Initiatives')}"
+                        )
+                        # Clear any prior broad exclusion markers for this BB, then set include list.
+                        exc_store.remove_bb_exclude(sel_ignore_bb, ExceptionStore.ALL_SKU_SENTINEL)
                         for sku in all_skus:
-                            exc_store.add_bb_exclude(bid, sku, notes=note)
-                    st.success(f"{len(ignore_bbs)} BB(s) added to exception log with all SKUs excluded.")
-                    st.rerun()
+                            exc_store.remove_bb_exclude(sel_ignore_bb, sku)
+                            exc_store.remove_bb_include(sel_ignore_bb, sku)
+
+                        for sku in selected_ignore_include_skus:
+                            exc_store.add_bb_include(sel_ignore_bb, sku, notes=note)
+                            # Exclude chosen initiative SKUs from global split.
+                            exc_store.add_global_exclusion(sku)
+
+                        st.success(
+                            f"Saved {len(selected_ignore_include_skus)} initiative include SFU_v value(s) for BB {sel_ignore_bb}."
+                        )
+                        st.rerun()
+                else:
+                    st.warning(
+                        "No SFU_v column resolved in exceptions data. Please verify SFU_v mapping in Step 2 "
+                        "to select initiative values."
+                    )
 
             if exception_bbs:
                 st.warning(
-                    f"**{len(exception_bbs)} Building Block(s) require SKU selection** "
+                    f"**{len(exception_bbs)} Building Block(s) require SFU_v selection** "
                     f"(Promotions / New Channels): `{'`, `'.join(exception_bbs)}`  \n"
-                    "Use the **Per-BB Exceptions** tab below to specify which SKUs should receive allocation."
+                    "Use the **Per-BB Exceptions** tab below to specify which SFU_v values should receive allocation."
                 )
 
     tab_global, tab_bb, tab_log = st.tabs(["Global Exclusions", "Per-BB Exceptions", "Exception Log"])
@@ -2724,7 +3004,10 @@ def step5_exceptions():
 
                 exc_bb = exc_store.bb_exceptions.get(selected_bb, {})
                 cur_include = list(exc_bb.get("include", set()))
-                cur_exclude = list(exc_bb.get("exclude", set()))
+                cur_exclude = [
+                    s for s in exc_bb.get("exclude", set())
+                    if s != ExceptionStore.ALL_SKU_SENTINEL
+                ]
                 cur_fixed = exc_bb.get("fixed_qty", {})
 
                 c1, c2 = st.columns(2)
@@ -2766,7 +3049,10 @@ def step5_exceptions():
                     for sku in old_include - set(new_include):
                         exc_store.remove_bb_include(selected_bb, sku)
                     # Exclude
-                    old_exclude = set(exc_store.bb_exceptions.get(selected_bb, {}).get("exclude", set()))
+                    old_exclude = {
+                        s for s in set(exc_store.bb_exceptions.get(selected_bb, {}).get("exclude", set()))
+                        if s != ExceptionStore.ALL_SKU_SENTINEL
+                    }
                     for sku in set(new_exclude) - old_exclude:
                         exc_store.add_bb_exclude(selected_bb, sku, notes)
                     for sku in old_exclude - set(new_exclude):
@@ -2790,17 +3076,11 @@ def step5_exceptions():
         else:
             st.dataframe(log_df, width='stretch')
 
-    if st.button("Proceed to Split →", type="primary"):
-        st.session_state.step = max(st.session_state.step, 6)
-        st.session_state.max_step = max(st.session_state.max_step, 6)
-        st.rerun()
-
-
 # ──────────────────────────────────────────────────────────────────────────────
-# STEP 6 – Run Split
+# STEP 5 – Run Split
 # ──────────────────────────────────────────────────────────────────────────────
 def step6_run():
-    st.header("Step 6 — Run Split")
+    st.header("Step 5 — Run Split")
 
     # Pre-flight checks
     issues = []
@@ -2850,8 +3130,7 @@ def step6_run():
         
         if st.button("Run Diagnostic Check"):
             with st.spinner("Analyzing building block matches..."):
-                sfuv_id_col = hcm.get("SFU_v", hcm.get("SKU", "SKU"))
-                specific_sfuv_col = hcm.get("SFU_v") if "SFU_v" in hcm else None
+                sas_cmap = st.session_state.col_maps.get("SAS", {})
 
                 # Determine which sheet(s) provide the SFU_v / SKU data
                 _sku_source_role = "Bible" if "Bible" in st.session_state.sheet_map else next(
@@ -2861,6 +3140,101 @@ def step6_run():
                     st.session_state.sheet_map.get(_sku_source_role, _sku_source_role)
                     if _sku_source_role else "SFU_v data"
                 )
+                sku_cmap = st.session_state.col_maps.get(_sku_source_role, {}) if _sku_source_role else {}
+
+                sfuv_id_col = hcm.get("SFU_v", hcm.get("SKU", "SKU"))
+                if sfuv_id_col not in sku_df.columns:
+                    sfuv_id_col = sku_cmap.get("SFU_v") or sku_cmap.get("SKU") or sfuv_id_col
+                specific_sfuv_col = sas_cmap.get("SFU_v") or sas_cmap.get("SKU")
+
+                def _salience_hit_count(
+                    eligible_ids: list[str],
+                    bb_level: str,
+                    bb_sku_keys: list[str] | None = None,
+                    bb_group_vals: list[str] | None = None,
+                    matched_rows: pd.DataFrame | None = None,
+                ) -> int:
+                    """Return count of eligible IDs with positive salience for this BB context.
+
+                    Primary check: do any of the eligible SFU_v IDs appear in the salience
+                    table with salience > 0?  Group-hierarchy filtering is attempted first
+                    but falls back to the full salience table when it produces an empty slice,
+                    so column-name or value mismatches never cause a false NO SALIENCE.
+                    """
+                    if sal_df is None or sal_df.empty:
+                        return 0
+
+                    eligible_norm = {str(x).strip() for x in eligible_ids if str(x).strip() != ""}
+                    if not eligible_norm:
+                        return 0
+
+                    # Candidate identifier columns (priority order).
+                    candidate_id_cols = [
+                        sfuv_id_col,
+                        MONTHLY_SFU_VERSION_COL,
+                        hcm.get("SFU_v"),
+                        hcm.get("SKU"),
+                        "SFU_v",
+                        "SKU",
+                    ]
+                    candidate_id_cols = [c for c in dict.fromkeys(candidate_id_cols) if c]
+
+                    # Expand eligible_norm with aliases from matched SKU rows so that
+                    # SFU_v vs "SFU_SFU Version" column-name differences don't block hits.
+                    if matched_rows is not None and not matched_rows.empty:
+                        alias_cols = [c for c in candidate_id_cols if c in matched_rows.columns]
+                        if alias_cols:
+                            eligible_rows = matched_rows[
+                                matched_rows[alias_cols[0]].astype(str).str.strip().isin(eligible_norm)
+                            ]
+                            for col in alias_cols:
+                                eligible_norm.update(
+                                    str(v).strip()
+                                    for v in eligible_rows[col].dropna().tolist()
+                                    if str(v).strip() != ""
+                                )
+
+                    if "salience" not in sal_df.columns:
+                        return 0
+
+                    def _hits_in_slice(sal_slice: pd.DataFrame) -> int:
+                        """Count eligible IDs that have salience > 0 in this slice."""
+                        sal_id_cols = [c for c in candidate_id_cols if c in sal_slice.columns]
+                        sal_lookup: dict[str, float] = {}
+                        for _, srow in sal_slice.iterrows():
+                            sval = float(pd.to_numeric(srow.get("salience", 0), errors="coerce") or 0.0)
+                            for col in sal_id_cols:
+                                sid = str(srow.get(col, "")).strip()
+                                if sid:
+                                    sal_lookup[sid] = max(sal_lookup.get(sid, 0.0), sval)
+                        return sum(1 for sid in eligible_norm if sal_lookup.get(sid, 0.0) > 0)
+
+                    # --- Attempt 1: level + group filtered slice --------------------
+                    sal_sub = sal_df.copy()
+                    if "_split_level" in sal_sub.columns:
+                        sal_sub = sal_sub[sal_sub["_split_level"].astype(str) == str(bb_level)]
+
+                    if bb_sku_keys and bb_group_vals:
+                        for col, val in zip(bb_sku_keys, bb_group_vals):
+                            if col in sal_sub.columns:
+                                sal_sub = sal_sub[
+                                    sal_sub[col].astype(str).str.strip() == str(val).strip()
+                                ]
+
+                    if not sal_sub.empty:
+                        hits = _hits_in_slice(sal_sub)
+                        if hits > 0:
+                            return hits
+                        # Group slice exists but IDs didn't match — check if any rows in
+                        # this slice have positive salience (catches formatting differences).
+                        sal_pos = pd.to_numeric(sal_sub["salience"], errors="coerce").fillna(0) > 0
+                        if sal_pos.any():
+                            return int(sal_pos.sum())
+
+                    # --- Attempt 2: full salience table (no group filter) ------------
+                    # Used when group filtering emptied the slice OR produced 0 hits.
+                    hits_full = _hits_in_slice(sal_df)
+                    return hits_full
 
                 diagnostic_results = []
                 for bb_idx, bb_row in sas_df.iterrows():
@@ -2875,27 +3249,49 @@ def step6_run():
                         mask = sku_df[sfuv_id_col].astype(str) == pinned_sfuv
                         match_count = mask.sum()
                         
+                        # Check eligibility after exceptions
+                        matched_rows = sku_df[mask] if match_count > 0 else sku_df.iloc[0:0]
+                        matched_sfuvs_list = matched_rows[sfuv_id_col].astype(str).tolist() if match_count > 0 else []
+                        eligible = exc_store.get_eligible_skus(bb_id, matched_sfuvs_list)
+                        eligible_count = len(eligible)
+                        
+                        # Check salience coverage
+                        salience_count = _salience_hit_count(eligible, bb_level, matched_rows=matched_rows)
+                        
+                        # Determine status
+                        if match_count == 0:
+                            status = "❌ NO MATCH"
+                        elif eligible_count == 0:
+                            status = f"⚠️ EXCLUDED (all {match_count} matched SKUs are globally excluded)"
+                        elif salience_count == 0:
+                            status = f"⚠️ NO SALIENCE ({eligible_count} eligible, but no salience data)"
+                        else:
+                            status = f"✅ OK ({eligible_count} eligible, {salience_count} with salience)"
+                        
                         diagnostic_results.append({
                             "BB_ID": bb_id,
                             "Split_Level": bb_level,
                             "Match_Type": "Pinned SFU_v",
                             "Match_Criteria": f"SFU_v={pinned_sfuv}",
                             "Matches_Found": match_count,
-                            "Status": "✅ OK" if match_count > 0 else "❌ NO MATCH"
+                            "Eligible": eligible_count,
+                            "With_Salience": salience_count,
+                            "Status": status
                         })
                     else:
                         # Check hierarchical matching
                         bb_group_keys_logical = [k for k in SPLIT_KEYS[bb_level] if k != "SFU_v"]
-                        bb_sas_keys = [hcm.get(k, k) for k in bb_group_keys_logical]
+                        bb_sas_keys = [sas_cmap.get(k, k) for k in bb_group_keys_logical]
+                        bb_sku_keys = [hcm.get(k, k) for k in bb_group_keys_logical]
                         bb_group_vals = [str(bb_row.get(c, "")) for c in bb_sas_keys]
                         
                         # Build match criteria string
-                        criteria_parts = [f"{col}={val}" for col, val in zip(bb_sas_keys, bb_group_vals)]
+                        criteria_parts = [f"{col}={val}" for col, val in zip(bb_sku_keys, bb_group_vals)]
                         criteria_str = ", ".join(criteria_parts)
                         
                         # Find matching rows
                         mask = pd.Series([True] * len(sku_df), index=sku_df.index)
-                        for col, val in zip(bb_sas_keys, bb_group_vals):
+                        for col, val in zip(bb_sku_keys, bb_group_vals):
                             if col in sku_df.columns:
                                 mask &= sku_df[col].astype(str) == str(val)
                             else:
@@ -2904,22 +3300,65 @@ def step6_run():
                         match_count = mask.sum()
                         
                         # Check for missing columns
-                        missing_cols = [col for col in bb_sas_keys if col not in sku_df.columns]
+                        missing_cols = [col for col in bb_sku_keys if col not in sku_df.columns]
                         if missing_cols:
                             status = f"❌ MISSING COLS in '{_sku_source_sheet}': {', '.join(missing_cols)}"
+                            diagnostic_results.append({
+                                "BB_ID": bb_id,
+                                "Split_Level": bb_level,
+                                "Match_Type": "Hierarchical",
+                                "Match_Criteria": criteria_str,
+                                "Matches_Found": 0,
+                                "Eligible": 0,
+                                "With_Salience": 0,
+                                "Status": status
+                            })
                         elif match_count == 0:
                             status = "❌ NO MATCH"
+                            diagnostic_results.append({
+                                "BB_ID": bb_id,
+                                "Split_Level": bb_level,
+                                "Match_Type": "Hierarchical",
+                                "Match_Criteria": criteria_str,
+                                "Matches_Found": 0,
+                                "Eligible": 0,
+                                "With_Salience": 0,
+                                "Status": status
+                            })
                         else:
-                            status = "✅ OK"
-                        
-                        diagnostic_results.append({
-                            "BB_ID": bb_id,
-                            "Split_Level": bb_level,
-                            "Match_Type": "Hierarchical",
-                            "Match_Criteria": criteria_str,
-                            "Matches_Found": match_count,
-                            "Status": status
-                        })
+                            # Check eligibility after exceptions
+                            matched_rows = sku_df[mask]
+                            matched_sfuvs_list = matched_rows[sfuv_id_col].astype(str).tolist()
+                            eligible = exc_store.get_eligible_skus(bb_id, matched_sfuvs_list)
+                            eligible_count = len(eligible)
+                            
+                            # Check salience coverage
+                            salience_count = _salience_hit_count(
+                                eligible,
+                                bb_level,
+                                bb_sku_keys=bb_sku_keys,
+                                bb_group_vals=bb_group_vals,
+                                matched_rows=matched_rows,
+                            )
+                            
+                            # Determine status
+                            if eligible_count == 0:
+                                status = f"⚠️ EXCLUDED (all {match_count} matched SKUs are globally excluded)"
+                            elif salience_count == 0:
+                                status = f"⚠️ NO SALIENCE ({eligible_count} eligible, but no salience data)"
+                            else:
+                                status = f"✅ OK ({eligible_count} eligible, {salience_count} with salience)"
+                            
+                            diagnostic_results.append({
+                                "BB_ID": bb_id,
+                                "Split_Level": bb_level,
+                                "Match_Type": "Hierarchical",
+                                "Match_Criteria": criteria_str,
+                                "Matches_Found": match_count,
+                                "Eligible": eligible_count,
+                                "With_Salience": salience_count,
+                                "Status": status
+                            })
                 
                 # Display results
                 diag_df = pd.DataFrame(diagnostic_results)
@@ -2930,9 +3369,9 @@ def step6_run():
                 failed_bbs = total_bbs - ok_bbs
                 
                 if failed_bbs > 0:
-                    st.error(f"⚠️ **{failed_bbs} of {total_bbs} building blocks will fail to match!**")
+                    st.error(f"⚠️ **{failed_bbs} of {total_bbs} building blocks will fail or have issues!**")
                 else:
-                    st.success(f"✅ All {total_bbs} building blocks have matching SFU_v rows!")
+                    st.success(f"✅ All {total_bbs} building blocks are ready to split!")
                 
                 # Filter options
                 col1, col2 = st.columns(2)
@@ -2957,6 +3396,26 @@ def step6_run():
                     has_missing_cols = any("MISSING COLS" in result["Status"] for result in diagnostic_results)
                     has_no_match = any(result["Status"] == "❌ NO MATCH" for result in diagnostic_results)
                     has_pinned = any(result["Match_Type"] == "Pinned SFU_v" and "❌" in result["Status"] for result in diagnostic_results)
+                    has_excluded = any("EXCLUDED" in result["Status"] for result in diagnostic_results)
+                    has_no_salience = any("NO SALIENCE" in result["Status"] for result in diagnostic_results)
+                    
+                    if has_excluded:
+                        st.warning("""
+                        **All Matched SKUs Are Excluded:**
+                        - Your matching SFU_vs exist but are ALL in the global exclusion list
+                        - Check the **Advanced Exceptions** section: Are you excluding too many SKUs?
+                        - For Initiative BBs: make sure you've selected SKUs to **include** in the Initiative BB section
+                        - If intentional, you may need to adjust your exclusion strategy
+                        """)
+                    
+                    if has_no_salience:
+                        st.warning("""
+                        **No Salience Data for Matched SKUs:**
+                        - Your SKUs match hierarchically and are eligible, but have zero salience values
+                        - Check the **Live Preview** in Step 4: Do these SFU_vs have "N/A" or 0 Final Basis?
+                        - If Final Basis is N/A, select a different **Basis / Metric** or **Basis Window**
+                        - Check the **Basis Status** column for specific failure reasons
+                        """)
                     
                     if has_missing_cols:
                         st.warning("""
@@ -2996,8 +3455,10 @@ def step6_run():
                     split_level=split_level,
                     bb_split_levels=bb_split_levels,
                     bb_id_col=bb_id_col,
-                    sfuv_col=hcm.get("SKU", "SKU"),
+                    sfuv_col=hcm.get("SFU_v", hcm.get("SKU", "SKU")),
+                    sas_sfuv_col=st.session_state.col_maps.get("SAS", {}).get("SFU_v"),
                     hier_col_map=hcm,
+                    sas_hier_col_map=st.session_state.col_maps.get("SAS", {}),
                     exc_store=exc_store,
                     forecast_boundaries=st.session_state.get("forecast_boundaries"),
                 )
@@ -3028,8 +3489,8 @@ def step6_run():
         else:
             st.success("No validation issues.")
 
-        st.session_state.step = max(st.session_state.step, 7)
-        st.session_state.max_step = max(st.session_state.max_step, 7)
+        st.session_state.step = max(st.session_state.step, 6)
+        st.session_state.max_step = max(st.session_state.max_step, 6)
 
     # Preview if already run
     if st.session_state.output_wide is not None:
@@ -3037,16 +3498,16 @@ def step6_run():
         st.dataframe(st.session_state.output_wide.head(20), width='stretch')
 
         if st.button("Proceed to Reasonability Check →", type="primary"):
-            st.session_state.step = max(st.session_state.step, 7)
-            st.session_state.max_step = max(st.session_state.max_step, 7)
+            st.session_state.step = max(st.session_state.step, 6)
+            st.session_state.max_step = max(st.session_state.max_step, 6)
             st.rerun()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# STEP 7 – Reasonability Check
+# STEP 6 – Reasonability Check
 # ──────────────────────────────────────────────────────────────────────────────
 def step7_reasonability():
-    st.header("Step 7 — Reasonability Check")
+    st.header("Step 6 — Reasonability Check")
     st.caption(
         "Review the split output against historical actuals. "
         "Cells highlighted in **🔵 blue** are above the upper tolerance; "
@@ -3055,7 +3516,7 @@ def step7_reasonability():
 
     output_wide = st.session_state.output_wide
     if output_wide is None or output_wide.empty:
-        st.warning("No split output yet — complete Step 6 first.")
+        st.warning("No split output yet — complete Step 5 first.")
         return
 
     # ── Controls ──────────────────────────────────────────────────────────────
@@ -3181,19 +3642,19 @@ def step7_reasonability():
         st.success("All cells are within tolerance. ✅")
 
     if st.button("Proceed to Download →", type="primary"):
-        st.session_state.step = max(st.session_state.step, 8)
-        st.session_state.max_step = max(st.session_state.max_step, 8)
+        st.session_state.step = max(st.session_state.step, 7)
+        st.session_state.max_step = max(st.session_state.max_step, 7)
         st.rerun()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# STEP 8 – Download
+# STEP 7 – Download
 # ──────────────────────────────────────────────────────────────────────────────
 def step7_download():
-    st.header("Step 8 — Download Results")
+    st.header("Step 7 — Download Results")
 
     if st.session_state.output_wide is None:
-        st.warning("No output yet — complete Step 6.")
+        st.warning("No output yet — complete Step 5.")
         return
 
     output_wide = st.session_state.output_wide
@@ -3285,13 +3746,14 @@ def main():
     elif step == 4:
         step4_salience()
     elif step == 5:
-        step5_exceptions()
-    elif step == 6:
         step6_run()
-    elif step == 7:
+    elif step == 6:
         step7_reasonability()
-    elif step >= 8:
+    elif step >= 7:
         step7_download()
+
+    # Auto-save session state so a browser refresh restores progress
+    _save_session(_sid)
 
 
 if __name__ == "__main__":

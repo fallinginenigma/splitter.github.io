@@ -24,11 +24,17 @@ class ExceptionEntry:
 class ExceptionStore:
     """In-memory store for all exceptions."""
 
+    ALL_SKU_SENTINEL = "__ALL_SKUS__"
+
     def __init__(self):
         self.global_exclusions: set[str] = set()
         # bb_id -> {"include": set, "exclude": set, "fixed_qty": {sku: {month: qty}}}
         self.bb_exceptions: dict[str, dict] = {}
         self.log: list[ExceptionEntry] = []
+
+    @staticmethod
+    def _norm_bb_id(bb_id: str) -> str:
+        return str(bb_id)
 
     # ---- global ----
     def add_global_exclusion(self, sku: str, notes: str = ""):
@@ -40,46 +46,74 @@ class ExceptionStore:
 
     # ---- bb-specific ----
     def _ensure_bb(self, bb_id: str):
-        if bb_id not in self.bb_exceptions:
-            self.bb_exceptions[bb_id] = {"include": set(), "exclude": set(), "fixed_qty": {}}
+        bb_key = self._norm_bb_id(bb_id)
+        if bb_key in self.bb_exceptions:
+            return
+
+        # Backward-compatibility: migrate legacy keys with non-string types.
+        legacy_key = next((k for k in self.bb_exceptions.keys() if str(k) == bb_key), None)
+        if legacy_key is not None:
+            self.bb_exceptions[bb_key] = self.bb_exceptions.pop(legacy_key)
+            return
+
+        self.bb_exceptions[bb_key] = {"include": set(), "exclude": set(), "fixed_qty": {}}
 
     def add_bb_include(self, bb_id: str, sku: str, notes: str = ""):
-        self._ensure_bb(bb_id)
-        self.bb_exceptions[bb_id]["include"].add(sku)
+        bb_key = self._norm_bb_id(bb_id)
+        self._ensure_bb(bb_key)
+        self.bb_exceptions[bb_key]["include"].add(sku)
         self.log.append(ExceptionEntry("bb_specific", bb_id, sku, "include", notes=notes))
 
     def remove_bb_include(self, bb_id: str, sku: str):
-        self._ensure_bb(bb_id)
-        self.bb_exceptions[bb_id]["include"].discard(sku)
+        bb_key = self._norm_bb_id(bb_id)
+        self._ensure_bb(bb_key)
+        self.bb_exceptions[bb_key]["include"].discard(sku)
 
     def add_bb_exclude(self, bb_id: str, sku: str, notes: str = ""):
-        self._ensure_bb(bb_id)
-        self.bb_exceptions[bb_id]["exclude"].add(sku)
+        bb_key = self._norm_bb_id(bb_id)
+        self._ensure_bb(bb_key)
+        self.bb_exceptions[bb_key]["exclude"].add(sku)
         self.log.append(ExceptionEntry("bb_specific", bb_id, sku, "exclude", notes=notes))
 
+    def exclude_all_for_bb(self, bb_id: str, notes: str = ""):
+        """Mark a BB as fully excluded even when a concrete SKU list is unavailable."""
+        bb_key = self._norm_bb_id(bb_id)
+        self._ensure_bb(bb_key)
+        self.bb_exceptions[bb_key]["exclude"].add(self.ALL_SKU_SENTINEL)
+        self.log.append(ExceptionEntry("bb_specific", bb_id, self.ALL_SKU_SENTINEL, "exclude_all", notes=notes))
+
     def remove_bb_exclude(self, bb_id: str, sku: str):
-        self._ensure_bb(bb_id)
-        self.bb_exceptions[bb_id]["exclude"].discard(sku)
+        bb_key = self._norm_bb_id(bb_id)
+        self._ensure_bb(bb_key)
+        self.bb_exceptions[bb_key]["exclude"].discard(sku)
 
     def set_fixed_qty(self, bb_id: str, sku: str, month: str, qty: float, notes: str = ""):
-        self._ensure_bb(bb_id)
-        if sku not in self.bb_exceptions[bb_id]["fixed_qty"]:
-            self.bb_exceptions[bb_id]["fixed_qty"][sku] = {}
-        old = self.bb_exceptions[bb_id]["fixed_qty"][sku].get(month)
-        self.bb_exceptions[bb_id]["fixed_qty"][sku][month] = qty
+        bb_key = self._norm_bb_id(bb_id)
+        self._ensure_bb(bb_key)
+        if sku not in self.bb_exceptions[bb_key]["fixed_qty"]:
+            self.bb_exceptions[bb_key]["fixed_qty"][sku] = {}
+        old = self.bb_exceptions[bb_key]["fixed_qty"][sku].get(month)
+        self.bb_exceptions[bb_key]["fixed_qty"][sku][month] = qty
         self.log.append(ExceptionEntry("bb_specific", bb_id, sku, "fixed_qty", old_value=old, new_value=qty, notes=notes))
 
     def get_fixed_qty(self, bb_id: str, sku: str, month: str) -> float | None:
-        return self.bb_exceptions.get(bb_id, {}).get("fixed_qty", {}).get(sku, {}).get(month)
+        bb_key = self._norm_bb_id(bb_id)
+        self._ensure_bb(bb_key)
+        return self.bb_exceptions.get(bb_key, {}).get("fixed_qty", {}).get(sku, {}).get(month)
 
     def get_eligible_skus(self, bb_id: str, candidate_skus: list[str]) -> list[str]:
         """Apply include/exclude rules, then global exclusions."""
-        exc = self.bb_exceptions.get(bb_id, {})
+        bb_key = self._norm_bb_id(bb_id)
+        self._ensure_bb(bb_key)
+        exc = self.bb_exceptions.get(bb_key, {})
         forced_include = exc.get("include", set())
         forced_exclude = exc.get("exclude", set())
+        exclude_all = self.ALL_SKU_SENTINEL in forced_exclude
 
         eligible = []
         for sku in candidate_skus:
+            if exclude_all and sku not in forced_include:
+                continue
             if sku in self.global_exclusions and sku not in forced_include:
                 continue
             if sku in forced_exclude:

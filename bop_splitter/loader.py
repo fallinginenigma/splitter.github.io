@@ -7,6 +7,7 @@ import datetime
 import io
 import re
 from pathlib import Path
+from typing import Iterable
 
 import pandas as pd
 
@@ -30,7 +31,7 @@ MONTHLY_MONTH_RE = re.compile(
 
 # Logical name → actual column name in the SAS (Building Block) sheet
 SAS_HIERARCHY_MAP: dict[str, str] = {
-    "Ctry":         "Ctry",
+    "Country":      "Country",
     "SMO Category": "SMO Category",
     "Brand":        "Brand",
     "Sub Brand":    "Sub Brand",
@@ -43,15 +44,47 @@ SAS_SFU_V_COL = "Specific SFU_v"
 SAS_GBB_TYPE_COL = "GBB Type"
 SAS_GBB_TYPE_VARIANTS = ["GBB Type", "GBB_Type", "Plan Type", "gbb_type"]
 
+
+def _normalize_header_name(value: str) -> str:
+    """Normalize header text for resilient, case/spacing-insensitive matching."""
+    return re.sub(r"[^a-z0-9]+", "", str(value).strip().lower())
+
+
+def find_gbb_type_column(columns: Iterable[str]) -> str | None:
+    """Return the best-matching GBB Type column name from a set of headers.
+
+    Matching is exact-first, then normalized (case/space/punctuation-insensitive).
+    """
+    cols = [str(c) for c in columns]
+
+    # Exact match first so we preserve user header exactly when possible.
+    for variant in SAS_GBB_TYPE_VARIANTS:
+        if variant in cols:
+            return variant
+
+    # Fuzzy fallback for headers like "GBB Type ", "gbb type", "GBB-TYPE", etc.
+    normalized_to_col: dict[str, str] = {}
+    for col in cols:
+        key = _normalize_header_name(col)
+        if key and key not in normalized_to_col:
+            normalized_to_col[key] = col
+
+    for variant in SAS_GBB_TYPE_VARIANTS:
+        hit = normalized_to_col.get(_normalize_header_name(variant))
+        if hit:
+            return hit
+
+    return None
+
 # Logical name → actual column name in the Monthly sheet (before renaming)
 MONTHLY_HIERARCHY_MAP: dict[str, str] = {
-    "Ctry":         "Reporting Country",
+    "Country":      "Reporting Country",
     "SMO Category": "Category",
     "Brand":        "Brand",          # same name in both sheets
     "Sub Brand":    "Family Name 1",
     "Form":         "Family Name 2",
 }
-MONTHLY_SFU_V_COL = "APO Product"         # SFU_v identifier in Monthly
+MONTHLY_SFU_V_COL = "SFU_SFU Version"       # canonical SFU_v identifier in Monthly-derived tabs
 MONTHLY_SFU_VERSION_COL = "SFU_SFU Version"  # composite SFU key (SFU + SFU Version)
 
 MONTHLY_MEASURE_COL = "Calendar Year/Month"
@@ -66,7 +99,7 @@ MONTHLY_HEADER_ROW = 13                 # 0-indexed row that contains column hea
 
 # Logical name → actual column name in the Bible (Master SKU Mapping) sheet
 BIBLE_HIERARCHY_MAP: dict[str, str] = {
-    "Ctry":         "Country",
+    "Country":      "Country",
     "SMO Category": "SMO Category",
     "Brand":        "Brand",
     "Sub Brand":    "Sub Brand",
@@ -112,10 +145,8 @@ def detect_bop_col_maps(sheets: dict[str, pd.DataFrame]) -> tuple[dict, dict]:
         sheet_map["SAS"] = "SAS"
         month_cols = detect_month_columns(sas_df)
         bb_id_default = "Plan Name_Brand" if "Plan Name_Brand" in sas_df.columns else None
-        # Detect GBB Type column (try canonical name first, then variants)
-        gbb_col_actual = next(
-            (c for c in SAS_GBB_TYPE_VARIANTS if c in sas_df.columns), None
-        )
+        # Detect GBB Type column (exact + normalized variant matching)
+        gbb_col_actual = find_gbb_type_column(sas_df.columns)
         col_maps["SAS"] = {
             **{k: v for k, v in SAS_HIERARCHY_MAP.items() if v in sas_df.columns},
             "BB_ID": bb_id_default,  # "Plan Name_Brand" if available, else generated in Step 3
@@ -134,8 +165,8 @@ def detect_bop_col_maps(sheets: dict[str, pd.DataFrame]) -> tuple[dict, dict]:
         entry = {
             **hier_map,
         }
-        if MONTHLY_SFU_V_COL in mdf.columns:
-            entry["SFU_v"] = MONTHLY_SFU_V_COL
+        if MONTHLY_SFU_VERSION_COL in mdf.columns:
+            entry["SFU_v"] = MONTHLY_SFU_VERSION_COL
         col_maps[measure] = entry
 
     # Bible (Master SKU Mapping) ----------------------------------------
@@ -204,7 +235,7 @@ def detect_bop_col_maps(sheets: dict[str, pd.DataFrame]) -> tuple[dict, dict]:
         
         # Detect SFU_v column: prefer a column whose name matches known SFU_v patterns,
         # then fall back to the first column.
-        _sfuv_keywords = ("sfu_v", "sfu_sfu version", "apo product", "salience sfu", "material", "sku")
+        _sfuv_keywords = ("sfu_v", "sfu_sfu version", "salience sfu", "material", "sku")
         _sfuv_col = next(
             (c for c in sellout_df.columns if any(kw in c.lower() for kw in _sfuv_keywords)),
             sellout_df.columns[0] if len(sellout_df.columns) > 0 else None,
@@ -319,7 +350,7 @@ def _load_bop_openpyxl(xl: pd.ExcelFile) -> dict[str, pd.DataFrame]:
         for k, v in MONTHLY_HIERARCHY_MAP.items()
         if v != k and v in monthly_raw.columns
     }
-    # e.g. {"Reporting Country": "Ctry", "Category": "SMO Category",
+    # e.g. {"Reporting Country": "Country", "Category": "SMO Category",
     #        "Family Name 1": "Sub Brand", "Family Name 2": "Form"}
     monthly_raw = monthly_raw.rename(columns=hier_rename)
 

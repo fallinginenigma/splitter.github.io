@@ -4,15 +4,15 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-HIERARCHY_LEVELS = ["Ctry", "SMO Category", "Brand", "Sub Brand", "Form"]
+HIERARCHY_LEVELS = ["Country", "SMO Category", "Brand", "Sub Brand", "Form"]
 
 SPLIT_KEYS: dict[str, list[str]] = {
-    "Ctry": ["Ctry"],
-    "SMO Category": ["Ctry", "SMO Category"],
-    "Brand": ["Ctry", "SMO Category", "Brand"],
-    "Sub Brand": ["Ctry", "SMO Category", "Brand", "Sub Brand"],
-    "Form": ["Ctry", "SMO Category", "Brand", "Sub Brand", "Form"],
-    "SFU_v": ["Ctry", "SMO Category", "Brand", "Sub Brand", "Form", "SFU_v"],
+    "Country": ["Country"],
+    "SMO Category": ["Country", "SMO Category"],
+    "Brand": ["Country", "SMO Category", "Brand"],
+    "Sub Brand": ["Country", "SMO Category", "Brand", "Sub Brand"],
+    "Form": ["Country", "SMO Category", "Brand", "Sub Brand", "Form"],
+    "SFU_v": ["Country", "SMO Category", "Brand", "Sub Brand", "Form", "SFU_v"],
 }
 
 # GBB Type → split behaviour rules.
@@ -165,6 +165,18 @@ def compute_salience(
     if sfuv_mapped in working.columns:
         working = working[~working[sfuv_mapped].isin(global_exclusions)].copy()
 
+    agg_keys = [k for k in group_keys if k in working.columns]
+    if sfuv_mapped in working.columns:
+        agg_keys = agg_keys + [sfuv_mapped]
+    if not agg_keys or sfuv_mapped not in agg_keys:
+        return pd.DataFrame(), []
+
+    working = (
+        working.groupby(agg_keys, sort=False, dropna=False)["_basis"]
+        .mean()
+        .reset_index()
+    )
+
     rows = []
     blocking_groups = []
 
@@ -226,16 +238,19 @@ def compute_equal_salience(
     if sfuv_mapped in working.columns:
         working = working[~working[sfuv_mapped].isin(global_exclusions)].copy()
 
-    rows = []
     valid_group_keys = [k for k in group_keys if k in working.columns]
-    if not valid_group_keys or working.empty:
+    if not valid_group_keys or working.empty or sfuv_mapped not in working.columns:
         return pd.DataFrame(), []
+
+    working = working[valid_group_keys + [sfuv_mapped]].drop_duplicates().copy()
+
+    rows = []
 
     for group_vals, grp in working.groupby(valid_group_keys, sort=False, dropna=False):
         if not isinstance(group_vals, tuple):
             group_vals = (group_vals,)
         group_id = dict(zip(valid_group_keys, group_vals))
-        n = len(grp)
+        n = grp[sfuv_mapped].astype(str).nunique()
         sal = 1.0 / n if n > 0 else 0.0
         for _, row in grp.iterrows():
             sfuv_val = row.get(sfuv_mapped, "") if sfuv_mapped in grp.columns else ""
