@@ -1672,7 +1672,7 @@ def step3_filters():
             bb_editor_df,
             column_config=col_config,
             disabled=disabled_cols,
-            use_container_width=True,
+            width='stretch',
             key="bb_split_level_editor",
             height=min(450, 60 + len(bb_editor_df) * 35),
             hide_index=True,
@@ -1827,13 +1827,14 @@ def _build_exclusion_upload_template(sku_col: str, months: list[str]) -> bytes:
     """Build an Excel template for the exclusions upload (SKU column + month columns)."""
     import io
     template_months = months if months else ["Jan-26", "Feb-26", "Mar-26"]
-    template_df = pd.DataFrame(columns=[sku_col] + template_months)
     # Add a couple of example rows
+    rows = []
     for i in range(2):
         row = {sku_col: f"1234567{i}"}
         for m in template_months:
             row[m] = 0.0
-        template_df = pd.concat([template_df, pd.DataFrame([row])], ignore_index=True)
+        rows.append(row)
+    template_df = pd.DataFrame(rows, columns=[sku_col] + template_months)
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         template_df.to_excel(writer, index=False, sheet_name="Exclusions")
@@ -3387,7 +3388,7 @@ def step6_run():
                 elif show_filter == "Show Only OK":
                     diag_df = diag_df[diag_df["Status"].str.contains("✅")]
                 
-                st.dataframe(diag_df, use_container_width=True, height=400)
+                st.dataframe(diag_df, width='stretch', height=400)
                 
                 # Helpful suggestions
                 if failed_bbs > 0:
