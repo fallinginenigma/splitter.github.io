@@ -245,6 +245,16 @@ def detect_bop_col_maps(sheets: dict[str, pd.DataFrame]) -> tuple[dict, dict]:
         
         col_maps["Sellout"] = sellout_col_map
 
+    # Last BOP (previous-week Final Fcst to Finance – BOP) ---------------
+    if "Last BOP" in sheets:
+        last_bop_df = sheets["Last BOP"]
+        sheet_map["Last BOP"] = "Last BOP"
+        hier_map_lb = {k: k for k in SAS_HIERARCHY_MAP if k in last_bop_df.columns}
+        last_bop_col_map: dict[str, str] = {**hier_map_lb}
+        if MONTHLY_SFU_VERSION_COL in last_bop_df.columns:
+            last_bop_col_map["SFU_v"] = MONTHLY_SFU_VERSION_COL
+        col_maps["Last BOP"] = last_bop_col_map
+
     return sheet_map, col_maps
 
 
@@ -376,9 +386,33 @@ def _load_bop_openpyxl(xl: pd.ExcelFile) -> dict[str, pd.DataFrame]:
         # Measure column absent — store everything under "Shipments"
         sheets["Shipments"] = monthly_raw.reset_index(drop=True)
 
+    # --- Last BOP sheet (previous-week Final Fcst to Finance – BOP) ----------
+    if "Last BOP" in xl.sheet_names:
+        last_bop_raw = xl.parse("Last BOP", header=MONTHLY_HEADER_ROW)
+        # Drop blank measure rows (same as Monthly)
+        if MONTHLY_MEASURE_COL in last_bop_raw.columns:
+            last_bop_raw = last_bop_raw.dropna(subset=[MONTHLY_MEASURE_COL])
+        # Rename hierarchy columns to match SAS logical names
+        last_bop_raw = last_bop_raw.rename(columns={
+            v: k
+            for k, v in MONTHLY_HIERARCHY_MAP.items()
+            if v != k and v in last_bop_raw.columns
+        })
+        # Normalise month column names from "NOV 2025" / "JUN 2026" → "Nov-25"
+        last_bop_month_rename = {
+            col: _normalize_monthly_month_label(col)
+            for col in last_bop_raw.columns
+            if isinstance(col, str) and MONTHLY_MONTH_RE.match(col.strip())
+            and _normalize_monthly_month_label(col) != col
+        }
+        if last_bop_month_rename:
+            last_bop_raw = last_bop_raw.rename(columns=last_bop_month_rename)
+        last_bop_raw.columns = [str(c) for c in last_bop_raw.columns]
+        sheets["Last BOP"] = last_bop_raw.reset_index(drop=True)
+
     # --- Additional sheets (Bible, Stat DB, Sellout, etc.) ------------------
     for sheet in xl.sheet_names:
-        if sheet in ("SAS", "Monthly"):
+        if sheet in ("SAS", "Monthly", "Last BOP"):
             continue
         if sheet in sheets:
             continue

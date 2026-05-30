@@ -38,6 +38,10 @@ class ExceptionStore:
 
     # ---- global ----
     def add_global_exclusion(self, sku: str, notes: str = ""):
+        """Add global exclusion (skip duplicate log entries if already excluded)."""
+        if sku in self.global_exclusions:
+            # Already excluded; skip duplicate log entry
+            return
         self.global_exclusions.add(sku)
         self.log.append(ExceptionEntry("global", None, sku, "exclude", notes=notes))
 
@@ -59,8 +63,12 @@ class ExceptionStore:
         self.bb_exceptions[bb_key] = {"include": set(), "exclude": set(), "fixed_qty": {}}
 
     def add_bb_include(self, bb_id: str, sku: str, notes: str = ""):
+        """Add BB-specific include (skip duplicate log entries if already included)."""
         bb_key = self._norm_bb_id(bb_id)
         self._ensure_bb(bb_key)
+        if sku in self.bb_exceptions[bb_key]["include"]:
+            # Already included; skip duplicate log entry
+            return
         self.bb_exceptions[bb_key]["include"].add(sku)
         self.log.append(ExceptionEntry("bb_specific", bb_id, sku, "include", notes=notes))
 
@@ -70,8 +78,12 @@ class ExceptionStore:
         self.bb_exceptions[bb_key]["include"].discard(sku)
 
     def add_bb_exclude(self, bb_id: str, sku: str, notes: str = ""):
+        """Add BB-specific exclude (skip duplicate log entries if already excluded)."""
         bb_key = self._norm_bb_id(bb_id)
         self._ensure_bb(bb_key)
+        if sku in self.bb_exceptions[bb_key]["exclude"]:
+            # Already excluded; skip duplicate log entry
+            return
         self.bb_exceptions[bb_key]["exclude"].add(sku)
         self.log.append(ExceptionEntry("bb_specific", bb_id, sku, "exclude", notes=notes))
 

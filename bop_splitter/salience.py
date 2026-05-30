@@ -1,6 +1,8 @@
 """Salience (weight) computation and override management."""
 from __future__ import annotations
 
+import re
+
 import numpy as np
 import pandas as pd
 
@@ -16,7 +18,7 @@ SPLIT_KEYS: dict[str, list[str]] = {
 }
 
 # GBB Type → split behaviour rules.
-# Keys are the exact GBB Type strings as they appear in the SAS sheet.
+# Keys are the configured rule labels for SAS GBB Type matching.
 # Each entry defines:
 #   split_level : hierarchy level to use when splitting (must be a key in SPLIT_KEYS)
 #   action      : one of "split" | "exceptions" | "ignore"
@@ -76,30 +78,45 @@ GBB_TYPE_RULES: dict[str, dict] = {
 }
 
 
+def normalize_gbb_type(raw: str) -> str:
+    """Normalize a raw GBB Type value from SAS by stripping numeric prefixes."""
+    if raw is None:
+        return ""
+    raw_strip = str(raw).strip()
+    if not raw_strip:
+        return ""
+    # Strip leading number+dot prefix (e.g. "1. ", "0.", "8.")
+    return re.sub(r"^\d+\s*\.\s*", "", raw_strip).strip()
+
+
 def _match_gbb_type(raw: str) -> str | None:
     """
     Match a raw GBB Type string (which may include a leading number prefix like
     '0.Base', '1. Brand Building Activities', '2.Promotions - Go To Market')
-    to a canonical key in GBB_TYPE_RULES.
+    to a configured label in GBB_TYPE_RULES.
 
     Returns the matching key, or None if no match.
     """
     if not raw:
         return None
-    raw_strip = raw.strip()
+    raw_strip = str(raw).strip()
     # Exact match first
     if raw_strip in GBB_TYPE_RULES:
         return raw_strip
-    # Strip leading number+dot prefix (e.g. "1. " or "0." or "8.")
-    import re
-    without_prefix = re.sub(r"^\d+\s*\.\s*", "", raw_strip).strip()
+    without_prefix = normalize_gbb_type(raw_strip)
     if without_prefix in GBB_TYPE_RULES:
         return without_prefix
-    # Fuzzy substring: check if any canonical key appears as substring
+    # Fuzzy substring: check if any configured key appears as substring
     for key in GBB_TYPE_RULES:
         if key.lower() in without_prefix.lower() or without_prefix.lower() in key.lower():
             return key
     return None
+
+
+def resolve_gbb_type_rule(raw: str) -> dict | None:
+    """Resolve a raw SAS GBB Type value to its configured split/action rule."""
+    matched = _match_gbb_type(raw)
+    return GBB_TYPE_RULES.get(matched) if matched else None
 
 
 def compute_basis(
