@@ -87,6 +87,8 @@ def _is_non_persistable_state_key(key: str) -> bool:
         return True
     if key.endswith("_uploader"):  # file_uploader widgets
         return True
+    if "_editor" in key:  # st.data_editor and related widget-managed state
+        return True
     return key in _SKIP_PERSIST
 
 def _session_id() -> str:
@@ -170,6 +172,7 @@ def _init_state():
         "sas_forecast_months_selected": [],  # user-selected future forecast months
         "forecast_horizon_mode": "Current FY",
         "_forecast_horizon_prev": "Current FY",
+        "_forecast_horizon_epoch": 0,
         "sfu_basis_sources": {},      # SFU_SFU Version -> basis config (source, mode, selected)
         "sfu_basis_overrides": {},    # SFU_SFU Version -> optional manual final basis override
         "sfu_manual_months": [],      # Global manual month selector for SFU basis (legacy)
@@ -211,10 +214,18 @@ if "step" not in st.session_state:
     # Fresh Streamlit session — try to restore from the persisted pickle
     _restored = _restore_session(_sid)
     _init_state()  # fill any keys that aren't in the saved snapshot
+    if _restored:
+        # Backward-compatibility cleanup for sessions saved before editor keys were skipped.
+        st.session_state.pop("bb_split_level_editor", None)
     if _restored and st.session_state.get("step", 1) > 1:
         st.toast("✅ Session restored — welcome back!", icon="🔀")
 else:
     _init_state()  # normal rerun — just fill missing defaults
+
+# One-time cleanup for sessions that may already contain stale editor widget state.
+if "_bb_editor_state_cleaned" not in st.session_state:
+    st.session_state.pop("bb_split_level_editor", None)
+    st.session_state["_bb_editor_state_cleaned"] = True
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Sidebar – progress tracker
@@ -930,6 +941,7 @@ def step2_columns():
     if st.session_state.get("_forecast_horizon_prev") != horizon_mode:
         st.session_state.sas_forecast_months_selected = []
         st.session_state._forecast_horizon_prev = horizon_mode
+        st.session_state._forecast_horizon_epoch = st.session_state.get("_forecast_horizon_epoch", 0) + 1
         for role_name, role_cmap in st.session_state.col_maps.items():
             if role_name in (
                 "Statistical Forecast",
@@ -940,7 +952,7 @@ def step2_columns():
                 "Retailing",
             ):
                 role_cmap.pop("_months", None)
-        st.rerun()  # Force rerun to re-render Step 2 with new horizon defaults
+        st.rerun()
 
     st.divider()
 
@@ -1005,8 +1017,6 @@ def step2_columns():
                 elif role in ("Statistical Forecast", "Final Fcst to Finance", "Stat", "FFF", "Consumption", "Retailing"):
                     current_month_start = pd.Timestamp.now().normalize().replace(day=1)
                     _sas_default = []
-                    
-                    # Respect forecast horizon mode: limit to SAS max month if Current FY
                     horizon_mode = st.session_state.get("forecast_horizon_mode", "Current FY")
                     max_sas_month = None
                     if horizon_mode == "Current FY":
@@ -1014,21 +1024,21 @@ def step2_columns():
                         if sas_df_for_max is not None:
                             sas_months = detect_month_columns(sas_df_for_max)
                             if sas_months:
-                                parsed_sas = [parse_month_to_date(m) for m in sas_months if parse_month_to_date(m) is not None]
+                                parsed_sas = [
+                                    parse_month_to_date(m)
+                                    for m in sas_months
+                                    if parse_month_to_date(m) is not None
+                                ]
                                 if parsed_sas:
                                     max_sas_month = max(parsed_sas)
-                    
                     for _m in detected_months:
                         _ts = parse_month_to_date(_m)
                         if _ts is not None and _ts > current_month_start:
-                            # If Current FY mode and max_sas_month is set, only include up to that month
                             if horizon_mode == "Current FY" and max_sas_month is not None:
                                 if _ts <= max_sas_month:
                                     _sas_default.append(_m)
                             else:
-                                # Next 18 Months: use all future months
                                 _sas_default.append(_m)
-                    
                     _sas_month_default = _sas_default  # future months, limited by horizon mode
                 else:
                     _sas_month_default = detected_months
@@ -1037,20 +1047,21 @@ def step2_columns():
             
             # Show month columns selector (skip for Stat_DB and Bible)
             if role not in ("Stat_DB", "Bible") and detected_months:
-                # For forecast roles, limit OPTIONS based on horizon mode
                 horizon_mode = st.session_state.get("forecast_horizon_mode", "Current FY")
                 if role in ("Statistical Forecast", "Final Fcst to Finance", "Stat", "FFF", "Consumption", "Retailing") and horizon_mode == "Current FY":
-                    # Limit options to months up to SAS max
                     sas_df_for_options = _get_df("SAS")
                     max_sas_month_for_options = None
                     if sas_df_for_options is not None:
                         sas_months_for_options = detect_month_columns(sas_df_for_options)
                         if sas_months_for_options:
-                            parsed_sas_for_options = [parse_month_to_date(m) for m in sas_months_for_options if parse_month_to_date(m) is not None]
+                            parsed_sas_for_options = [
+                                parse_month_to_date(m)
+                                for m in sas_months_for_options
+                                if parse_month_to_date(m) is not None
+                            ]
                             if parsed_sas_for_options:
                                 max_sas_month_for_options = max(parsed_sas_for_options)
-                    
-                    # Filter detected_months to only those up to max_sas_month
+
                     months_to_show = []
                     if max_sas_month_for_options is not None:
                         for m in detected_months:
@@ -1060,14 +1071,13 @@ def step2_columns():
                     else:
                         months_to_show = detected_months
                 else:
-                    # Next 18 Months or other roles: show all detected months
                     months_to_show = detected_months
-                
+
                 confirmed_months = st.multiselect(
                     "Month columns",
                     months_to_show,
                     default=[m for m in _sas_month_default if m in months_to_show],
-                    key=f"months_{role}_{horizon_mode}",
+                    key=f"months_{role}_{st.session_state.get('_forecast_horizon_epoch', 0)}",
                 )
                 cmap["_months"] = confirmed_months
             else:
@@ -1231,6 +1241,153 @@ def _guess_col(cols: list[str], *keywords: str) -> str:
             if kw.lower() in c.lower():
                 return c
     return "— auto —"
+
+
+def _find_product_description_col(df: pd.DataFrame) -> str | None:
+    """Return the best matching product-description column in a DataFrame."""
+    if df is None or df.empty:
+        return None
+
+    cols = [str(c) for c in df.columns]
+    normalized = {re.sub(r"[^a-z0-9]+", "", c.lower()): c for c in cols}
+
+    preferred_exact = [
+        "productdescription",
+        "productdesc",
+        "materialdescription",
+        "materialdesc",
+        "skudescription",
+        "sfudescription",
+    ]
+    for key in preferred_exact:
+        if key in normalized:
+            return normalized[key]
+
+    for c in cols:
+        cl = c.lower()
+        if "description" not in cl:
+            continue
+        if any(tok in cl for tok in ("product", "material", "sku", "sfu")):
+            return c
+    return None
+
+
+def _latest_product_description_map() -> dict[str, str]:
+    """Build SFU_v -> latest Product Description from loaded sheets.
+
+    Latest is determined by the best available date-like column; if none exists,
+    later row order is used.
+    """
+    sheets = st.session_state.get("sheets", {})
+    if not sheets:
+        return {}
+
+    role_by_sheet = {
+        str(sheet): str(role)
+        for role, sheet in st.session_state.get("sheet_map", {}).items()
+    }
+
+    records: list[pd.DataFrame] = []
+    order_col_candidates = [
+        "Last Updated",
+        "Updated At",
+        "Updated On",
+        "Effective Date",
+        "Valid From",
+        "As Of Date",
+        "Snapshot Date",
+        "Date",
+        "Timestamp",
+        "Forecast To",
+        "Forecast From",
+    ]
+
+    for sheet_name, df in sheets.items():
+        if df is None or df.empty:
+            continue
+
+        desc_col = _find_product_description_col(df)
+        if not desc_col or desc_col not in df.columns:
+            continue
+
+        role = role_by_sheet.get(str(sheet_name))
+        cmap = st.session_state.get("col_maps", {}).get(role, {}) if role else {}
+
+        sfu_col = None
+        if MONTHLY_SFU_VERSION_COL in df.columns:
+            sfu_col = MONTHLY_SFU_VERSION_COL
+        else:
+            mapped_sfu = cmap.get("SFU_v") or cmap.get("SKU")
+            if mapped_sfu in df.columns:
+                sfu_col = mapped_sfu
+            else:
+                for cand in ["SFU_v", "SKU", BIBLE_SFU_V_COL, BIBLE_SALIENCE_SFU_COL]:
+                    if cand in df.columns:
+                        sfu_col = cand
+                        break
+
+        work = pd.DataFrame(index=df.index)
+        if sfu_col:
+            work["_sfu"] = df[sfu_col].astype(str).str.strip()
+        elif STAT_DB_SFU_COL in df.columns and STAT_DB_SFU_VERSION_COL in df.columns:
+            work["_sfu"] = (
+                df[STAT_DB_SFU_COL].astype(str).str.strip()
+                + "_"
+                + df[STAT_DB_SFU_VERSION_COL].astype(str).str.strip()
+            )
+        else:
+            continue
+
+        work["_desc"] = df[desc_col].astype(str).str.strip()
+        work = work[(work["_sfu"] != "") & (work["_desc"] != "")]
+        if work.empty:
+            continue
+
+        parsed_order = pd.Series(pd.NaT, index=df.index)
+        for col in order_col_candidates:
+            if col in df.columns:
+                parsed = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
+                if parsed.notna().any():
+                    parsed_order = parsed
+                    break
+
+        work["_order_ts"] = parsed_order
+        work["_order_row"] = np.arange(len(work), dtype=int)
+        records.append(work)
+
+    if not records:
+        return {}
+
+    all_rows = pd.concat(records, ignore_index=True)
+    all_rows["_order_ts"] = all_rows["_order_ts"].fillna(pd.Timestamp.min)
+    all_rows = all_rows.sort_values(["_sfu", "_order_ts", "_order_row"]) 
+    latest = all_rows.drop_duplicates(subset=["_sfu"], keep="last")
+    return dict(zip(latest["_sfu"], latest["_desc"]))
+
+
+def _add_product_description(df: pd.DataFrame) -> pd.DataFrame:
+    """Add Product Description to SFU_v tables for display purposes."""
+    if df is None or df.empty or "Product Description" in df.columns:
+        return df
+
+    sfu_col = next(
+        (c for c in [MONTHLY_SFU_VERSION_COL, "SFU_v", "SKU"] if c in df.columns),
+        None,
+    )
+    if not sfu_col:
+        return df
+
+    desc_map = _latest_product_description_map()
+    if not desc_map:
+        return df
+
+    out = df.copy()
+    out["Product Description"] = out[sfu_col].astype(str).str.strip().map(desc_map).fillna("")
+    cols = list(out.columns)
+    cols.remove("Product Description")
+    insert_at = cols.index(sfu_col) + 1
+    cols.insert(insert_at, "Product Description")
+    return out[cols]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2110,7 +2267,7 @@ def step4_salience():
             st.subheader(f"Current Salience Table — {len(display_sal)} rows (at SFU_SFU Version level)")
             st.caption("This salience is applied consistently across all selected SAS forecast months.")
             st.dataframe(
-                display_sal,
+                _add_product_description(display_sal),
                 width='stretch',
                 height=300,
                 column_config={
@@ -2474,8 +2631,9 @@ def step4_salience():
                     )
 
                 # Column order: SFU_v, Basis, Window, P6M…P1M, Final, Salience, Remarks
+                preview_df = _add_product_description(preview_df)
                 ordered_cols = (
-                    ["SFU_SFU Version", "Basis / Metric", "Basis Window"]
+                    ["SFU_SFU Version", "Product Description", "Basis / Metric", "Basis Window"]
                     + preview_labels
                     + ["Final Basis", "Basis Status", "Salience %", "Remarks"]
                 )
@@ -2645,6 +2803,7 @@ def step4_salience():
                                 .sort_values(excl_cols)
                                 .reset_index(drop=True)
                             )
+                            excl_display = _add_product_description(excl_display)
 
                             # "Exclude" checkbox — pre-checked if already excluded OR has < 3 months shipments
                             already_excl_set = exc_store_sal.global_exclusions
@@ -2780,7 +2939,10 @@ def step4_salience():
                                         f"Detected **{len(excl_up_df)} SKU row(s)** and "
                                         f"**{len(month_cols_up)} month column(s)**: {', '.join(month_cols_up)}"
                                     )
-                                    st.dataframe(excl_up_df[[found_sku_col] + month_cols_up].head(20), width='stretch')
+                                    st.dataframe(
+                                        _add_product_description(excl_up_df[[found_sku_col] + month_cols_up]).head(20),
+                                        width='stretch'
+                                    )
 
                                     if st.button("✅ Apply Uploaded Exclusions + Volumes", key="apply_excl_upload"):
                                         applied_skus = set()
@@ -3824,7 +3986,7 @@ def step6_run():
     if st.session_state.output_wide is not None:
         output_wide = st.session_state.output_wide
         st.subheader("Output Preview (first 20 rows)")
-        st.dataframe(output_wide.head(20), width='stretch')
+        st.dataframe(_add_product_description(output_wide).head(20), width='stretch')
 
         # ── Reasonability Check 1: Last BOP FFF + Split → New Total (SKU-month) ──
         st.subheader("Reasonability Check 1 — SKU-Month New Total (Last BOP FFF + Split)")
@@ -3890,7 +4052,7 @@ def step6_run():
                         _display_data[f"{_m} New Total"] = _lb_v + _adj_v
                     _check1_df = pd.DataFrame(_display_data)
                     st.dataframe(
-                        _check1_df,
+                        _add_product_description(_check1_df),
                         width="stretch",
                         height=min(600, 60 + len(_check1_df) * 35),
                     )
@@ -4745,7 +4907,7 @@ def step7_download():
     tab_out, tab_sal, tab_exc, tab_val = st.tabs(["Split Forecast", "Salience Table", "Exception Log", "Validation"])
 
     with tab_out:
-        st.dataframe(output_wide, width='stretch', height=400)
+        st.dataframe(_add_product_description(output_wide), width='stretch', height=400)
     with tab_sal:
         # Always show salience as % — drop raw fraction column, add Salience %
         sal_display = sal_df.copy()
@@ -4756,7 +4918,7 @@ def step7_download():
             non_sal_cols = [c for c in sal_display.columns if c != "Salience %"]
             sal_display = sal_display[non_sal_cols + ["Salience %"]]
         st.dataframe(
-            sal_display,
+            _add_product_description(sal_display),
             width='stretch',
             height=400,
             column_config={"Salience %": st.column_config.NumberColumn("Salience %", format="%.2f %%")},
