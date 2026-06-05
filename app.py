@@ -178,6 +178,7 @@ def _init_state():
         "sfu_manual_months": [],      # Global manual month selector for SFU basis (legacy)
         "sfu_specific_months": {},    # SFU_SFU Version -> list[str] of manually chosen months
         "sfu_remarks": {},            # SFU_SFU Version -> user remarks string
+        "exception_log_remarks": {},  # exception log row key -> user remark string
         "filters": {},
         "step": 1,
         "max_step": 1,
@@ -234,10 +235,11 @@ STEPS = [
     "1. Upload & Map Sheets",
     "2. Map Columns",
     "3. Filters & Split Level",
-    "4. Basis & Salience",
-    "5. Run Split",
-    "6. Reasonability Check",
-    "7. Download",
+    "4. Exclusions",
+    "5. Basis & Salience",
+    "6. Run Split",
+    "7. Reasonability Check",
+    "8. Download",
 ]
 
 with st.sidebar:
@@ -303,7 +305,7 @@ with st.sidebar:
                     # After loading, keep the user at step 1 so they upload fresh data
                     # but mark max_step so they can navigate freely
                     st.session_state.step = 1
-                    st.session_state.max_step = 7
+                    st.session_state.max_step = 8
                     st.success("Profile loaded! Upload your new Excel file and all previous settings will be pre-filled.")
                     with st.expander("What was loaded", expanded=False):
                         st.text("\n".join(load_notes))
@@ -554,14 +556,14 @@ def _show_bop_load_summary(sheets: dict) -> None:
     if has_sellout:
         st.info(
             "📊 **Sellout sheet detected!** This sheet can be used as a historical basis for salience "
-            "weighting in Step 4."
+            "weighting in Step 5."
         )
 
     has_last_bop = "Last BOP" in st.session_state.sheet_map
     if has_last_bop:
         st.info(
             "📋 **Last BOP sheet detected!** Previous-week Final Fcst to Finance — BOP values are loaded "
-            "and will be used in the Reasonability Check (Step 6) to show Last BOP + split adjustments."
+            "and will be used in the Reasonability Check (Step 7) to show Last BOP + split adjustments."
         )
 
     # Entry Type check — warn if the SAS sheet does not appear to be a BOP file
@@ -1746,13 +1748,13 @@ def step3_filters():
             f"**GBB Type** is pulled directly from the SAS sheet (column: `{_gbb_col}`) and is read-only. "
             "It drives the default **Split Level** and **Action** for each Building Block. "
             "You can still override **Split Level** for any row. "
-            "Rows flagged as *exceptions* or *ignore* will be highlighted in Step 5."
+            "Rows flagged as *exceptions* or *ignore* will be highlighted in Step 4."
         )
     else:
         st.caption(
             "No GBB Type column was found in the SAS sheet — you can manually assign a **GBB Type** per row. "
             "GBB Type drives the default **Split Level** and **Action** for each Building Block. "
-            "Rows flagged as *exceptions* or *ignore* will be highlighted in Step 5."
+            "Rows flagged as *exceptions* or *ignore* will be highlighted in Step 4."
         )
 
     # Auto-detect SFU_v split level: if SAS has a Specific SFU_v column with data for a BB row → use SFU_v level
@@ -1921,7 +1923,7 @@ def step3_filters():
                 from collections import Counter
                 st.session_state.split_level = Counter(new_bb_split_levels.values()).most_common(1)[0][0]
 
-            # Persist GBB action flags so Step 5 can surface them
+            # Persist GBB action flags so Step 4 can surface them
             gbb_actions: dict[str, str] = {}
             gbb_types: dict[str, str] = {}
             if "Action" in edited_bb.columns and "GBB Type" in edited_bb.columns:
@@ -1973,7 +1975,7 @@ def step3_filters():
                 covered_sfus = len(set(sku_out[MONTHLY_SFU_VERSION_COL].astype(str).tolist()) & sfus_with_fff)
                 st.info(
                     f"ℹ️ Future FFF coverage: **{covered_sfus}/{total_sfus}** SFU_vs have non-zero FFF. "
-                    "All SFU_vs are kept for Step 4 salience configuration."
+                    "All SFU_vs are kept for Step 5 salience configuration."
                 )
 
         st.session_state.sas_df_filtered = sas_out
@@ -2028,6 +2030,237 @@ def _build_exclusion_upload_template(sku_col: str, months: list[str]) -> bytes:
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         template_df.to_excel(writer, index=False, sheet_name="Exclusions")
     return buf.getvalue()
+
+
+def render_detailed_exclusion_tools() -> None:
+    """Detailed exclusion review table and exclusions upload workflow."""
+    st.markdown("#### Detailed Global Exclusion Review")
+    st.caption(
+        "Review SFU_v exclusions in detail before salience is calculated. "
+        "Excluded items receive salience 0 and do not participate in the split."
+    )
+
+    sku_df_excl = st.session_state.sku_df_filtered
+    exc_store_sal: ExceptionStore = st.session_state.exc_store
+    hcm_excl = hier_col_map_from_state()
+    sku_col_excl = hcm_excl.get("SFU_v", MONTHLY_SFU_VERSION_COL)
+    if sku_df_excl is not None:
+        candidate_cols = [
+            sku_col_excl,
+            MONTHLY_SFU_VERSION_COL,
+            "SFU_v",
+            "SKU",
+        ]
+        sku_col_excl = next((c for c in candidate_cols if c and c in sku_df_excl.columns), None)
+
+    current_month_start_excl = pd.Timestamp.now().normalize().replace(day=1)
+
+    sparse_skus: set[str] = set()
+    shipments_df = _get_df("Shipments")
+    if shipments_df is not None and sku_col_excl in shipments_df.columns:
+        ship_past_months = [
+            m for m in detect_month_columns(shipments_df)
+            if (parse_month_to_date(m) or pd.Timestamp.max) < current_month_start_excl
+        ]
+        if ship_past_months:
+            for _sku_val, grp in shipments_df.groupby(sku_col_excl):
+                nonzero_months = sum(
+                    1 for m in ship_past_months
+                    if m in grp.columns
+                    and pd.to_numeric(grp[m], errors="coerce").sum() > 0
+                )
+                if nonzero_months < 3:
+                    sparse_skus.add(str(_sku_val))
+
+    if sparse_skus:
+        st.warning(
+            f"⚠️ **{len(sparse_skus)} SFU_v value(s) have fewer than 3 months of shipments** "
+            "and are pre-checked for exclusion below. "
+            "Please confirm whether these are **Initiatives** or new SFU_v values before saving exclusions: "
+            f"`{'`, `'.join(sorted(sparse_skus))}`"
+        )
+
+    tab_excl_table, tab_excl_upload = st.tabs(["📋 Select Exclusions", "📤 Upload Exclusions + Volumes"])
+
+    with tab_excl_table:
+        if sku_df_excl is not None and not sku_df_excl.empty and sku_col_excl:
+            excl_cols = []
+            if MONTHLY_SFU_VERSION_COL in sku_df_excl.columns:
+                excl_cols.append(MONTHLY_SFU_VERSION_COL)
+            if sku_col_excl in sku_df_excl.columns and sku_col_excl != MONTHLY_SFU_VERSION_COL:
+                excl_cols.append(sku_col_excl)
+            for h in HIERARCHY_LEVELS:
+                actual_h = hcm_excl.get(h)
+                if actual_h and actual_h in sku_df_excl.columns and actual_h not in excl_cols:
+                    excl_cols.append(actual_h)
+
+            if excl_cols:
+                excl_display = (
+                    sku_df_excl[excl_cols]
+                    .drop_duplicates()
+                    .sort_values(excl_cols)
+                    .reset_index(drop=True)
+                )
+                excl_display = _add_product_description(excl_display)
+
+                already_excl_set = exc_store_sal.global_exclusions
+                excl_display["Exclude"] = excl_display[sku_col_excl].apply(
+                    lambda v: (str(v) in already_excl_set) or (str(v) in sparse_skus)
+                ) if sku_col_excl in excl_display.columns else False
+
+                excl_display["⚠️ < 3 months data"] = excl_display[sku_col_excl].apply(
+                    lambda v: "⚠️ Sparse" if str(v) in sparse_skus else ""
+                ) if sku_col_excl in excl_display.columns else ""
+
+                excl_display["📌 Status"] = excl_display[sku_col_excl].apply(
+                    lambda v: "Excluded ✓" if str(v) in already_excl_set else ""
+                ) if sku_col_excl in excl_display.columns else ""
+
+                excl_ordered = ["Exclude", "⚠️ < 3 months data", "📌 Status"] + [c for c in excl_cols if c in excl_display.columns]
+                excl_col_cfg: dict = {
+                    "Exclude": st.column_config.CheckboxColumn(
+                        "Exclude",
+                        help="Check to exclude this SFU_v value from salience calculation.",
+                    ),
+                    "⚠️ < 3 months data": st.column_config.TextColumn(
+                        "< 3 months shipments",
+                        disabled=True,
+                        help="SFU_v values with fewer than 3 non-zero shipment months — likely Initiatives.",
+                    ),
+                    "📌 Status": st.column_config.TextColumn(
+                        "Current Status",
+                        disabled=True,
+                        help="Whether this SFU_v value is currently in the global exclusions list.",
+                    ),
+                }
+                if MONTHLY_SFU_VERSION_COL in excl_display.columns:
+                    excl_col_cfg[MONTHLY_SFU_VERSION_COL] = st.column_config.TextColumn("SFU_v", disabled=True)
+                if sku_col_excl in excl_display.columns:
+                    excl_col_cfg[sku_col_excl] = st.column_config.TextColumn("SFU_v", disabled=True)
+
+                edited_excl = st.data_editor(
+                    excl_display[excl_ordered],
+                    column_config=excl_col_cfg,
+                    disabled=[c for c in excl_ordered if c != "Exclude"],
+                    width='stretch',
+                    key="sfu_exclusion_editor",
+                    height=min(450, 60 + len(excl_display) * 35),
+                    num_rows="fixed",
+                )
+
+                if st.button("💾 Save Exclusions", key="save_excl_btn"):
+                    all_skus_in_table = set(
+                        excl_display[sku_col_excl].dropna().astype(str).tolist()
+                    ) if sku_col_excl in excl_display.columns else set()
+                    exc_store_sal.global_exclusions -= all_skus_in_table
+                    newly_excluded = set()
+                    for _, erow in edited_excl.iterrows():
+                        if erow.get("Exclude"):
+                            sku_val = str(erow.get(sku_col_excl, ""))
+                            if sku_val:
+                                flag_note = " [< 3 months shipments — confirmed initiative/new SKU]" if sku_val in sparse_skus else ""
+                                exc_store_sal.add_global_exclusion(sku_val, notes=f"Excluded before salience in Step 4{flag_note}")
+                                newly_excluded.add(sku_val)
+                    st.session_state.exc_store = exc_store_sal
+                    if newly_excluded:
+                        st.success(f"✅ {len(newly_excluded)} SFU_v value(s) marked for exclusion: {', '.join(sorted(newly_excluded))}")
+                    else:
+                        st.info("No exclusions set — all SFU_v values will be included in salience.")
+                    st.rerun()
+
+                current_excl = exc_store_sal.global_exclusions & (
+                    set(excl_display[sku_col_excl].dropna().astype(str).tolist())
+                    if sku_col_excl in excl_display.columns else set()
+                )
+                if current_excl:
+                    st.warning(
+                        f"⚠️ **{len(current_excl)} SFU_v value(s) currently excluded** "
+                        f"(will be skipped in salience): {', '.join(sorted(current_excl))}"
+                    )
+            else:
+                st.info("No SFU_v data available — complete Step 3 first.")
+        else:
+            if sku_df_excl is not None and not sku_df_excl.empty and not sku_col_excl:
+                st.warning(
+                    "Could not find a valid SKU/SFU column in the filtered data. "
+                    "Please check column mappings in Step 2."
+                )
+            else:
+                st.info("No SFU_v data loaded yet — complete Step 3 first.")
+
+    with tab_excl_upload:
+        st.markdown(
+            "Upload an **Excel file** with excluded SFU_v values and their volumes. "
+            "The file must have:\n"
+            "- A column named **`SFU_v`** (or the mapped SFU_v column name for your data)\n"
+            "- Month columns in `Mmm-YY` format (e.g. `Jan-26`, `Feb-26`) with the volumes to allocate\n\n"
+            "These SFU_v values will be **globally excluded from the salience split** and their volumes will be "
+            "loaded as **fixed allocations** in the exception store."
+        )
+        st.download_button(
+            label="📥 Download template",
+            data=_build_exclusion_upload_template(sku_col_excl, st.session_state.get("sas_months_selected", [])),
+            file_name="exclusions_template.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        excl_upload_file = st.file_uploader(
+            "Upload exclusions Excel",
+            type=["xlsx", "xls"],
+            key="excl_upload_file",
+        )
+        if excl_upload_file is not None:
+            try:
+                excl_up_df = pd.read_excel(excl_upload_file)
+                sku_col_candidates = [sku_col_excl, MONTHLY_SFU_VERSION_COL, "SFU_v", "SKU"]
+                found_sku_col = next((c for c in sku_col_candidates if c in excl_up_df.columns), None)
+                if found_sku_col is None:
+                    st.error(f"Could not find a SKU column in the uploaded file. Expected one of: {sku_col_candidates}")
+                else:
+                    month_cols_up = [
+                        c for c in excl_up_df.columns
+                        if c != found_sku_col and parse_month_to_date(c) is not None
+                    ]
+                    if not month_cols_up:
+                        st.warning("No month columns detected in the uploaded file. Ensure columns are in `Mmm-YY` format.")
+                    else:
+                        st.success(
+                            f"Detected **{len(excl_up_df)} SKU row(s)** and "
+                            f"**{len(month_cols_up)} month column(s)**: {', '.join(month_cols_up)}"
+                        )
+                        st.dataframe(
+                            _add_product_description(excl_up_df[[found_sku_col] + month_cols_up]).head(20),
+                            width='stretch'
+                        )
+
+                        if st.button("✅ Apply Uploaded Exclusions + Volumes", key="apply_excl_upload"):
+                            applied_skus = set()
+                            for _, urow in excl_up_df.iterrows():
+                                sku_v = str(urow[found_sku_col])
+                                if not sku_v or sku_v == "nan":
+                                    continue
+                                exc_store_sal.add_global_exclusion(
+                                    sku_v,
+                                    notes="Excluded via uploaded exclusions Excel (Step 4)"
+                                )
+                                applied_skus.add(sku_v)
+                                for mc in month_cols_up:
+                                    qty_val = pd.to_numeric(urow.get(mc, 0), errors="coerce")
+                                    if not pd.isna(qty_val) and qty_val != 0:
+                                        exc_store_sal.set_fixed_qty(
+                                            "__uploaded__",
+                                            sku_v,
+                                            mc,
+                                            float(qty_val),
+                                            notes="Volume from uploaded exclusions Excel",
+                                        )
+                            st.session_state.exc_store = exc_store_sal
+                            st.success(
+                                f"✅ {len(applied_skus)} SKU(s) excluded and volumes loaded: "
+                                f"{', '.join(sorted(applied_skus))}"
+                            )
+                            st.rerun()
+            except Exception as _exc_up_err:
+                st.error(f"Error reading uploaded file: {_exc_up_err}")
 
 
 def _compute_bop_salience_for_level(
@@ -2214,10 +2447,106 @@ def _compute_bop_salience(sfu_configs: dict, basis_overrides: dict[str, float] |
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# STEP 4 – Basis & Salience
+# STEP 4 – Exclusions
+# ──────────────────────────────────────────────────────────────────────────────
+def step4_exclusions():
+    st.header("Step 4 — Exclusions & Exceptions")
+
+    sku_filtered = st.session_state.sku_df_filtered
+    sas_filtered = st.session_state.sas_df_filtered
+    if sku_filtered is None or sku_filtered.empty or sas_filtered is None or sas_filtered.empty:
+        st.error("No filtered SAS/SFU_v data — complete Step 3 first.")
+        return
+
+    exc_store = st.session_state.exc_store
+    hcm = hier_col_map_from_state()
+    sku_col_for_quick = hcm.get("SFU_v", MONTHLY_SFU_VERSION_COL)
+
+    st.caption(
+        "Review exclusions before salience setup. Global exclusions narrow the SFU_v list that appears in "
+        "the live salience preview, while initiative and per-BB overrides stay available below."
+    )
+
+    if (
+        MONTHLY_SFU_VERSION_COL in sku_filtered.columns
+        and sku_col_for_quick in sku_filtered.columns
+    ):
+        quick_scope_cols = list(dict.fromkeys([MONTHLY_SFU_VERSION_COL, sku_col_for_quick]))
+        quick_scope = sku_filtered[quick_scope_cols].copy()
+        quick_scope[MONTHLY_SFU_VERSION_COL] = quick_scope[MONTHLY_SFU_VERSION_COL].astype(str).str.strip()
+        if sku_col_for_quick != MONTHLY_SFU_VERSION_COL:
+            quick_scope[sku_col_for_quick] = quick_scope[sku_col_for_quick].astype(str).str.strip()
+        quick_scope = quick_scope[
+            (quick_scope[MONTHLY_SFU_VERSION_COL] != "")
+            & (quick_scope[sku_col_for_quick] != "")
+        ]
+
+        all_quick_skus = sorted(quick_scope[sku_col_for_quick].dropna().unique().tolist())
+        current_excl = exc_store.global_exclusions
+        quick_default = [s for s in all_quick_skus if s in current_excl]
+
+        col_total, col_excluded, col_visible = st.columns(3)
+        bb_included_skus = set()
+        for _, bb_exc in exc_store.bb_exceptions.items():
+            bb_included_skus.update(bb_exc.get("include", set()))
+        visible_mask = ~quick_scope[sku_col_for_quick].isin(current_excl) | quick_scope[sku_col_for_quick].isin(bb_included_skus)
+        visible_scope = quick_scope[visible_mask]
+        col_total.metric("SFU_v values in scope", len(all_quick_skus))
+        col_excluded.metric("Global exclusions", len(current_excl))
+        col_visible.metric("Visible for salience", visible_scope[MONTHLY_SFU_VERSION_COL].nunique())
+
+        st.markdown("#### Global SFU_v Exclusions")
+        st.caption(
+            "Use this list for broad exclusions such as fixed promo volumes or initiatives. "
+            "BB-specific includes below can still bring an excluded SFU_v back for a particular building block. "
+            "All initiative SKUs are treated as part of the global exclusion pool by default."
+        )
+        quick_selected = st.multiselect(
+            "Exclude SFU_v values before salience setup",
+            all_quick_skus,
+            default=quick_default,
+            key="quick_pre_basis_exclusions",
+        )
+
+        if st.button("Save Global Exclusions", key="apply_quick_pre_basis_exclusions"):
+            quick_scope_skus = set(all_quick_skus)
+            exc_store.global_exclusions -= quick_scope_skus
+            for _sku in quick_selected:
+                exc_store.add_global_exclusion(
+                    str(_sku),
+                    notes="Excluded before salience setup (Step 4 quick filter)",
+                )
+            st.session_state.exc_store = exc_store
+            st.success(f"Saved {len(quick_selected)} global exclusion(s).")
+            st.rerun()
+
+        st.caption(
+            f"Live Preview in Step 5 will show **{visible_scope[MONTHLY_SFU_VERSION_COL].nunique()}** visible SFU_v "
+            f"out of **{quick_scope[MONTHLY_SFU_VERSION_COL].nunique()}** after exclusions."
+        )
+    else:
+        st.warning(
+            "Could not resolve the SFU_v column for quick exclusions. Verify your Step 2 mappings if the "
+            "global exclusion list appears empty."
+        )
+
+    st.divider()
+    render_detailed_exclusion_tools()
+
+    st.divider()
+    render_exceptions_panel()
+
+    if st.button("Confirm Exclusions →", type="primary"):
+        st.session_state.step = max(st.session_state.step, 5)
+        st.session_state.max_step = max(st.session_state.max_step, 5)
+        st.rerun()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# STEP 5 – Basis & Salience
 # ──────────────────────────────────────────────────────────────────────────────
 def step4_salience():
-    st.header("Step 4 — Review & Refine Salience")
+    st.header("Step 5 — Review & Refine Salience")
 
     sku_filtered = st.session_state.sku_df_filtered
     if sku_filtered is None or sku_filtered.empty:
@@ -2317,7 +2646,7 @@ def step4_salience():
                             all_sfu_versions.extend(_df_src[MONTHLY_SFU_VERSION_COL].dropna().astype(str).tolist())
                 sfu_versions = sorted(set(all_sfu_versions))
 
-            # ── Step 4 exclusions before basis selection ───────────────────
+            # Apply exclusions from Step 4 before building the live preview.
             sku_col_for_quick = hcm.get("SFU_v", MONTHLY_SFU_VERSION_COL)
             sfu_versions_all = list(sfu_versions)
             if (
@@ -2325,45 +2654,12 @@ def step4_salience():
                 and MONTHLY_SFU_VERSION_COL in sku_for_versions.columns
                 and sku_col_for_quick in sku_for_versions.columns
             ):
-                st.markdown("#### Step 4 — Exclusions (Fixed Promo volumes, Initiatives)")
-                st.caption(
-                    "Exclude SFU_v values first to reduce the list shown in Live Preview. "
-                    "Excluded items will receive salience 0 and be skipped in split allocation."
-                )
-
                 quick_scope_cols = list(dict.fromkeys([MONTHLY_SFU_VERSION_COL, sku_col_for_quick]))
                 quick_scope = sku_for_versions[quick_scope_cols].copy()
                 quick_scope[MONTHLY_SFU_VERSION_COL] = quick_scope[MONTHLY_SFU_VERSION_COL].astype(str).str.strip()
                 if sku_col_for_quick != MONTHLY_SFU_VERSION_COL:
                     quick_scope[sku_col_for_quick] = quick_scope[sku_col_for_quick].astype(str).str.strip()
                 quick_scope = quick_scope[(quick_scope[MONTHLY_SFU_VERSION_COL] != "") & (quick_scope[sku_col_for_quick] != "")]
-
-                all_quick_skus = sorted(quick_scope[sku_col_for_quick].dropna().unique().tolist())
-                current_excl = st.session_state.exc_store.global_exclusions
-                quick_default = [s for s in all_quick_skus if s in current_excl]
-                quick_selected = st.multiselect(
-                    "Exclude SFU_v values (applied before basis selection)",
-                    all_quick_skus,
-                    default=quick_default,
-                    key="quick_pre_basis_exclusions",
-                )
-
-                if st.button("Apply Quick Exclusions", key="apply_quick_pre_basis_exclusions"):
-                    st.session_state._apply_quick_exclusions = True
-
-                # Process deferred exclusion application
-                if st.session_state.get("_apply_quick_exclusions", False):
-                    exc_store_quick = st.session_state.exc_store
-                    quick_scope_skus = set(all_quick_skus)
-                    exc_store_quick.global_exclusions -= quick_scope_skus
-                    for _sku in quick_selected:
-                        exc_store_quick.add_global_exclusion(
-                            str(_sku),
-                            notes="Excluded before basis selection (Step 4 quick filter)",
-                        )
-                    st.session_state.exc_store = exc_store_quick
-                    st.session_state._apply_quick_exclusions = False
-                    st.rerun()
 
                 # Reduce visible SFU list to those not globally excluded.
                 # Keep SFU_vs that have BB-specific includes, even if globally excluded elsewhere.
@@ -2380,12 +2676,8 @@ def step4_salience():
 
                 st.caption(
                     f"Visible in Live Preview: **{len(sfu_versions)}** / **{len(sfu_versions_all)}** SFU_v "
-                    "after quick exclusions."
+                    "after Step 4 exclusions."
                 )
-
-            # Merged exceptions controls so users can finish all exclusions in Step 4.
-            with st.expander("Advanced Exceptions (Per-BB include/exclude, fixed qty, log)", expanded=False):
-                render_exceptions_panel()
 
             if not sfu_versions or not available_basis_sources:
                 st.info(
@@ -2429,6 +2721,53 @@ def step4_salience():
                 saved_sfu_configs = st.session_state.get("sfu_basis_sources", {})
                 saved_basis_overrides: dict[str, float] = st.session_state.get("sfu_basis_overrides", {})
                 saved_remarks: dict = st.session_state.get("sfu_remarks", {})
+
+                preview_meta_source = sku_for_versions if sku_for_versions is not None else pd.DataFrame()
+                preview_brand_col = next(
+                    (
+                        col for col in (
+                            st.session_state.col_maps.get("Bible", {}).get("Brand"),
+                            hcm.get("Brand"),
+                            "Brand",
+                        )
+                        if col and col in preview_meta_source.columns
+                    ),
+                    None,
+                )
+                preview_form_col = next(
+                    (
+                        col for col in (
+                            st.session_state.col_maps.get("Bible", {}).get("Form"),
+                            hcm.get("Form"),
+                            "Form",
+                        )
+                        if col and col in preview_meta_source.columns
+                    ),
+                    None,
+                )
+                preview_meta_map: dict[str, dict[str, str]] = {}
+                if not preview_meta_source.empty and MONTHLY_SFU_VERSION_COL in preview_meta_source.columns:
+                    meta_keep = [MONTHLY_SFU_VERSION_COL]
+                    if preview_brand_col:
+                        meta_keep.append(preview_brand_col)
+                    if preview_form_col and preview_form_col not in meta_keep:
+                        meta_keep.append(preview_form_col)
+                    preview_meta_df = (
+                        preview_meta_source[meta_keep]
+                        .copy()
+                        .drop_duplicates(subset=[MONTHLY_SFU_VERSION_COL], keep="first")
+                    )
+                    preview_meta_df[MONTHLY_SFU_VERSION_COL] = (
+                        preview_meta_df[MONTHLY_SFU_VERSION_COL].astype(str).str.strip()
+                    )
+                    for _, meta_row in preview_meta_df.iterrows():
+                        sfu_ver = str(meta_row[MONTHLY_SFU_VERSION_COL]).strip()
+                        if not sfu_ver:
+                            continue
+                        preview_meta_map[sfu_ver] = {
+                            "Brand": str(meta_row.get(preview_brand_col, "") or "") if preview_brand_col else "",
+                            "Form": str(meta_row.get(preview_form_col, "") or "") if preview_form_col else "",
+                        }
 
                 # ── Helper: compute basis value for one SFU from a source df ─
                 def _sfu_basis_with_reason(sfu_ver: str, src_role: str, mode_key: str, sel_months: list[str]) -> tuple[float, str]:
@@ -2563,8 +2902,11 @@ def step4_salience():
                 preview_rows = []
                 for v, cfg_p in preview_configs.items():
                     src_role = cfg_p["source"]
+                    meta_row = preview_meta_map.get(v, {})
                     row_p: dict = {
                         "SFU_SFU Version": v,
+                        "Brand": meta_row.get("Brand", ""),
+                        "Form": meta_row.get("Form", ""),
                         "Basis / Metric": src_role,
                         "Basis Window": next(
                             (k for k, mv in basis_window_mode_map.items() if mv == cfg_p["mode"]),
@@ -2633,7 +2975,7 @@ def step4_salience():
                 # Column order: SFU_v, Basis, Window, P6M…P1M, Final, Salience, Remarks
                 preview_df = _add_product_description(preview_df)
                 ordered_cols = (
-                    ["SFU_SFU Version", "Product Description", "Basis / Metric", "Basis Window"]
+                    ["SFU_SFU Version", "Product Description", "Brand", "Form", "Basis / Metric", "Basis Window"]
                     + preview_labels
                     + ["Final Basis", "Basis Status", "Salience %", "Remarks"]
                 )
@@ -2732,249 +3074,7 @@ def step4_salience():
                 else:
                     new_specific = st.session_state.get("sfu_specific_months", {})
 
-                # ── Additional exclusion tools (detailed table + upload) ───
-                st.markdown("#### Additional Exclusion Tools")
-                st.caption(
-                    "Select any **SFU_v values** to exclude before salience is calculated. "
-                    "Excluded items will receive a salience weight of **0** and will not participate in the split. "
-                    "SFU_v values with fewer than 3 months of shipments are flagged automatically and pre-checked for exclusion."
-                )
-
-                sku_df_excl = st.session_state.sku_df_filtered
-                exc_store_sal: ExceptionStore = st.session_state.exc_store
-                hcm_excl = hier_col_map_from_state()
-                sku_col_excl = hcm_excl.get("SFU_v", MONTHLY_SFU_VERSION_COL)
-                if sku_df_excl is not None:
-                    candidate_cols = [
-                        sku_col_excl,
-                        MONTHLY_SFU_VERSION_COL,
-                        "SFU_v",
-                        "SKU",
-                    ]
-                    sku_col_excl = next((c for c in candidate_cols if c and c in sku_df_excl.columns), None)
-
-                # ── Detect SFU_v values with < 3 months of shipments ─────────
-                sparse_skus: set[str] = set()
-                shipments_df = _get_df("Shipments")
-                if shipments_df is not None and sku_col_excl in (shipments_df.columns if shipments_df is not None else []):
-                    ship_past_months = [
-                        m for m in detect_month_columns(shipments_df)
-                        if (parse_month_to_date(m) or pd.Timestamp.max) < current_month_start_sal
-                    ]
-                    if ship_past_months:
-                        for _sku_val, grp in shipments_df.groupby(sku_col_excl):
-                            nonzero_months = sum(
-                                1 for m in ship_past_months
-                                if m in grp.columns
-                                and pd.to_numeric(grp[m], errors="coerce").sum() > 0
-                            )
-                            if nonzero_months < 3:
-                                sparse_skus.add(str(_sku_val))
-
-                if sparse_skus:
-                    st.warning(
-                        f"⚠️ **{len(sparse_skus)} SFU_v value(s) have fewer than 3 months of shipments** "
-                        "and are pre-checked for exclusion below. "
-                        "Please confirm whether these are **Initiatives** or new SFU_v values before saving exclusions: "
-                        f"`{'`, `'.join(sorted(sparse_skus))}`"
-                    )
-
-                # ── Sub-tabs: SKU table exclusions | Upload exclusions Excel ─
-                tab_excl_table, tab_excl_upload = st.tabs(["📋 Select Exclusions", "📤 Upload Exclusions + Volumes"])
-
-                with tab_excl_table:
-                    if sku_df_excl is not None and not sku_df_excl.empty and sku_col_excl:
-                        # Build a display table of unique SFU_v values.
-                        excl_cols = []
-                        if MONTHLY_SFU_VERSION_COL in sku_df_excl.columns:
-                            excl_cols.append(MONTHLY_SFU_VERSION_COL)
-                        if sku_col_excl in sku_df_excl.columns and sku_col_excl != MONTHLY_SFU_VERSION_COL:
-                            excl_cols.append(sku_col_excl)
-                        # Add hierarchy cols for context
-                        for h in HIERARCHY_LEVELS:
-                            actual_h = hcm_excl.get(h)
-                            if actual_h and actual_h in sku_df_excl.columns and actual_h not in excl_cols:
-                                excl_cols.append(actual_h)
-
-                        if excl_cols:
-                            excl_display = (
-                                sku_df_excl[excl_cols]
-                                .drop_duplicates()
-                                .sort_values(excl_cols)
-                                .reset_index(drop=True)
-                            )
-                            excl_display = _add_product_description(excl_display)
-
-                            # "Exclude" checkbox — pre-checked if already excluded OR has < 3 months shipments
-                            already_excl_set = exc_store_sal.global_exclusions
-                            excl_display["Exclude"] = excl_display[sku_col_excl].apply(
-                                lambda v: (str(v) in already_excl_set) or (str(v) in sparse_skus)
-                            ) if sku_col_excl in excl_display.columns else False
-
-                            # "Flagged (< 3 months shipments)" indicator column
-                            excl_display["⚠️ < 3 months data"] = excl_display[sku_col_excl].apply(
-                                lambda v: "⚠️ Sparse" if str(v) in sparse_skus else ""
-                            ) if sku_col_excl in excl_display.columns else ""
-
-                            # "Currently Excluded" status column
-                            excl_display["📌 Status"] = excl_display[sku_col_excl].apply(
-                                lambda v: "Excluded ✓" if str(v) in already_excl_set else ""
-                            ) if sku_col_excl in excl_display.columns else ""
-
-                            # Column order: Exclude, status, flag, ID cols
-                            excl_ordered = (
-                                ["Exclude", "⚠️ < 3 months data", "📌 Status"]
-                                + [c for c in excl_cols if c in excl_display.columns]
-                            )
-                            excl_col_cfg: dict = {
-                                "Exclude": st.column_config.CheckboxColumn(
-                                    "Exclude",
-                                    help="Check to exclude this SFU_v value from salience calculation.",
-                                ),
-                                "⚠️ < 3 months data": st.column_config.TextColumn(
-                                    "< 3 months shipments",
-                                    disabled=True,
-                                    help="SFU_v values with fewer than 3 non-zero shipment months — likely Initiatives.",
-                                ),
-                                "📌 Status": st.column_config.TextColumn(
-                                    "Current Status",
-                                    disabled=True,
-                                    help="Whether this SFU_v value is currently in the global exclusions list.",
-                                ),
-                            }
-                            if MONTHLY_SFU_VERSION_COL in excl_display.columns:
-                                excl_col_cfg[MONTHLY_SFU_VERSION_COL] = st.column_config.TextColumn("SFU_v", disabled=True)
-                            if sku_col_excl in excl_display.columns:
-                                excl_col_cfg[sku_col_excl] = st.column_config.TextColumn("SFU_v", disabled=True)
-
-                            edited_excl = st.data_editor(
-                                excl_display[excl_ordered],
-                                column_config=excl_col_cfg,
-                                disabled=[c for c in excl_ordered if c != "Exclude"],
-                                width='stretch',
-                                key="sfu_exclusion_editor",
-                                height=min(450, 60 + len(excl_display) * 35),
-                                num_rows="fixed",
-                            )
-
-                            if st.button("💾 Save Exclusions", key="save_excl_btn"):
-                                all_skus_in_table = set(
-                                    excl_display[sku_col_excl].dropna().astype(str).tolist()
-                                ) if sku_col_excl in excl_display.columns else set()
-                                exc_store_sal.global_exclusions -= all_skus_in_table
-                                newly_excluded = set()
-                                for _, erow in edited_excl.iterrows():
-                                    if erow.get("Exclude"):
-                                        sku_val = str(erow.get(sku_col_excl, ""))
-                                        if sku_val:
-                                            flag_note = " [< 3 months shipments — confirmed initiative/new SKU]" if sku_val in sparse_skus else ""
-                                            exc_store_sal.add_global_exclusion(sku_val, notes=f"Excluded before salience in Step 4{flag_note}")
-                                            newly_excluded.add(sku_val)
-                                st.session_state.exc_store = exc_store_sal
-                                if newly_excluded:
-                                    st.success(f"✅ {len(newly_excluded)} SFU_v value(s) marked for exclusion: {', '.join(sorted(newly_excluded))}")
-                                else:
-                                    st.info("No exclusions set — all SFU_v values will be included in salience.")
-                                st.rerun()
-
-                            # Summary of currently excluded SKUs
-                            current_excl = exc_store_sal.global_exclusions & (
-                                set(excl_display[sku_col_excl].dropna().astype(str).tolist())
-                                if sku_col_excl in excl_display.columns else set()
-                            )
-                            if current_excl:
-                                st.warning(
-                                    f"⚠️ **{len(current_excl)} SFU_v value(s) currently excluded** "
-                                    f"(will be skipped in salience): "
-                                    f"{', '.join(sorted(current_excl))}"
-                                )
-                        else:
-                            st.info("No SFU_v data available — complete Step 3 first.")
-                    else:
-                        if sku_df_excl is not None and not sku_df_excl.empty and not sku_col_excl:
-                            st.warning(
-                                "Could not find a valid SKU/SFU column in the filtered data. "
-                                "Please check column mappings in Step 2."
-                            )
-                        else:
-                            st.info("No SFU_v data loaded yet — complete Step 3 first.")
-
-                with tab_excl_upload:
-                    st.markdown(
-                        "Upload an **Excel file** with excluded SFU_v values and their volumes. "
-                        "The file must have:\n"
-                        "- A column named **`SFU_v`** (or the mapped SFU_v column name for your data)\n"
-                        "- Month columns in `Mmm-YY` format (e.g. `Jan-26`, `Feb-26`) with the volumes to allocate\n\n"
-                        "These SFU_v values will be **globally excluded from the salience split** and their volumes will be "
-                        "loaded as **fixed allocations** in the exception store."
-                    )
-                    st.download_button(
-                        label="📥 Download template",
-                        data=_build_exclusion_upload_template(sku_col_excl, st.session_state.get("sas_months_selected", [])),
-                        file_name="exclusions_template.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
-                    excl_upload_file = st.file_uploader(
-                        "Upload exclusions Excel",
-                        type=["xlsx", "xls"],
-                        key="excl_upload_file",
-                    )
-                    if excl_upload_file is not None:
-                        try:
-                            excl_up_df = pd.read_excel(excl_upload_file)
-                            # Normalise SKU column name
-                            sku_col_candidates = [sku_col_excl, MONTHLY_SFU_VERSION_COL, "SFU_v", "SKU"]
-                            found_sku_col = next((c for c in sku_col_candidates if c in excl_up_df.columns), None)
-                            if found_sku_col is None:
-                                st.error(f"Could not find a SKU column in the uploaded file. Expected one of: {sku_col_candidates}")
-                            else:
-                                month_cols_up = [
-                                    c for c in excl_up_df.columns
-                                    if c != found_sku_col and parse_month_to_date(c) is not None
-                                ]
-                                if not month_cols_up:
-                                    st.warning("No month columns detected in the uploaded file. Ensure columns are in `Mmm-YY` format.")
-                                else:
-                                    st.success(
-                                        f"Detected **{len(excl_up_df)} SKU row(s)** and "
-                                        f"**{len(month_cols_up)} month column(s)**: {', '.join(month_cols_up)}"
-                                    )
-                                    st.dataframe(
-                                        _add_product_description(excl_up_df[[found_sku_col] + month_cols_up]).head(20),
-                                        width='stretch'
-                                    )
-
-                                    if st.button("✅ Apply Uploaded Exclusions + Volumes", key="apply_excl_upload"):
-                                        applied_skus = set()
-                                        for _, urow in excl_up_df.iterrows():
-                                            sku_v = str(urow[found_sku_col])
-                                            if not sku_v or sku_v == "nan":
-                                                continue
-                                            # Globally exclude this SKU
-                                            exc_store_sal.add_global_exclusion(
-                                                sku_v,
-                                                notes="Excluded via uploaded exclusions Excel (Step 4)"
-                                            )
-                                            applied_skus.add(sku_v)
-                                            # Load fixed volumes per month (stored under a special bb_id = "__uploaded__")
-                                            for mc in month_cols_up:
-                                                qty_val = pd.to_numeric(urow.get(mc, 0), errors="coerce")
-                                                if not pd.isna(qty_val) and qty_val != 0:
-                                                    exc_store_sal.set_fixed_qty(
-                                                        "__uploaded__",
-                                                        sku_v,
-                                                        mc,
-                                                        float(qty_val),
-                                                        notes="Volume from uploaded exclusions Excel",
-                                                    )
-                                        st.session_state.exc_store = exc_store_sal
-                                        st.success(
-                                            f"✅ {len(applied_skus)} SKU(s) excluded and volumes loaded: "
-                                            f"{', '.join(sorted(applied_skus))}"
-                                        )
-                                        st.rerun()
-                        except Exception as _exc_up_err:
-                            st.error(f"Error reading uploaded file: {_exc_up_err}")
+                st.caption("Exclusion editing lives in Step 4. Step 5 uses those saved exclusions to scope the live salience preview.")
 
                 # ── Compute button ───────────────────────────────────────────
                 if st.button("✅ Compute BOP Salience (SFU Level)", type="primary"):
@@ -3074,8 +3174,8 @@ def step4_salience():
                 st.success("Overrides saved. Click 'Compute Historical Salience' again to refresh.")
 
     if st.button("Confirm Salience →", type="primary", disabled=(sal_df is None)):
-        st.session_state.step = max(st.session_state.step, 5)
-        st.session_state.max_step = max(st.session_state.max_step, 5)
+        st.session_state.step = max(st.session_state.step, 6)
+        st.session_state.max_step = max(st.session_state.max_step, 6)
         st.rerun()
 
 
@@ -3329,10 +3429,14 @@ def _apply_planner_redistribution(
 # Exceptions panel (merged into Step 4)
 # ──────────────────────────────────────────────────────────────────────────────
 def render_exceptions_panel():
-    st.markdown("#### Per-BB Exceptions & Log (formerly Step 5)")
+    st.markdown("#### Step 4 Exception Controls")
     exc_store: ExceptionStore = st.session_state.exc_store
     hcm = hier_col_map_from_state()
     sku_col = hcm.get("SFU_v") or hcm.get("SKU") or MONTHLY_SFU_VERSION_COL
+    sas_cmap = st.session_state.col_maps.get("SAS", {})
+    bb_split_levels = st.session_state.get("bb_split_levels", {})
+    split_level_default = st.session_state.get("split_level", "Form")
+    bb_id_col = st.session_state.bb_id_col or "BB_ID"
 
     sku_filtered = st.session_state.sku_df_filtered
     sas_filtered = st.session_state.sas_df_filtered
@@ -3355,184 +3459,268 @@ def render_exceptions_panel():
     else:
         st.caption("Exceptions status: no SFU_v column resolved from filtered data")
 
+    desc_map = _latest_product_description_map()
+
+    def _format_sku_option(sku_value: str) -> str:
+        sku_norm = str(sku_value).strip()
+        desc = str(desc_map.get(sku_norm, "")).strip()
+        return f"{sku_norm} ({desc})" if desc else sku_norm
+
+    def _match_skus_for_bb(bb_id: str) -> list[str]:
+        if (
+            not bb_id
+            or sku_filtered is None
+            or sku_filtered.empty
+            or sas_filtered is None
+            or sas_filtered.empty
+            or not resolved_sku_col
+            or resolved_sku_col not in sku_filtered.columns
+            or bb_id_col not in sas_filtered.columns
+        ):
+            return []
+
+        bb_rows = sas_filtered[sas_filtered[bb_id_col].astype(str) == str(bb_id)]
+        if bb_rows.empty:
+            return []
+        bb_row = bb_rows.iloc[0]
+
+        specific_sfuv_col = sas_cmap.get("SFU_v") or sas_cmap.get("SKU")
+        if specific_sfuv_col not in sas_filtered.columns:
+            specific_sfuv_col = None
+
+        pinned_sfuv = str(bb_row.get(specific_sfuv_col, "")).strip() if specific_sfuv_col else ""
+        if pinned_sfuv and pinned_sfuv.lower() != "nan":
+            candidate_cols = [
+                resolved_sku_col,
+                MONTHLY_SFU_VERSION_COL,
+                hcm.get("SFU_v"),
+                hcm.get("SKU"),
+                "SFU_v",
+                "SKU",
+            ]
+            candidate_cols = [c for c in dict.fromkeys(candidate_cols) if c and c in sku_filtered.columns]
+            if not candidate_cols:
+                return []
+            mask = pd.Series([False] * len(sku_filtered), index=sku_filtered.index)
+            for col in candidate_cols:
+                mask |= sku_filtered[col].astype(str).str.strip() == pinned_sfuv
+            matched_rows = sku_filtered[mask]
+        else:
+            bb_level = bb_split_levels.get(str(bb_id), split_level_default)
+            bb_group_keys_logical = [k for k in SPLIT_KEYS.get(bb_level, []) if k != "SFU_v"]
+            bb_sas_keys = [sas_cmap.get(k, k) for k in bb_group_keys_logical]
+            bb_sku_keys = [hcm.get(k, k) for k in bb_group_keys_logical]
+
+            if any(col not in sku_filtered.columns for col in bb_sku_keys):
+                return []
+
+            mask = pd.Series([True] * len(sku_filtered), index=sku_filtered.index)
+            for sas_col, sku_col_name in zip(bb_sas_keys, bb_sku_keys):
+                mask &= sku_filtered[sku_col_name].astype(str).str.strip() == str(bb_row.get(sas_col, "")).strip()
+            matched_rows = sku_filtered[mask]
+
+        if matched_rows.empty:
+            return []
+
+        return sorted(matched_rows[resolved_sku_col].dropna().astype(str).str.strip().unique().tolist())
+
+    def _exception_log_key(row: pd.Series) -> str:
+        parts = [
+            str(row.get("timestamp", "")),
+            str(row.get("scope", "")),
+            str(row.get("bb_id", "")),
+            str(row.get("sku", "")),
+            str(row.get("exc_type", "")),
+            str(row.get("old_value", "")),
+            str(row.get("new_value", "")),
+            str(row.get("notes", "")),
+        ]
+        return "|".join(parts)
+
     # ── GBB action banners ────────────────────────────────────────────────────
     gbb_actions: dict[str, str] = st.session_state.get("gbb_actions", {})
     gbb_types: dict[str, str] = st.session_state.get("gbb_types", {})
     exception_bbs = [bid for bid, act in gbb_actions.items() if act == "exceptions"]
     ignore_bbs = [bid for bid, act in gbb_actions.items() if act == "ignore"]
 
-    if exception_bbs or ignore_bbs:
-        with st.expander("⚠️ GBB Type actions required — click to review", expanded=True):
-            if ignore_bbs:
-                st.error(
-                    f"**{len(ignore_bbs)} Building Block(s) flagged as *Ignore* (Initiatives):** "
-                    "Select which SFU_v values should be **included** for BB split handling for each Initiative BB. "
-                    f"BBs: `{'`, `'.join(ignore_bbs)}`"
+    st.markdown("#### Initiative Exclusion")
+    if ignore_bbs:
+        with st.expander("⚠️ Initiative Exclusion — click to review", expanded=True):
+            st.error(
+                f"**{len(ignore_bbs)} Building Block(s) flagged as *Ignore* (Initiatives):** "
+                "Select which SFU_v values should still be included for BB split handling. "
+                f"BBs: `{'`, `'.join(ignore_bbs)}`"
+            )
+            if all_skus:
+                sel_ignore_bb = st.selectbox(
+                    "Select Initiative BB",
+                    ignore_bbs,
+                    key="ignore_bb_selector",
                 )
-                if all_skus:
-                    sel_ignore_bb = st.selectbox(
-                        "Select Initiative BB",
-                        ignore_bbs,
-                        key="ignore_bb_selector",
+                matched_ignore_skus = _match_skus_for_bb(sel_ignore_bb)
+                cur_ignore_inc = sorted([
+                    s for s in exc_store.bb_exceptions.get(sel_ignore_bb, {}).get("include", set())
+                    if s in matched_ignore_skus
+                ])
+                if matched_ignore_skus:
+                    st.caption(
+                        f"Showing **{len(matched_ignore_skus)}** SFU_v values that match this BB's split granularity. "
+                        "All of them remain globally excluded by default."
                     )
-                    cur_ignore_inc = sorted([
-                        s for s in exc_store.bb_exceptions.get(sel_ignore_bb, {}).get("include", set())
-                        if s in all_skus
-                    ])
-                    selected_ignore_include_skus = st.multiselect(
-                        "SFU_v values to include for this Initiative BB split",
-                        all_skus,
-                        default=cur_ignore_inc,
-                        key="ignore_bb_sku_selector",
-                        help="Selected SFU_v values are saved as BB-specific includes for this Initiative BB and will be excluded from the global split.",
-                    )
-                    if st.button("Save Initiative Includes", key="gbb_add_ignore"):
-                        note = (
-                            f"Initiatives BB — include for BB split handling. "
-                            f"GBB Type: {gbb_types.get(sel_ignore_bb, 'Initiatives')}"
-                        )
-                        # Clear any prior broad exclusion markers for this BB, then set include list.
-                        exc_store.remove_bb_exclude(sel_ignore_bb, ExceptionStore.ALL_SKU_SENTINEL)
-                        for sku in all_skus:
-                            exc_store.remove_bb_exclude(sel_ignore_bb, sku)
-                            exc_store.remove_bb_include(sel_ignore_bb, sku)
-
-                        for sku in selected_ignore_include_skus:
-                            exc_store.add_bb_include(sel_ignore_bb, sku, notes=note)
-                            # Exclude chosen initiative SKUs from global split.
-                            exc_store.add_global_exclusion(sku)
-
-                        st.success(
-                            f"Saved {len(selected_ignore_include_skus)} initiative include SFU_v value(s) for BB {sel_ignore_bb}."
-                        )
-                        st.rerun()
                 else:
-                    st.warning(
-                        "No SFU_v column resolved in exceptions data. Please verify SFU_v mapping in Step 2 "
-                        "to select initiative values."
+                    st.warning("No matching SFU_v values were found for this Initiative BB at its current split granularity.")
+                selected_ignore_include_skus = st.multiselect(
+                    "SFU_v values to include for this Initiative BB split",
+                    matched_ignore_skus,
+                    default=cur_ignore_inc,
+                    key="ignore_bb_sku_selector",
+                    format_func=_format_sku_option,
+                    help="Selected SFU_v values are saved as BB-specific includes for this Initiative BB while all initiative SKUs stay globally excluded by default.",
+                )
+                if st.button("Save Initiative Exclusion", key="gbb_add_ignore"):
+                    note = (
+                        f"Initiatives BB — include for BB split handling. "
+                        f"GBB Type: {gbb_types.get(sel_ignore_bb, 'Initiatives')}"
                     )
+                    exc_store.remove_bb_exclude(sel_ignore_bb, ExceptionStore.ALL_SKU_SENTINEL)
+                    for sku in matched_ignore_skus:
+                        exc_store.remove_bb_exclude(sel_ignore_bb, sku)
+                        exc_store.remove_bb_include(sel_ignore_bb, sku)
+                        exc_store.add_global_exclusion(sku, notes="Initiative SKU — globally excluded by default")
 
-            if exception_bbs:
+                    for sku in selected_ignore_include_skus:
+                        exc_store.add_bb_include(sel_ignore_bb, sku, notes=note)
+
+                    st.success(
+                        f"Saved {len(selected_ignore_include_skus)} initiative include SFU_v value(s) for BB {sel_ignore_bb}."
+                    )
+                    st.rerun()
+            else:
                 st.warning(
-                    f"**{len(exception_bbs)} Building Block(s) require SFU_v selection** "
-                    f"(Promotions / New Channels): `{'`, `'.join(exception_bbs)}`  \n"
-                    "Use the **Per-BB Exceptions** tab below to specify which SFU_v values should receive allocation."
+                    "No SFU_v column resolved in exceptions data. Please verify SFU_v mapping in Step 2 "
+                    "to select initiative values."
+                )
+    else:
+        st.caption("No initiative exclusions require review for the current filtered dataset.")
+
+    st.divider()
+    override_count = sum(
+        1
+        for values in exc_store.bb_exceptions.values()
+        if values.get("include") or values.get("exclude")
+    )
+    st.markdown(f"#### Manage Per-BB Exceptions ({override_count} BB(s) with overrides)")
+    if exception_bbs:
+        st.warning(
+            f"**{len(exception_bbs)} Building Block(s) require SFU_v selection** "
+            f"(Promotions / New Channels): `{'`, `'.join(exception_bbs)}`"
+        )
+
+    if sas_filtered is None or sas_filtered.empty:
+        st.warning("No SAS data loaded.")
+    else:
+        bb_id_col = st.session_state.bb_id_col or "BB_ID"
+        bb_ids = sas_filtered[bb_id_col].astype(str).tolist() if bb_id_col in sas_filtered.columns else []
+
+        selected_bb = st.selectbox("Select Building Block", bb_ids, key="exc_bb_sel")
+        if selected_bb:
+            st.caption(f"**BB_ID:** `{selected_bb}`")
+            bb_row = sas_filtered[sas_filtered[bb_id_col].astype(str) == selected_bb].iloc[0] if len(sas_filtered[sas_filtered[bb_id_col].astype(str) == selected_bb]) > 0 else None
+            if bb_row is not None:
+                hier_info = {lh: bb_row.get(hcm.get(lh, ""), "") for lh in LOGICAL_HIER if hcm.get(lh)}
+                st.json(hier_info)
+
+            matched_bb_skus = _match_skus_for_bb(selected_bb)
+            if matched_bb_skus:
+                st.caption(f"Showing **{len(matched_bb_skus)}** SFU_v values that match this BB's split granularity.")
+            else:
+                st.warning("No matching SFU_v values were found for this Building Block at its current split granularity.")
+
+            exc_bb = exc_store.bb_exceptions.get(selected_bb, {})
+            cur_include = [s for s in exc_bb.get("include", set()) if s in matched_bb_skus]
+            cur_exclude = [
+                s for s in exc_bb.get("exclude", set())
+                if s != ExceptionStore.ALL_SKU_SENTINEL and s in matched_bb_skus
+            ]
+
+            c1, c2 = st.columns(2)
+
+            with c1:
+                st.markdown("**Force Include SFU_vs**")
+                new_include = st.multiselect(
+                    "Include",
+                    matched_bb_skus,
+                    default=cur_include,
+                    key=f"inc_{selected_bb}",
+                    format_func=_format_sku_option,
+                )
+            with c2:
+                st.markdown("**Force Exclude SFU_vs**")
+                new_exclude = st.multiselect(
+                    "Exclude",
+                    matched_bb_skus,
+                    default=cur_exclude,
+                    key=f"exc_{selected_bb}",
+                    format_func=_format_sku_option,
                 )
 
-    tab_global, tab_bb, tab_log = st.tabs(["Global Exclusions", "Per-BB Exceptions", "Exception Log"])
+            notes = st.text_input("Notes (optional)", key=f"exc_notes_{selected_bb}")
 
-    # ---- Global exclusions ----
-    with tab_global:
-        st.subheader("Globally Excluded SFU_vs")
-        st.caption("These SFU_vs will never receive allocation in any split.")
-        new_excl = st.multiselect("Add global exclusions", all_skus, default=list(exc_store.global_exclusions), key="global_excl_sel")
-        if st.button("Save Global Exclusions", key="save_global_excl"):
-            # Add newly selected
-            for sku in new_excl:
-                if sku not in exc_store.global_exclusions:
-                    exc_store.add_global_exclusion(sku)
-            # Remove deselected
-            for sku in list(exc_store.global_exclusions):
-                if sku not in new_excl:
-                    exc_store.remove_global_exclusion(sku)
-            st.success(f"Global exclusions updated: {len(exc_store.global_exclusions)} SFU_v(s)")
+            if st.button("Save BB Exceptions", key=f"save_bb_{selected_bb}"):
+                old_include = set(exc_store.bb_exceptions.get(selected_bb, {}).get("include", set()))
+                for sku in set(new_include) - old_include:
+                    exc_store.add_bb_include(selected_bb, sku, notes)
+                for sku in old_include - set(new_include):
+                    exc_store.remove_bb_include(selected_bb, sku)
 
-    # ---- Per-BB exceptions ----
-    with tab_bb:
-        st.subheader("Per Building-Block Exceptions")
-        if sas_filtered is None or sas_filtered.empty:
-            st.warning("No SAS data loaded.")
-        else:
-            bb_id_col = st.session_state.bb_id_col or "BB_ID"
-            bb_ids = sas_filtered[bb_id_col].astype(str).tolist() if bb_id_col in sas_filtered.columns else []
-
-            selected_bb = st.selectbox("Select Building Block", bb_ids, key="exc_bb_sel")
-            if selected_bb:
-                st.caption(f"**BB_ID:** `{selected_bb}`")
-                bb_row = sas_filtered[sas_filtered[bb_id_col].astype(str) == selected_bb].iloc[0] if len(sas_filtered[sas_filtered[bb_id_col].astype(str) == selected_bb]) > 0 else None
-                if bb_row is not None:
-                    hier_info = {lh: bb_row.get(hcm.get(lh, ""), "") for lh in LOGICAL_HIER if hcm.get(lh)}
-                    st.json(hier_info)
-
-                exc_bb = exc_store.bb_exceptions.get(selected_bb, {})
-                cur_include = list(exc_bb.get("include", set()))
-                cur_exclude = [
-                    s for s in exc_bb.get("exclude", set())
+                old_exclude = {
+                    s for s in set(exc_store.bb_exceptions.get(selected_bb, {}).get("exclude", set()))
                     if s != ExceptionStore.ALL_SKU_SENTINEL
-                ]
-                cur_fixed = exc_bb.get("fixed_qty", {})
+                }
+                for sku in set(new_exclude) - old_exclude:
+                    exc_store.add_bb_exclude(selected_bb, sku, notes)
+                for sku in old_exclude - set(new_exclude):
+                    exc_store.remove_bb_exclude(selected_bb, sku)
 
-                c1, c2 = st.columns(2)
+                st.success("BB exceptions saved.")
 
-                with c1:
-                    st.markdown("**Force Include SFU_vs**")
-                    new_include = st.multiselect("Include", all_skus, default=cur_include, key=f"inc_{selected_bb}")
-                with c2:
-                    st.markdown("**Force Exclude SFU_vs**")
-                    new_exclude = st.multiselect("Exclude", all_skus, default=cur_exclude, key=f"exc_{selected_bb}")
-
-                # Fixed quantities
-                st.markdown("**Fixed Quantity Allocations** (by SFU_v × Month)")
-                sas_months = st.session_state.sas_months_selected or []
-                if sas_months:
-                    fixed_skus = st.multiselect("SKUs with fixed qty", all_skus, default=list(cur_fixed.keys()), key=f"fq_skus_{selected_bb}")
-                    if fixed_skus:
-                        fq_data = []
-                        for sku in fixed_skus:
-                            row_data = {"SKU": sku}
-                            for m in sas_months:
-                                row_data[m] = cur_fixed.get(sku, {}).get(m, 0.0)
-                            fq_data.append(row_data)
-                        fq_df = pd.DataFrame(fq_data)
-                        edited_fq = st.data_editor(fq_df, width='stretch', key=f"fq_editor_{selected_bb}", num_rows="fixed")
-                    else:
-                        edited_fq = None
-                else:
-                    st.caption("Select SAS months in Step 4 first.")
-                    edited_fq = None
-
-                notes = st.text_input("Notes (optional)", key=f"exc_notes_{selected_bb}")
-
-                if st.button("Save BB Exceptions", key=f"save_bb_{selected_bb}"):
-                    # Include
-                    old_include = set(exc_store.bb_exceptions.get(selected_bb, {}).get("include", set()))
-                    for sku in set(new_include) - old_include:
-                        exc_store.add_bb_include(selected_bb, sku, notes)
-                    for sku in old_include - set(new_include):
-                        exc_store.remove_bb_include(selected_bb, sku)
-                    # Exclude
-                    old_exclude = {
-                        s for s in set(exc_store.bb_exceptions.get(selected_bb, {}).get("exclude", set()))
-                        if s != ExceptionStore.ALL_SKU_SENTINEL
-                    }
-                    for sku in set(new_exclude) - old_exclude:
-                        exc_store.add_bb_exclude(selected_bb, sku, notes)
-                    for sku in old_exclude - set(new_exclude):
-                        exc_store.remove_bb_exclude(selected_bb, sku)
-                    # Fixed qty
-                    if edited_fq is not None:
-                        for _, fq_row in edited_fq.iterrows():
-                            sku_v = fq_row["SKU"]
-                            for m in sas_months:
-                                qty = fq_row.get(m, 0.0)
-                                if qty and float(qty) != 0.0:
-                                    exc_store.set_fixed_qty(selected_bb, sku_v, m, float(qty), notes)
-                    st.success("BB exceptions saved.")
-
-    # ---- Log ----
-    with tab_log:
-        st.subheader("Exception Log")
-        log_df = exc_store.log_as_df()
-        if log_df.empty:
-            st.info("No exceptions logged yet.")
-        else:
-            st.dataframe(log_df, width='stretch')
+    st.divider()
+    st.markdown("#### Exception Log")
+    st.caption("Review the saved exception actions below and add optional remarks before moving to Step 5.")
+    log_df = exc_store.log_as_df()
+    if log_df.empty:
+        st.info("No exceptions logged yet.")
+    else:
+        log_df = log_df.copy()
+        log_remarks = st.session_state.get("exception_log_remarks", {})
+        log_df["Remarks"] = log_df.apply(
+            lambda row: log_remarks.get(_exception_log_key(row), ""),
+            axis=1,
+        )
+        edited_log = st.data_editor(
+            log_df,
+            width='stretch',
+            num_rows="fixed",
+            key="exception_log_editor",
+            disabled=[c for c in log_df.columns if c != "Remarks"],
+            column_config={
+                "Remarks": st.column_config.TextColumn(
+                    "Remarks",
+                    help="Optional user notes for remembering why this exception was captured.",
+                ),
+                "notes": st.column_config.TextColumn("Notes", disabled=True),
+            },
+        )
+        st.session_state.exception_log_remarks = {
+            _exception_log_key(row): str(edited_log.iloc[idx].get("Remarks", ""))
+            for idx, (_, row) in enumerate(log_df.iterrows())
+        }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# STEP 5 – Run Split
+# STEP 6 – Run Split
 # ──────────────────────────────────────────────────────────────────────────────
 def step6_run():
-    st.header("Step 5 — Run Split")
+    st.header("Step 6 — Run Split")
 
     # Pre-flight checks
     issues = []
@@ -3541,7 +3729,7 @@ def step6_run():
     if st.session_state.sku_df_filtered is None:
         issues.append("No SFU_v data — complete Steps 1-3")
     if st.session_state.salience_df is None:
-        issues.append("Salience not computed — complete Step 4")
+        issues.append("Salience not computed — complete Step 5")
     if not st.session_state.sas_months_selected:
         issues.append("No SAS months selected — complete Step 3")
 
@@ -3878,7 +4066,7 @@ def step6_run():
                         st.warning("""
                         **No Salience Data for Matched SKUs:**
                         - Your SKUs match hierarchically and are eligible, but have zero salience values
-                        - Check the **Live Preview** in Step 4: Do these SFU_vs have "N/A" or 0 Final Basis?
+                        - Check the **Live Preview** in Step 5: Do these SFU_vs have "N/A" or 0 Final Basis?
                         - If Final Basis is N/A, select a different **Basis / Metric** or **Basis Window**
                         - Check the **Basis Status** column for specific failure reasons
                         """)
@@ -3979,8 +4167,8 @@ def step6_run():
         else:
             st.success("No validation issues.")
 
-        st.session_state.step = max(st.session_state.step, 6)
-        st.session_state.max_step = max(st.session_state.max_step, 6)
+        st.session_state.step = max(st.session_state.step, 7)
+        st.session_state.max_step = max(st.session_state.max_step, 7)
 
     # Preview if already run
     if st.session_state.output_wide is not None:
@@ -4149,16 +4337,16 @@ def step6_run():
                 )
 
         if st.button("Proceed to Reasonability Check →", type="primary"):
-            st.session_state.step = max(st.session_state.step, 6)
-            st.session_state.max_step = max(st.session_state.max_step, 6)
+            st.session_state.step = max(st.session_state.step, 7)
+            st.session_state.max_step = max(st.session_state.max_step, 7)
             st.rerun()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# STEP 6 – Reasonability Check
+# STEP 7 – Reasonability Check
 # ──────────────────────────────────────────────────────────────────────────────
 def step7_reasonability():
-    st.header("Step 6 — Reasonability Check")
+    st.header("Step 7 — Reasonability Check")
     st.caption(
         "Review the split output against historical actuals. "
         "Cells highlighted in **🔵 blue** are above the upper tolerance; "
@@ -4167,7 +4355,7 @@ def step7_reasonability():
 
     output_wide = st.session_state.output_wide_final if st.session_state.output_wide_final is not None else st.session_state.output_wide
     if output_wide is None or output_wide.empty:
-        st.warning("No split output yet — complete Step 5 first.")
+        st.warning("No split output yet — complete Step 6 first.")
         return
 
     # ── Controls ──────────────────────────────────────────────────────────────
@@ -4424,8 +4612,8 @@ def step7_reasonability():
         st.caption("_Last BOP sheet not loaded — upload a file containing a 'Last BOP' sheet to see the Last BOP + adjustments view._")
 
     if st.button("Proceed to Download →", type="primary"):
-        st.session_state.step = max(st.session_state.step, 7)
-        st.session_state.max_step = max(st.session_state.max_step, 7)
+        st.session_state.step = max(st.session_state.step, 8)
+        st.session_state.max_step = max(st.session_state.max_step, 8)
         st.rerun()
 
 
@@ -4815,13 +5003,13 @@ def build_da_csv_export(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# STEP 7 – Download
+# STEP 8 – Download
 # ──────────────────────────────────────────────────────────────────────────────
 def step7_download():
-    st.header("Step 7 — Download Results")
+    st.header("Step 8 — Download Results")
 
     if st.session_state.output_wide is None and st.session_state.output_wide_final is None:
-        st.warning("No output yet — complete Step 5.")
+        st.warning("No output yet — complete Step 6.")
         return
 
     output_wide = st.session_state.output_wide_final if st.session_state.output_wide_final is not None else st.session_state.output_wide
@@ -4960,12 +5148,14 @@ def main():
     elif step == 3:
         step3_filters()
     elif step == 4:
-        step4_salience()
+        step4_exclusions()
     elif step == 5:
-        step6_run()
+        step4_salience()
     elif step == 6:
+        step6_run()
+    elif step == 7:
         step7_reasonability()
-    elif step >= 7:
+    elif step >= 8:
         step7_download()
 
     # Auto-save session state so a browser refresh restores progress
