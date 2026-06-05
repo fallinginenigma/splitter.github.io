@@ -197,6 +197,7 @@ def run_split(
     shipments_df: pd.DataFrame | None = None,  # Historical Shipments for 12-month fallback
     fff_df: pd.DataFrame | None = None,  # Existing Final Fcst to Finance values for upload-delta logic
     all_sas_months: list[str] | None = None,  # All SAS months (including past) to detect FY
+    monthly_salience: dict[str, dict[str, float]] | None = None,  # month -> {SFU_v: salience_fraction}
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Perform the split.
@@ -218,6 +219,7 @@ def run_split(
     bb_split_levels = bb_split_levels or {}
     sas_hier_col_map = sas_hier_col_map or {}
     validation_issues = []
+    monthly_salience = monthly_salience or {}
 
     def _month_ts(month_str: str) -> pd.Timestamp | None:
         try:
@@ -526,10 +528,16 @@ def run_split(
 
             proportional_sfuvs = [s for s in eligible_sfuvs if s not in fixed_alloc]
 
-            # Resolve scalar salience for each proportional SFU_v
+            # Resolve month-specific salience first; fall back to scalar salience.
+            month_sal_lookup = monthly_salience.get(month, {}) if monthly_salience else {}
             sal_vals: dict[str, float] = {}
             for sfuv_val in proportional_sfuvs:
-                sal_vals[sfuv_val] = float(bb_sal_lookup.get(sfuv_val, 0.0))
+                sfuv_key_norm = _norm(sfuv_val)
+                monthly_weight = pd.to_numeric(month_sal_lookup.get(sfuv_key_norm), errors="coerce")
+                if pd.notna(monthly_weight):
+                    sal_vals[sfuv_val] = float(monthly_weight)
+                else:
+                    sal_vals[sfuv_val] = float(bb_sal_lookup.get(sfuv_val, 0.0))
             sal_total = sum(sal_vals.values())
 
             for sfuv_val in eligible_sfuvs:

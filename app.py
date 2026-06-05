@@ -177,7 +177,10 @@ def _init_state():
         "sfu_basis_overrides": {},    # SFU_SFU Version -> optional manual final basis override
         "sfu_manual_months": [],      # Global manual month selector for SFU basis (legacy)
         "sfu_specific_months": {},    # SFU_SFU Version -> list[str] of manually chosen months
+        "sfu_monthly_salience": {},   # SFU_SFU Version -> {month: salience_fraction}
         "sfu_remarks": {},            # SFU_SFU Version -> user remarks string
+        "step5_brand_filter": [],     # Step 5 live preview filter by Brand
+        "step5_form_filter": [],      # Step 5 live preview filter by Form
         "exception_log_remarks": {},  # exception log row key -> user remark string
         "filters": {},
         "step": 1,
@@ -2606,7 +2609,8 @@ def step4_salience():
 
     # ── BOP Auto-Salience from historical data (Shipments-based, SFU level) ──
     if st.session_state.get("_is_bop"):
-        with st.expander("BOP Auto-Salience — Basis & Salience Configuration (SFU Level)", expanded=True):
+        st.subheader("BOP Auto-Salience — Basis & Salience Configuration (SFU Level)")
+        with st.container():
             st.caption(
                 "Configure the **Basis / Metric** and **Basis Window** for each SFU Version. "
                 "The table previews the last 6 historical months of that basis, "
@@ -2769,6 +2773,47 @@ def step4_salience():
                             "Form": str(meta_row.get(preview_form_col, "") or "") if preview_form_col else "",
                         }
 
+                available_brands = sorted(
+                    {
+                        m.get("Brand", "")
+                        for v, m in preview_meta_map.items()
+                        if v in sfu_versions and str(m.get("Brand", "")).strip()
+                    }
+                )
+                available_forms = sorted(
+                    {
+                        m.get("Form", "")
+                        for v, m in preview_meta_map.items()
+                        if v in sfu_versions and str(m.get("Form", "")).strip()
+                    }
+                )
+                filter_col1, filter_col2 = st.columns(2)
+                with filter_col1:
+                    selected_brands = st.multiselect(
+                        "Filter Brand",
+                        options=available_brands,
+                        key="step5_brand_filter",
+                        help="Filter the Step 5 tables by Brand.",
+                    )
+                with filter_col2:
+                    selected_forms = st.multiselect(
+                        "Filter Form",
+                        options=available_forms,
+                        key="step5_form_filter",
+                        help="Filter the Step 5 tables by Form.",
+                    )
+
+                filtered_sfu_versions: list[str] = []
+                for v in sfu_versions:
+                    meta = preview_meta_map.get(v, {})
+                    brand_v = str(meta.get("Brand", "") or "")
+                    form_v = str(meta.get("Form", "") or "")
+                    if selected_brands and brand_v not in selected_brands:
+                        continue
+                    if selected_forms and form_v not in selected_forms:
+                        continue
+                    filtered_sfu_versions.append(v)
+
                 # ── Helper: compute basis value for one SFU from a source df ─
                 def _sfu_basis_with_reason(sfu_ver: str, src_role: str, mode_key: str, sel_months: list[str]) -> tuple[float, str]:
                     src_df = _get_df(src_role)
@@ -2900,7 +2945,8 @@ def step4_salience():
 
                 # Build preview rows
                 preview_rows = []
-                for v, cfg_p in preview_configs.items():
+                for v in filtered_sfu_versions:
+                    cfg_p = preview_configs.get(v, {})
                     src_role = cfg_p["source"]
                     meta_row = preview_meta_map.get(v, {})
                     row_p: dict = {
@@ -2935,6 +2981,20 @@ def step4_salience():
                     preview_rows.append(row_p)
 
                 preview_df = pd.DataFrame(preview_rows)
+                required_preview_cols = [
+                    "SFU_SFU Version",
+                    "Brand",
+                    "Form",
+                    "Basis / Metric",
+                    "Basis Window",
+                    "Final Basis",
+                    "Basis Status",
+                    "Salience %",
+                    "Remarks",
+                ] + preview_labels
+                for col in required_preview_cols:
+                    if col not in preview_df.columns:
+                        preview_df[col] = np.nan if col in (preview_labels + ["Final Basis", "Salience %"]) else ""
 
                 # Build column config for preview table
                 preview_col_cfg: dict = {
@@ -2991,6 +3051,13 @@ def step4_salience():
                     num_rows="fixed",
                 )
 
+                st.download_button(
+                    label="Download Live Preview CSV",
+                    data=edited_preview.to_csv(index=False).encode("utf-8"),
+                    file_name=f"step5_live_preview_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                    mime="text/csv",
+                )
+
                 # Persist live config edits from preview table so calculated columns refresh.
                 edited_configs: dict[str, dict] = {}
                 for _, r in edited_preview.iterrows():
@@ -3005,8 +3072,10 @@ def step4_salience():
                         "selected": saved_specific.get(v, []) if mode_val == "selected" else [],
                     }
 
-                if edited_configs != preview_configs:
-                    st.session_state.sfu_basis_sources = edited_configs
+                merged_configs = dict(preview_configs)
+                merged_configs.update(edited_configs)
+                if merged_configs != preview_configs:
+                    st.session_state.sfu_basis_sources = merged_configs
                     st.rerun()
 
                 # Persist manual final basis overrides from preview table edits.
@@ -3021,9 +3090,101 @@ def step4_salience():
                         if pd.isna(auto_basis) or abs(float(edited_basis) - float(auto_basis)) > 1e-9:
                             edited_basis_overrides[v] = float(edited_basis)
 
-                if edited_basis_overrides != saved_basis_overrides:
-                    st.session_state.sfu_basis_overrides = edited_basis_overrides
+                merged_basis_overrides = dict(saved_basis_overrides)
+                for v in edited_preview["SFU_SFU Version"].astype(str):
+                    merged_basis_overrides.pop(v, None)
+                merged_basis_overrides.update(edited_basis_overrides)
+
+                if merged_basis_overrides != saved_basis_overrides:
+                    st.session_state.sfu_basis_overrides = merged_basis_overrides
                     st.rerun()
+
+                st.markdown("#### Editable Monthly Salience Matrix (SKU x Month)")
+                split_months = list(st.session_state.get("sas_months_selected", []) or [])
+                if not split_months:
+                    st.info("No forecast months selected yet. Complete Step 3 month selection to edit monthly salience.")
+                else:
+                    st.caption(
+                        "Edit month-level salience in % for each SFU Version. These values are used when BB monthly values are split in Step 6. "
+                        "Within each BB-month, values are normalized across eligible SFU_v rows."
+                    )
+                    saved_monthly_salience = st.session_state.get("sfu_monthly_salience", {})
+                    row_sal_map = {
+                        str(r.get("SFU_SFU Version", "")): float(pd.to_numeric(r.get("Salience %"), errors="coerce") or 0.0)
+                        for _, r in preview_df.iterrows()
+                    }
+                    monthly_rows: list[dict] = []
+                    for _, r in preview_df.iterrows():
+                        sfu_v = str(r.get("SFU_SFU Version", "") or "").strip()
+                        if not sfu_v:
+                            continue
+                        base_pct = row_sal_map.get(sfu_v, 0.0)
+                        stored_for_sfu = saved_monthly_salience.get(sfu_v, {}) if isinstance(saved_monthly_salience.get(sfu_v, {}), dict) else {}
+                        m_row = {
+                            "SFU_SFU Version": sfu_v,
+                            "Product Description": r.get("Product Description", ""),
+                            "Brand": r.get("Brand", ""),
+                            "Form": r.get("Form", ""),
+                        }
+                        for m in split_months:
+                            stored_frac = pd.to_numeric(stored_for_sfu.get(m), errors="coerce")
+                            if pd.notna(stored_frac):
+                                m_row[m] = float(stored_frac) * 100.0
+                            else:
+                                m_row[m] = float(base_pct)
+                        monthly_rows.append(m_row)
+
+                    monthly_df = pd.DataFrame(monthly_rows)
+                    monthly_col_cfg: dict = {
+                        "SFU_SFU Version": st.column_config.TextColumn("SFU_SFU Version", disabled=True),
+                        "Product Description": st.column_config.TextColumn("Product Description", disabled=True),
+                        "Brand": st.column_config.TextColumn("Brand", disabled=True),
+                        "Form": st.column_config.TextColumn("Form", disabled=True),
+                    }
+                    for m in split_months:
+                        monthly_col_cfg[m] = st.column_config.NumberColumn(f"{m} Salience %", format="%.2f")
+
+                    monthly_editor_cols = [
+                        c for c in ["SFU_SFU Version", "Product Description", "Brand", "Form"] + split_months
+                        if c in monthly_df.columns
+                    ]
+                    if not monthly_rows:
+                        st.info("No SFU_v rows available for the current Brand/Form filter.")
+                        edited_monthly = pd.DataFrame(columns=monthly_editor_cols)
+                    else:
+                        edited_monthly = st.data_editor(
+                            monthly_df[monthly_editor_cols],
+                            column_config=monthly_col_cfg,
+                            disabled=[c for c in monthly_editor_cols if c not in split_months],
+                            width='stretch',
+                            key="sfu_monthly_salience_editor",
+                            height=min(500, 60 + len(monthly_df) * 35),
+                            num_rows="fixed",
+                        )
+
+                    merged_monthly_salience = dict(saved_monthly_salience)
+                    for _, mr in edited_monthly.iterrows():
+                        sfu_v = str(mr.get("SFU_SFU Version", "") or "").strip()
+                        if not sfu_v:
+                            continue
+                        month_map: dict[str, float] = {}
+                        for m in split_months:
+                            pct = pd.to_numeric(mr.get(m), errors="coerce")
+                            if pd.notna(pct):
+                                month_map[m] = max(0.0, float(pct)) / 100.0
+                        if month_map:
+                            merged_monthly_salience[sfu_v] = month_map
+                        else:
+                            merged_monthly_salience.pop(sfu_v, None)
+                    st.session_state.sfu_monthly_salience = merged_monthly_salience
+
+                    if not edited_monthly.empty:
+                        st.download_button(
+                            label="Download SKU x Month Salience CSV",
+                            data=edited_monthly.to_csv(index=False).encode("utf-8"),
+                            file_name=f"step5_sku_monthly_salience_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                            mime="text/csv",
+                        )
 
                 # ── Optional manual month selection ──────────────────────────
                 specific_sfu_rows = [
@@ -3079,7 +3240,7 @@ def step4_salience():
                 # ── Compute button ───────────────────────────────────────────
                 if st.button("✅ Compute BOP Salience (SFU Level)", type="primary"):
                     # Save remarks
-                    new_remarks = {}
+                    new_remarks = dict(saved_remarks)
                     for _, pr in edited_preview.iterrows():
                         new_remarks[pr["SFU_SFU Version"]] = str(pr.get("Remarks", "") or "")
                     st.session_state.sfu_remarks = new_remarks
@@ -3088,7 +3249,7 @@ def step4_salience():
                     st.session_state.sfu_specific_months = new_specific
 
                     # Save configs from the live preview table edits
-                    new_sfu_configs: dict = {}
+                    new_sfu_configs: dict = dict(preview_configs)
                     for _, pr in edited_preview.iterrows():
                         v = str(pr.get("SFU_SFU Version", ""))
                         if not v:
@@ -3102,8 +3263,44 @@ def step4_salience():
                         }
                     st.session_state.sfu_basis_sources = new_sfu_configs
 
+                    # Warn (non-blocking) if SFUs within the same Form use mixed Basis / Metric.
+                    form_col_name = preview_form_col
+                    if form_col_name and sku_for_versions is not None and form_col_name in sku_for_versions.columns and MONTHLY_SFU_VERSION_COL in sku_for_versions.columns:
+                        cfg_by_sfu = {
+                            str(k): str(v.get("source", "")).strip()
+                            for k, v in new_sfu_configs.items()
+                            if isinstance(v, dict)
+                        }
+                        form_sources: dict[str, set[str]] = {}
+                        form_sfus: dict[str, set[str]] = {}
+                        for _, rr in sku_for_versions[[MONTHLY_SFU_VERSION_COL, form_col_name]].dropna(subset=[MONTHLY_SFU_VERSION_COL]).iterrows():
+                            sfu_v = str(rr.get(MONTHLY_SFU_VERSION_COL, "") or "").strip()
+                            form_v = str(rr.get(form_col_name, "") or "").strip()
+                            if not sfu_v or not form_v:
+                                continue
+                            src_v = cfg_by_sfu.get(sfu_v, "")
+                            if not src_v:
+                                continue
+                            form_sources.setdefault(form_v, set()).add(src_v)
+                            form_sfus.setdefault(form_v, set()).add(sfu_v)
+
+                        inconsistent = [
+                            (form_v, sorted(list(srcs)), sorted(list(form_sfus.get(form_v, set()))))
+                            for form_v, srcs in form_sources.items()
+                            if len(srcs) > 1
+                        ]
+                        if inconsistent:
+                            st.error("Mixed Basis / Metric detected within the same Form. Please align these rows.")
+                            for form_v, srcs, sfu_list in inconsistent:
+                                st.error(
+                                    f"Form '{form_v}' uses multiple Basis / Metric values: {', '.join(srcs)}. "
+                                    f"Impacted SFU_v count: {len(sfu_list)}."
+                                )
+
                     # Save manual final basis overrides from the preview table edits.
-                    new_basis_overrides: dict[str, float] = {}
+                    new_basis_overrides: dict[str, float] = dict(saved_basis_overrides)
+                    for sfu_v in edited_preview["SFU_SFU Version"].astype(str):
+                        new_basis_overrides.pop(sfu_v, None)
                     for _, pr in edited_preview.iterrows():
                         v = str(pr.get("SFU_SFU Version", ""))
                         if not v:
@@ -4104,6 +4301,16 @@ def step6_run():
                 shipments_df = st.session_state.sheets.get("Shipments")
                 fff_df = st.session_state.sheets.get("Final Fcst to Finance")
                 all_sas_months_for_fy = sas_cmap.get("_months", detect_month_columns(sas_df_alloc))
+                monthly_salience_by_month: dict[str, dict[str, float]] = {}
+                for sfu_v, month_vals in st.session_state.get("sfu_monthly_salience", {}).items():
+                    sfu_key = str(sfu_v).strip()
+                    if not sfu_key or not isinstance(month_vals, dict):
+                        continue
+                    for month, frac in month_vals.items():
+                        val = pd.to_numeric(frac, errors="coerce")
+                        if pd.isna(val):
+                            continue
+                        monthly_salience_by_month.setdefault(str(month), {})[sfu_key] = float(val)
 
                 output_wide, validation_df, split_trace_df = run_split(
                     sas_df=sas_df_alloc,
@@ -4122,6 +4329,7 @@ def step6_run():
                     shipments_df=shipments_df,
                     fff_df=fff_df,
                     all_sas_months=all_sas_months_for_fy,
+                    monthly_salience=monthly_salience_by_month,
                 )
                 lb_agg, adj_agg, new_total_df, _shared = _build_last_bop_matching_tables(
                     _get_df("Last BOP"),

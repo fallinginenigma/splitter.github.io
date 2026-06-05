@@ -35,6 +35,31 @@
 - ✅ **Post-FY Upload Adjustment**: Intelligent forecast adjustments for months beyond FY end
 - ✅ **Validation & Audit Trails**: Pre-split diagnostics, post-split reasonability checks, timestamped exception logs
 - ✅ **Session Persistence**: User selections saved and restored across browser sessions
+- ✅ **Step 5 Always-Visible Config**: BOP Auto-Salience Basis & Salience section is non-collapsible
+- ✅ **Monthly Salience Matrix**: Editable SKU x forecast-month salience table used during BB month split allocation
+- ✅ **Enhanced Live Preview**: Step 5 preview supports Brand/Form filtering and CSV download
+- ✅ **Form-Level Basis Consistency Warning**: Red warning appears when mixed Basis/Metric is used within the same Form
+
+## Step 5 Rule Additions (June 2026)
+
+1. **Non-collapsible SFU Basis Configuration**
+   - The section **"BOP Auto-Salience — Basis & Salience Configuration (SFU Level)"** is permanently visible.
+
+2. **Editable SKU x Month Salience Matrix**
+   - Step 5 now includes an editable matrix where rows are `SFU_SFU Version` and columns are selected forecast/SAS split months.
+   - User-edited values are treated as monthly salience percentages and used in Step 6 split execution.
+   - During split, monthly values are normalized across eligible SFU_v rows within each BB-month.
+   - If a monthly value is missing for an SFU_v, split falls back to computed scalar salience.
+
+3. **Live Preview Enhancements**
+   - Step 5 Live Preview supports Brand and Form filters.
+   - Live Preview table is editable and downloadable as CSV.
+   - Editing under a filter updates only visible rows while preserving hidden-row configurations.
+
+4. **Form-Level Basis/Metric Validation**
+   - On "Compute BOP Salience", the app checks whether SFU_v rows in the same Form use mixed Basis/Metric sources.
+   - If mixed sources are detected, the app shows a red warning with impacted Forms and SFU_v counts.
+   - This warning is **non-blocking**; computation continues.
 
 ## Business Value
 
