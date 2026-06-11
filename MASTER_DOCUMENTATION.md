@@ -471,6 +471,47 @@ New Total = Last BOP Final Fcst to Finance + Split Adjustment
 | **Blue Alert** | SKU forecast > baseline | > 120% of 12M avg | Review for unusual growth |
 | **Yellow Alert** | SKU forecast < baseline | < 80% of 12M avg | Review for decline |
 
+### BOP Topline Matching Rules (June 2026)
+
+For BOP matching, the allocation pipeline now applies these rules:
+
+1. **Topline source**:
+- Use SAS rows tagged in Plan Name with `Topline Base` as the topline basis.
+- Topline is aggregated by `Country + SMO Category + month`.
+
+2. **Split input exclusions**:
+- Rows tagged as topline (`Topline Base`) are excluded from BB split input.
+- Prior-cycle rows are excluded from split input using `BOP Cycle (MMM'YY)` token detection in Plan Name.
+- Last FF reference rows remain excluded from split input and shown for reference only.
+
+3. **Gap formula**:
+- For each `Country + SMO Category + month`:
+   `gap = topline - (FFF + split)`
+
+4. **Gap allocation scope**:
+- Gap is distributed to SKUs within the same `Country + SMO Category + month`.
+- Distribution uses salience weights; equal split is fallback when salience is unavailable.
+
+5. **Final matched number**:
+- SKU final matched value is:
+   `FFF + split + gap`
+
+6. **DA export payload (Type 9)**:
+- DA Level 1 = `9. BOP Adjustment` exports **gap-only** values at SKU level.
+- This payload is sourced from the same SKU gap artifact shown in Step 7.
+
+7. **Reasonability closure check**:
+- Step 7 includes explicit closure check at `Country + SMO Category + month`:
+   `topline == FFF + split + gap`
+
+### Fixed Volume SKU Behavior (Aligned with Initiatives)
+
+Fixed-volume SKUs follow initiative-style default exclusion behavior:
+
+1. Fixed-volume SKUs are globally excluded by default.
+2. They require explicit BB-level include to participate in split allocation.
+3. Profile load now restores fixed quantities **and** reapplies global exclusion for those SKUs.
+
 ---
 
 ## Output Files

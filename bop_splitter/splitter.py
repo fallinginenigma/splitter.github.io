@@ -247,6 +247,54 @@ def run_split(
             if ts is not None and ts > fy_end_date:
                 post_fy_months.append(m)
 
+    # Validation: Warn early if post-FY months exist but required data is missing.
+    # Without Shipments the rule "final = prior-year shipment" cannot be applied;
+    # without FFF the upload delta (shipment - FFF) would be wrong (treated as 0).
+    if post_fy_months:
+        if shipments_df is None or shipments_df.empty:
+            validation_issues.append({
+                "type": "post_fy_missing_shipments",
+                "bb_id": "ALL",
+                "detail": (
+                    f"Months beyond current FY detected ({', '.join(post_fy_months)}) but "
+                    "no Shipments data is loaded. The rule 'final value = prior-year Shipments' "
+                    "cannot be applied — these months will use the normal salience split instead. "
+                    "Load the Shipments sheet to enable the correct post-FY adjustment."
+                ),
+            })
+        else:
+            # Check that each prior-year month column is actually present in Shipments
+            missing_prior_cols = []
+            for m in post_fy_months:
+                prior = get_prior_year_month(m)
+                if prior and prior not in shipments_df.columns:
+                    missing_prior_cols.append(f"{m} → needs {prior}")
+            if missing_prior_cols:
+                validation_issues.append({
+                    "type": "post_fy_missing_prior_year_columns",
+                    "bb_id": "ALL",
+                    "detail": (
+                        "Post-FY months are present but the corresponding prior-year Shipments "
+                        f"columns are missing: {', '.join(missing_prior_cols)}. "
+                        "Affected months will have a ship_val of 0, so the upload delta will be "
+                        "0 − FFF (which subtracts the existing FFF). "
+                        "Ensure Shipments data covers at least one prior year."
+                    ),
+                })
+            if fff_df is None or fff_df.empty:
+                validation_issues.append({
+                    "type": "post_fy_missing_fff",
+                    "bb_id": "ALL",
+                    "detail": (
+                        f"Months beyond current FY detected ({', '.join(post_fy_months)}) but "
+                        "no Final Fcst to Finance (FFF) sheet is loaded. "
+                        "The upload value will be set to prior-year Shipments directly instead of "
+                        "the delta (Shipments − FFF). This means uploading it would add the full "
+                        "shipment on top of any existing FFF — load the FFF sheet to get the "
+                        "correct upload adjustment."
+                    ),
+                })
+
     # Validation: Check that all required month columns exist
     missing_months = [m for m in sas_months if m not in sas_df.columns]
     if missing_months:

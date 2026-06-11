@@ -74,6 +74,7 @@ def _exc_store_from_dict(d: dict, exc_store_class) -> Any:
         for sku, months in exc.get("fixed_qty", {}).items():
             for month, qty in months.items():
                 store.set_fixed_qty(bb_id, sku, month, float(qty), notes="(loaded from profile)")
+                store.add_global_exclusion(sku, notes="Fixed volume SKU — globally excluded by default (loaded from profile)")
     return store
 
 

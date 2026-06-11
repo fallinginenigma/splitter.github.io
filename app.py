@@ -13,6 +13,7 @@ from copy import deepcopy
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 from bop_splitter.loader import (
     load_excel,
@@ -200,6 +201,12 @@ def _init_state():
         "sas_df_split_input": None,
         "last_ff_reference_df": None,
         "last_ff_plan_col": None,
+        "sas_df_topline_scope": None,
+        "sas_df_prior_cycle_excluded": None,
+        "bop_cycle_active_token": None,
+        "bop_gap_ccm_df": None,
+        "bop_gap_sku_df": None,
+        "bop_final_matched_sku_df": None,
         "split_trace_df": None,
         "matching_new_total_df": None,
         "matching_last_bop_df": None,
@@ -207,10 +214,33 @@ def _init_state():
         "output_wide_final": None,
         "planner_adjustment_audit_df": None,
         "planner_residual_df": None,
+                "confirm_reset_all": False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
+
+
+def _inject_refresh_warning() -> None:
+        """Warn before browser refresh/close so users don't lose context unexpectedly."""
+        components.html(
+                """
+                <script>
+                (function() {
+                    if (window.__bopBeforeUnloadInstalled) {
+                        return;
+                    }
+                    window.__bopBeforeUnloadInstalled = true;
+                    window.addEventListener('beforeunload', function (event) {
+                        event.preventDefault();
+                        event.returnValue = '';
+                    });
+                })();
+                </script>
+                """,
+                height=0,
+                width=0,
+        )
 
 # ── Restore session from disk if a session ID is present in the URL ───────────
 _sid = _session_id()
@@ -225,6 +255,8 @@ if "step" not in st.session_state:
         st.toast("✅ Session restored — welcome back!", icon="🔀")
 else:
     _init_state()  # normal rerun — just fill missing defaults
+
+_inject_refresh_warning()
 
 # One-time cleanup for sessions that may already contain stale editor widget state.
 if "_bb_editor_state_cleaned" not in st.session_state:
@@ -249,9 +281,26 @@ with st.sidebar:
     st.title("🔀 BOP Splitter")
     st.caption("Building Block → SFU_v Forecast Splitter")
     st.divider()
-    for i, label in enumerate(STEPS, 1):
-        icon = "▶️" if i == st.session_state.step else ("✅" if i <= st.session_state.max_step else "⬜")
-        st.markdown(f"{icon} {label}")
+    
+    # Combined progress tracker and navigation
+    max_step = st.session_state.max_step
+    jump = st.radio(
+        "Progress & Navigation",
+        STEPS[:max_step],
+        index=min(st.session_state.step - 1, max_step - 1),
+        format_func=lambda label: (
+            f"▶️ {label}" if STEPS.index(label) + 1 == st.session_state.step
+            else f"✅ {label}" if STEPS.index(label) + 1 <= st.session_state.max_step
+            else f"⬜ {label}"
+        ),
+        label_visibility="collapsed"
+    )
+    if jump:
+        target = STEPS.index(jump) + 1
+        if target != st.session_state.step:
+            st.session_state.step = target
+            st.rerun()
+    
     st.divider()
 
     # ── Monthly Profile: Save & Load ─────────────────────────────────────────
@@ -319,10 +368,22 @@ with st.sidebar:
                     st.error(f"Could not apply profile: {_le}")
 
     st.divider()
-    if st.button("↺ Reset All", width='stretch'):
-        for k in list(st.session_state.keys()):
-            del st.session_state[k]
-        st.rerun()
+    if not st.session_state.get("confirm_reset_all", False):
+        if st.button("↺ Reset All", width='stretch', key="reset_all_init_btn"):
+            st.session_state.confirm_reset_all = True
+            st.rerun()
+    else:
+        st.warning(
+            "Are you sure? This will clear all loaded data, mappings, filters, and outputs for this session."
+        )
+        c_reset, c_cancel = st.columns(2)
+        if c_reset.button("Yes, reset", width='stretch', key="reset_all_confirm_btn"):
+            for k in list(st.session_state.keys()):
+                del st.session_state[k]
+            st.rerun()
+        if c_cancel.button("Cancel", width='stretch', key="reset_all_cancel_btn"):
+            st.session_state.confirm_reset_all = False
+            st.rerun()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helper utilities
@@ -343,6 +404,15 @@ SKU_SHEETS = [
 ]
 LOGICAL_HIER = HIERARCHY_LEVELS  # Country, SMO Category, Brand, Sub Brand, Form
 ALL_LOGICAL = LOGICAL_HIER + ["SFU_v"]
+SELLOUT_UI_LABEL = "Retailing (Sellout)"
+
+
+def _role_display_name(role: str) -> str:
+    return SELLOUT_UI_LABEL if role == "Sellout" else role
+
+
+def _role_from_display_name(role: str) -> str:
+    return "Sellout" if role == SELLOUT_UI_LABEL else role
 
 
 def _guess_sheet(candidates: list[str], keywords: list[str]) -> str | None:
@@ -366,6 +436,7 @@ def _make_bb_id(df: pd.DataFrame, hier_cols: list[str]) -> pd.Series:
 
 
 def _get_df(role: str) -> pd.DataFrame | None:
+    role = _role_from_display_name(role)
     sheet_name = st.session_state.sheet_map.get(role)
     if not sheet_name or sheet_name not in st.session_state.sheets:
         return None
@@ -373,6 +444,7 @@ def _get_df(role: str) -> pd.DataFrame | None:
 
 
 def _mapped_col(role: str, logical: str) -> str | None:
+    role = _role_from_display_name(role)
     return st.session_state.col_maps.get(role, {}).get(logical)
 
 
@@ -539,35 +611,12 @@ def _show_bop_load_summary(sheets: dict) -> None:
 
     st.success("✅ **SAP BEx BOP export detected** — sheets and columns have been auto-mapped.")
 
-    # Check for Bible, Stat_DB, and Sellout sheets
+    # Check for Bible, Stat_DB, and Retailing (Sellout) sheets
     has_bible = "Bible" in st.session_state.sheet_map
     has_stat_db = "Stat_DB" in st.session_state.sheet_map
     has_sellout = "Sellout" in st.session_state.sheet_map
-    
-    if has_bible:
-        st.info(
-            "📚 **Bible sheet detected!** This sheet will be used as the authoritative source for "
-            "SFU hierarchy mappings (SMO Category, Brand, Sub Brand, Form)."
-        )
-    
-    if has_stat_db:
-        st.info(
-            "📅 **Stat DB export detected!** This sheet will be used to enforce forecast date boundaries. "
-            "Forecasts will only be created within the date range specified for each SFU."
-        )
-    
-    if has_sellout:
-        st.info(
-            "📊 **Sellout sheet detected!** This sheet can be used as a historical basis for salience "
-            "weighting in Step 5."
-        )
 
     has_last_bop = "Last BOP" in st.session_state.sheet_map
-    if has_last_bop:
-        st.info(
-            "📋 **Last BOP sheet detected!** Previous-week Final Fcst to Finance — BOP values are loaded "
-            "and will be used in the Reasonability Check (Step 7) to show Last BOP + split adjustments."
-        )
 
     # Entry Type check — warn if the SAS sheet does not appear to be a BOP file
     if not sas_df.empty and "Entry Type" in sas_df.columns:
@@ -594,6 +643,32 @@ def _show_bop_load_summary(sheets: dict) -> None:
                 n_sku = "?"
             m_cols[min(i, 3)].metric(measure, f"{len(mdf):,} rows")
             m_cols[min(i, 3)].caption(f"{n_sku:,} unique SFU_vs")
+
+    # Localized summary notes for optional sources
+    optional_notes = []
+    if has_bible:
+        optional_notes.append(
+            "📚 **Bible** detected: authoritative source for SFU hierarchy mappings "
+            "(SMO Category, Brand, Sub Brand, Form)."
+        )
+    if has_stat_db:
+        optional_notes.append(
+            "📅 **Stat_DB** detected: forecast date boundaries will be enforced per SFU."
+        )
+    if has_sellout:
+        optional_notes.append(
+            "📊 **Retailing (Sellout)** detected: available as historical basis input for salience in Step 5."
+        )
+    if has_last_bop:
+        optional_notes.append(
+            "📋 **Last BOP** detected: used in Step 7 Reasonability Check "
+            "(Last BOP plus split adjustments)."
+        )
+
+    if optional_notes:
+        st.markdown("**Detected optional inputs**")
+        for note in optional_notes:
+            st.caption(note)
 
     # Last BOP metric (separate row if present)
     if "Last BOP" in sheets:
@@ -632,9 +707,9 @@ def _show_bop_load_summary(sheets: dict) -> None:
         st.dataframe(pd.DataFrame(mapping_rows), width='stretch', hide_index=True)
 
         if gbb_col_found:
-            st.success(
-                f"✅ **GBB Type** column detected in SAS sheet as `{gbb_col_found}` — "
-                "Split Level and Action will be auto-derived from it in Step 3."
+            st.caption(
+                f"✅ **GBB Type** detected as `{gbb_col_found}` in SAS. "
+                "Split Level and Action will be auto-derived in Step 3."
             )
             # Show unique GBB Type values present
             unique_gbb = sas_df[gbb_col_found].dropna().astype(str).str.strip()
@@ -791,12 +866,17 @@ def step1_upload():
         for i, role in enumerate(LOGICAL_SHEETS):
             guess = st.session_state.sheet_map.get(role) or guesses.get(role) or "— none —"
             idx = none_opt.index(guess) if guess in none_opt else 0
-            sel = cols[i % 3].selectbox(f"**{role}**", none_opt, index=idx, key=f"sheet_map_{role}")
+            sel = cols[i % 3].selectbox(f"**{_role_display_name(role)}**", none_opt, index=idx, key=f"sheet_map_{role}")
             if sel != "— none —":
                 new_map[role] = sel
 
         if new_map:
-            preview_role = st.selectbox("Preview sheet", list(new_map.keys()), key="preview_role")
+            preview_role = st.selectbox(
+                "Preview sheet",
+                list(new_map.keys()),
+                key="preview_role",
+                format_func=_role_display_name,
+            )
             if preview_role:
                 st.dataframe(sheets[new_map[preview_role]].head(5), width='stretch')
 
@@ -863,7 +943,7 @@ def step1_upload():
         for role in LOGICAL_SHEETS:
             required_tag = " *(required)*" if role == "SAS" else " *(optional)*"
             db_tables_input[role] = st.text_input(
-                f"{role}{required_tag}",
+                f"{_role_display_name(role)}{required_tag}",
                 value=st.session_state.db_tables.get(role, ""),
                 placeholder="catalog.schema.table_name",
                 key=f"db_table_{role}",
@@ -898,19 +978,19 @@ def step1_upload():
                 for role, tbl in db_tables_input.items():
                     if not tbl.strip():
                         continue
-                    with st.spinner(f"Fetching **{role}** from `{tbl}`…"):
+                    with st.spinner(f"Fetching **{_role_display_name(role)}** from `{tbl}`…"):
                         try:
                             df = fetch_databricks_table(
                                 db_host, db_http, db_token, tbl.strip(), int(row_limit)
                             )
                             loaded_sheets[role] = df
-                            st.success(f"✓ **{role}**: {len(df):,} rows loaded")
+                            st.success(f"✓ **{_role_display_name(role)}**: {len(df):,} rows loaded")
                         except ImportError as exc:
                             st.error(str(exc))
                             has_error = True
                             break
                         except Exception as exc:
-                            st.error(f"Failed to load **{role}** from `{tbl}`: {exc}")
+                            st.error(f"Failed to load **{_role_display_name(role)}** from `{tbl}`: {exc}")
                             has_error = True
 
                 if not has_error and loaded_sheets:
@@ -990,7 +1070,7 @@ def step2_columns():
         if df is None:
             continue
 
-        with st.expander(f"**{role}** — {st.session_state.sheet_map[role]}", expanded=(role == "SAS")):
+        with st.expander(f"**{_role_display_name(role)}** — {st.session_state.sheet_map[role]}", expanded=(role == "SAS")):
             cols_all = list(df.columns)
             none_opt = ["— auto —"] + cols_all
             cmap = st.session_state.col_maps.get(role, {})
@@ -1109,7 +1189,7 @@ def step2_columns():
                     # Bible sheet: try SFU_v first, then Salience SFU
                     sku_guess = cmap.get("SFU_v") or cmap.get("SKU") or _guess_col(cols_all, "SFU_v", "Salience SFU", "Material", "SKU")
                 elif role == "Sellout":
-                    # Sellout sheet: prefer explicit SFU_v column if present
+                    # Retailing (Sellout) sheet: prefer explicit SFU_v column if present
                     sku_guess = (
                         cmap.get("SFU_v")
                         or _guess_col(cols_all, "SFU_v", MONTHLY_SFU_VERSION_COL, "Salience SFU", "Material", "SKU")
@@ -1368,6 +1448,15 @@ def _latest_product_description_map() -> dict[str, str]:
     all_rows = all_rows.sort_values(["_sfu", "_order_ts", "_order_row"]) 
     latest = all_rows.drop_duplicates(subset=["_sfu"], keep="last")
     return dict(zip(latest["_sfu"], latest["_desc"]))
+
+
+def _format_sku_excl(sku_value: str, desc_map: dict[str, str] | None = None) -> str:
+    """Format a SKU value with its product description for display."""
+    if desc_map is None:
+        desc_map = _latest_product_description_map()
+    sku_norm = str(sku_value).strip()
+    desc = str(desc_map.get(sku_norm, "")).strip()
+    return f"{sku_norm} ({desc})" if desc else sku_norm
 
 
 def _add_product_description(df: pd.DataFrame) -> pd.DataFrame:
@@ -1957,7 +2046,7 @@ def step3_filters():
         if MONTHLY_SFU_VERSION_COL in sku_out.columns:
             sku_out = sku_out[sku_out[MONTHLY_SFU_VERSION_COL].astype(str).str.strip() != "_"].copy()
 
-        # Keep all SFU_vs for salience setup; basis can come from Shipments / Sellout / other metrics.
+        # Keep all SFU_vs for salience setup; basis can come from Shipments / Retailing (Sellout) / other metrics.
         # We still compute and show FFF coverage as an informational hint only.
         fff_df = _get_df("Final Fcst to Finance")
         if fff_df is not None and not fff_df.empty and MONTHLY_SFU_VERSION_COL in fff_df.columns:
@@ -2047,6 +2136,8 @@ def render_detailed_exclusion_tools() -> None:
     exc_store_sal: ExceptionStore = st.session_state.exc_store
     hcm_excl = hier_col_map_from_state()
     sku_col_excl = hcm_excl.get("SFU_v", MONTHLY_SFU_VERSION_COL)
+    desc_map_excl = _latest_product_description_map()
+
     if sku_df_excl is not None:
         candidate_cols = [
             sku_col_excl,
@@ -2076,194 +2167,138 @@ def render_detailed_exclusion_tools() -> None:
                     sparse_skus.add(str(_sku_val))
 
     if sparse_skus:
+        sparse_list_display = ", ".join(f"`{_format_sku_excl(v)}`" for v in sorted(sparse_skus))
         st.warning(
             f"⚠️ **{len(sparse_skus)} SFU_v value(s) have fewer than 3 months of shipments** "
             "and are pre-checked for exclusion below. "
             "Please confirm whether these are **Initiatives** or new SFU_v values before saving exclusions: "
-            f"`{'`, `'.join(sorted(sparse_skus))}`"
+            f"{sparse_list_display}"
         )
 
-    tab_excl_table, tab_excl_upload = st.tabs(["📋 Select Exclusions", "📤 Upload Exclusions + Volumes"])
+    # ═════════════════════════════════════════════════════════════════════════════════
+    # BLOCK 1: SELECT EXCLUSIONS
+    # ═════════════════════════════════════════════════════════════════════════════════
+    st.subheader("📋 Select Exclusions")
+    st.caption("Review SFU_v exclusions in detail before salience is calculated.")
+    
+    if sku_df_excl is not None and not sku_df_excl.empty and sku_col_excl:
+        excl_cols = []
+        if MONTHLY_SFU_VERSION_COL in sku_df_excl.columns:
+            excl_cols.append(MONTHLY_SFU_VERSION_COL)
+        if sku_col_excl in sku_df_excl.columns and sku_col_excl != MONTHLY_SFU_VERSION_COL:
+            excl_cols.append(sku_col_excl)
+        for h in HIERARCHY_LEVELS:
+            actual_h = hcm_excl.get(h)
+            if actual_h and actual_h in sku_df_excl.columns and actual_h not in excl_cols:
+                excl_cols.append(actual_h)
 
-    with tab_excl_table:
-        if sku_df_excl is not None and not sku_df_excl.empty and sku_col_excl:
-            excl_cols = []
-            if MONTHLY_SFU_VERSION_COL in sku_df_excl.columns:
-                excl_cols.append(MONTHLY_SFU_VERSION_COL)
-            if sku_col_excl in sku_df_excl.columns and sku_col_excl != MONTHLY_SFU_VERSION_COL:
-                excl_cols.append(sku_col_excl)
-            for h in HIERARCHY_LEVELS:
-                actual_h = hcm_excl.get(h)
-                if actual_h and actual_h in sku_df_excl.columns and actual_h not in excl_cols:
-                    excl_cols.append(actual_h)
+        if excl_cols:
+            excl_display = (
+                sku_df_excl[excl_cols]
+                .drop_duplicates()
+                .sort_values(excl_cols)
+                .reset_index(drop=True)
+            )
+            excl_display = _add_product_description(excl_display)
 
-            if excl_cols:
-                excl_display = (
-                    sku_df_excl[excl_cols]
-                    .drop_duplicates()
-                    .sort_values(excl_cols)
-                    .reset_index(drop=True)
-                )
-                excl_display = _add_product_description(excl_display)
+            already_excl_set = exc_store_sal.global_exclusions
+            excl_display["Exclude"] = excl_display[sku_col_excl].apply(
+                lambda v: (str(v) in already_excl_set) or (str(v) in sparse_skus)
+            ) if sku_col_excl in excl_display.columns else False
 
-                already_excl_set = exc_store_sal.global_exclusions
-                excl_display["Exclude"] = excl_display[sku_col_excl].apply(
-                    lambda v: (str(v) in already_excl_set) or (str(v) in sparse_skus)
-                ) if sku_col_excl in excl_display.columns else False
+            excl_display["⚠️ < 3 months data"] = excl_display[sku_col_excl].apply(
+                lambda v: "⚠️ Sparse" if str(v) in sparse_skus else ""
+            ) if sku_col_excl in excl_display.columns else ""
 
-                excl_display["⚠️ < 3 months data"] = excl_display[sku_col_excl].apply(
-                    lambda v: "⚠️ Sparse" if str(v) in sparse_skus else ""
-                ) if sku_col_excl in excl_display.columns else ""
+            excl_display["📌 Status"] = excl_display[sku_col_excl].apply(
+                lambda v: "Excluded ✓" if str(v) in already_excl_set else ""
+            ) if sku_col_excl in excl_display.columns else ""
 
-                excl_display["📌 Status"] = excl_display[sku_col_excl].apply(
-                    lambda v: "Excluded ✓" if str(v) in already_excl_set else ""
-                ) if sku_col_excl in excl_display.columns else ""
+            control_cols = ["Exclude", "⚠️ < 3 months data", "📌 Status"]
+            excl_ordered = control_cols + [c for c in excl_display.columns if c not in control_cols]
+            excl_col_cfg: dict = {
+                "Exclude": st.column_config.CheckboxColumn(
+                    "Exclude",
+                    help="Check to exclude this SFU_v value from salience calculation.",
+                ),
+                "⚠️ < 3 months data": st.column_config.TextColumn(
+                    "< 3 months shipments",
+                    disabled=True,
+                    help="SFU_v values with fewer than 3 non-zero shipment months — likely Initiatives.",
+                ),
+                "📌 Status": st.column_config.TextColumn(
+                    "Current Status",
+                    disabled=True,
+                    help="Whether this SFU_v value is currently in the global exclusions list.",
+                ),
+            }
+            if MONTHLY_SFU_VERSION_COL in excl_display.columns:
+                excl_col_cfg[MONTHLY_SFU_VERSION_COL] = st.column_config.TextColumn("SFU_v", disabled=True)
+            if sku_col_excl in excl_display.columns:
+                excl_col_cfg[sku_col_excl] = st.column_config.TextColumn("SFU_v", disabled=True)
+            if "Product Description" in excl_display.columns:
+                excl_col_cfg["Product Description"] = st.column_config.TextColumn("Product Description", disabled=True)
 
-                excl_ordered = ["Exclude", "⚠️ < 3 months data", "📌 Status"] + [c for c in excl_cols if c in excl_display.columns]
-                excl_col_cfg: dict = {
-                    "Exclude": st.column_config.CheckboxColumn(
-                        "Exclude",
-                        help="Check to exclude this SFU_v value from salience calculation.",
-                    ),
-                    "⚠️ < 3 months data": st.column_config.TextColumn(
-                        "< 3 months shipments",
-                        disabled=True,
-                        help="SFU_v values with fewer than 3 non-zero shipment months — likely Initiatives.",
-                    ),
-                    "📌 Status": st.column_config.TextColumn(
-                        "Current Status",
-                        disabled=True,
-                        help="Whether this SFU_v value is currently in the global exclusions list.",
-                    ),
-                }
-                if MONTHLY_SFU_VERSION_COL in excl_display.columns:
-                    excl_col_cfg[MONTHLY_SFU_VERSION_COL] = st.column_config.TextColumn("SFU_v", disabled=True)
-                if sku_col_excl in excl_display.columns:
-                    excl_col_cfg[sku_col_excl] = st.column_config.TextColumn("SFU_v", disabled=True)
+            # Use a signature-based editor key so checkbox defaults are refreshed
+            # when sparse-SFU prechecks or current exclusion scope changes.
+            sparse_sig = "|".join(sorted(str(v).strip() for v in sparse_skus))
+            current_sig = "|".join(sorted(str(v).strip() for v in already_excl_set))
+            editor_sig = hashlib.md5(
+                f"{sku_col_excl}::{len(excl_display)}::{sparse_sig}::{current_sig}".encode("utf-8")
+            ).hexdigest()[:12]
+            editor_key = f"sfu_exclusion_editor_{editor_sig}"
 
-                edited_excl = st.data_editor(
-                    excl_display[excl_ordered],
-                    column_config=excl_col_cfg,
-                    disabled=[c for c in excl_ordered if c != "Exclude"],
-                    width='stretch',
-                    key="sfu_exclusion_editor",
-                    height=min(450, 60 + len(excl_display) * 35),
-                    num_rows="fixed",
-                )
+            edited_excl = st.data_editor(
+                excl_display[excl_ordered],
+                column_config=excl_col_cfg,
+                disabled=[c for c in excl_ordered if c != "Exclude"],
+                width='stretch',
+                key=editor_key,
+                height=min(450, 60 + len(excl_display) * 35),
+                num_rows="fixed",
+            )
 
-                if st.button("💾 Save Exclusions", key="save_excl_btn"):
-                    all_skus_in_table = set(
-                        excl_display[sku_col_excl].dropna().astype(str).tolist()
-                    ) if sku_col_excl in excl_display.columns else set()
-                    exc_store_sal.global_exclusions -= all_skus_in_table
-                    newly_excluded = set()
-                    for _, erow in edited_excl.iterrows():
-                        if erow.get("Exclude"):
-                            sku_val = str(erow.get(sku_col_excl, ""))
-                            if sku_val:
-                                flag_note = " [< 3 months shipments — confirmed initiative/new SKU]" if sku_val in sparse_skus else ""
-                                exc_store_sal.add_global_exclusion(sku_val, notes=f"Excluded before salience in Step 4{flag_note}")
-                                newly_excluded.add(sku_val)
-                    st.session_state.exc_store = exc_store_sal
-                    if newly_excluded:
-                        st.success(f"✅ {len(newly_excluded)} SFU_v value(s) marked for exclusion: {', '.join(sorted(newly_excluded))}")
-                    else:
-                        st.info("No exclusions set — all SFU_v values will be included in salience.")
-                    st.rerun()
-
-                current_excl = exc_store_sal.global_exclusions & (
-                    set(excl_display[sku_col_excl].dropna().astype(str).tolist())
-                    if sku_col_excl in excl_display.columns else set()
-                )
-                if current_excl:
-                    st.warning(
-                        f"⚠️ **{len(current_excl)} SFU_v value(s) currently excluded** "
-                        f"(will be skipped in salience): {', '.join(sorted(current_excl))}"
-                    )
-            else:
-                st.info("No SFU_v data available — complete Step 3 first.")
-        else:
-            if sku_df_excl is not None and not sku_df_excl.empty and not sku_col_excl:
-                st.warning(
-                    "Could not find a valid SKU/SFU column in the filtered data. "
-                    "Please check column mappings in Step 2."
-                )
-            else:
-                st.info("No SFU_v data loaded yet — complete Step 3 first.")
-
-    with tab_excl_upload:
-        st.markdown(
-            "Upload an **Excel file** with excluded SFU_v values and their volumes. "
-            "The file must have:\n"
-            "- A column named **`SFU_v`** (or the mapped SFU_v column name for your data)\n"
-            "- Month columns in `Mmm-YY` format (e.g. `Jan-26`, `Feb-26`) with the volumes to allocate\n\n"
-            "These SFU_v values will be **globally excluded from the salience split** and their volumes will be "
-            "loaded as **fixed allocations** in the exception store."
-        )
-        st.download_button(
-            label="📥 Download template",
-            data=_build_exclusion_upload_template(sku_col_excl, st.session_state.get("sas_months_selected", [])),
-            file_name="exclusions_template.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-        excl_upload_file = st.file_uploader(
-            "Upload exclusions Excel",
-            type=["xlsx", "xls"],
-            key="excl_upload_file",
-        )
-        if excl_upload_file is not None:
-            try:
-                excl_up_df = pd.read_excel(excl_upload_file)
-                sku_col_candidates = [sku_col_excl, MONTHLY_SFU_VERSION_COL, "SFU_v", "SKU"]
-                found_sku_col = next((c for c in sku_col_candidates if c in excl_up_df.columns), None)
-                if found_sku_col is None:
-                    st.error(f"Could not find a SKU column in the uploaded file. Expected one of: {sku_col_candidates}")
+            if st.button("💾 Save Exclusions", key="save_excl_btn"):
+                all_skus_in_table = set(
+                    excl_display[sku_col_excl].dropna().astype(str).tolist()
+                ) if sku_col_excl in excl_display.columns else set()
+                exc_store_sal.global_exclusions -= all_skus_in_table
+                newly_excluded = set()
+                for _, erow in edited_excl.iterrows():
+                    if erow.get("Exclude"):
+                        sku_val = str(erow.get(sku_col_excl, ""))
+                        if sku_val:
+                            flag_note = " [< 3 months shipments — confirmed initiative/new SKU]" if sku_val in sparse_skus else ""
+                            exc_store_sal.add_global_exclusion(sku_val, notes=f"Excluded before salience in Step 4{flag_note}")
+                            newly_excluded.add(sku_val)
+                st.session_state.exc_store = exc_store_sal
+                if newly_excluded:
+                    new_excl_display = ", ".join(_format_sku_excl(v) for v in sorted(newly_excluded))
+                    st.success(f"✅ {len(newly_excluded)} SFU_v value(s) marked for exclusion: {new_excl_display}")
                 else:
-                    month_cols_up = [
-                        c for c in excl_up_df.columns
-                        if c != found_sku_col and parse_month_to_date(c) is not None
-                    ]
-                    if not month_cols_up:
-                        st.warning("No month columns detected in the uploaded file. Ensure columns are in `Mmm-YY` format.")
-                    else:
-                        st.success(
-                            f"Detected **{len(excl_up_df)} SKU row(s)** and "
-                            f"**{len(month_cols_up)} month column(s)**: {', '.join(month_cols_up)}"
-                        )
-                        st.dataframe(
-                            _add_product_description(excl_up_df[[found_sku_col] + month_cols_up]).head(20),
-                            width='stretch'
-                        )
+                    st.info("No exclusions set — all SFU_v values will be included in salience.")
+                st.rerun()
 
-                        if st.button("✅ Apply Uploaded Exclusions + Volumes", key="apply_excl_upload"):
-                            applied_skus = set()
-                            for _, urow in excl_up_df.iterrows():
-                                sku_v = str(urow[found_sku_col])
-                                if not sku_v or sku_v == "nan":
-                                    continue
-                                exc_store_sal.add_global_exclusion(
-                                    sku_v,
-                                    notes="Excluded via uploaded exclusions Excel (Step 4)"
-                                )
-                                applied_skus.add(sku_v)
-                                for mc in month_cols_up:
-                                    qty_val = pd.to_numeric(urow.get(mc, 0), errors="coerce")
-                                    if not pd.isna(qty_val) and qty_val != 0:
-                                        exc_store_sal.set_fixed_qty(
-                                            "__uploaded__",
-                                            sku_v,
-                                            mc,
-                                            float(qty_val),
-                                            notes="Volume from uploaded exclusions Excel",
-                                        )
-                            st.session_state.exc_store = exc_store_sal
-                            st.success(
-                                f"✅ {len(applied_skus)} SKU(s) excluded and volumes loaded: "
-                                f"{', '.join(sorted(applied_skus))}"
-                            )
-                            st.rerun()
-            except Exception as _exc_up_err:
-                st.error(f"Error reading uploaded file: {_exc_up_err}")
+            current_excl = exc_store_sal.global_exclusions & (
+                set(excl_display[sku_col_excl].dropna().astype(str).tolist())
+                if sku_col_excl in excl_display.columns else set()
+            )
+            if current_excl:
+                current_excl_display = ", ".join(_format_sku_excl(v) for v in sorted(current_excl))
+                st.warning(
+                    f"⚠️ **{len(current_excl)} SFU_v value(s) currently excluded** "
+                    f"(will be skipped in salience): {current_excl_display}"
+                )
+        else:
+            st.info("No SFU_v data available — complete Step 3 first.")
+    else:
+        if sku_df_excl is not None and not sku_df_excl.empty and not sku_col_excl:
+            st.warning(
+                "Could not find a valid SKU/SFU column in the filtered data. "
+                "Please check column mappings in Step 2."
+            )
+        else:
+            st.info("No SFU_v data loaded yet — complete Step 3 first.")
 
 
 def _compute_bop_salience_for_level(
@@ -2303,11 +2338,12 @@ def _compute_bop_salience_for_level(
         config_to_sfus.setdefault(config_key, []).append(sfu_ver)
 
     for (src_role, mode, selected_m), sfu_list in config_to_sfus.items():
+        src_role = _role_from_display_name(str(src_role))
         src_df = _get_df(src_role)
         if src_df is None:
             continue
 
-        # Ensure SFU_SFU Version column exists; for Sellout use the mapped SFU_v column
+        # Ensure SFU_SFU Version column exists; for Retailing (Sellout) use the mapped SFU_v column
         if src_role == "Sellout":
             cmap_sellout = st.session_state.col_maps.get("Sellout", {})
             sfu_col = cmap_sellout.get("SFU_v") or cmap_sellout.get("SKU")
@@ -2464,6 +2500,12 @@ def step4_exclusions():
     exc_store = st.session_state.exc_store
     hcm = hier_col_map_from_state()
     sku_col_for_quick = hcm.get("SFU_v", MONTHLY_SFU_VERSION_COL)
+    desc_map_step4 = _latest_product_description_map()
+
+    def _format_sku_step4(sku_value: str) -> str:
+        sku_norm = str(sku_value).strip()
+        desc = str(desc_map_step4.get(sku_norm, "")).strip()
+        return f"{sku_norm} ({desc})" if desc else sku_norm
 
     st.caption(
         "Review exclusions before salience setup. Global exclusions narrow the SFU_v list that appears in "
@@ -2509,6 +2551,7 @@ def step4_exclusions():
             all_quick_skus,
             default=quick_default,
             key="quick_pre_basis_exclusions",
+            format_func=_format_sku_step4,
         )
 
         if st.button("Save Global Exclusions", key="apply_quick_pre_basis_exclusions"):
@@ -2520,7 +2563,11 @@ def step4_exclusions():
                     notes="Excluded before salience setup (Step 4 quick filter)",
                 )
             st.session_state.exc_store = exc_store
-            st.success(f"Saved {len(quick_selected)} global exclusion(s).")
+            if quick_selected:
+                quick_selected_display = ", ".join(_format_sku_step4(v) for v in sorted(quick_selected))
+                st.success(f"Saved {len(quick_selected)} global exclusion(s): {quick_selected_display}")
+            else:
+                st.success("Saved 0 global exclusions.")
             st.rerun()
 
         st.caption(
@@ -2583,11 +2630,11 @@ def step4_salience():
 
         # Display one salience value per SFU_SFU Version (no monthly salience overrides).
         if "salience" in display_sal.columns:
-            display_sal["Salience %"] = (pd.to_numeric(display_sal["salience"], errors="coerce") * 100).round(2)
+            display_sal["Salience %"] = (pd.to_numeric(display_sal["salience"], errors="coerce") * 100).round(3)
             display_sal = display_sal.drop(columns=["salience"])
         elif "salience %" in display_sal.columns:
             display_sal = display_sal.rename(columns={"salience %": "Salience %"})
-            display_sal["Salience %"] = pd.to_numeric(display_sal["Salience %"], errors="coerce").round(2)
+            display_sal["Salience %"] = pd.to_numeric(display_sal["Salience %"], errors="coerce").round(3)
 
         show_current_salience = st.checkbox(
             "Show Current Salience Table",
@@ -2603,7 +2650,7 @@ def step4_salience():
                 width='stretch',
                 height=300,
                 column_config={
-                    "Salience %": st.column_config.NumberColumn("Salience %", format="%.2f %%"),
+                    "Salience %": st.column_config.NumberColumn("Salience %", format="%.3f %%"),
                 },
             )
 
@@ -2619,10 +2666,11 @@ def step4_salience():
             )
 
             # ── Discover available data ──────────────────────────────────────
-            # Include MONTHLY_MEASURES (standard BOP measures) + Sellout
+            # Include MONTHLY_MEASURES (standard BOP measures) + Retailing (Sellout)
             available_basis_sources = [r for r in MONTHLY_MEASURES if r in st.session_state.sheets]
             if "Sellout" in st.session_state.sheets:
                 available_basis_sources.append("Sellout")
+            available_basis_sources_display = [_role_display_name(r) for r in available_basis_sources]
 
             def _is_fff_source(role: str) -> bool:
                 role_n = str(role or "").strip().lower()
@@ -2641,7 +2689,7 @@ def step4_salience():
                     _df_src = _get_df(_src)
                     if _df_src is not None:
                         if _src == "Sellout":
-                            # Sellout sheet: get SFU_v from mapped column or first column
+                            # Retailing (Sellout) sheet: get SFU_v from mapped column
                             _cmap_sellout = st.session_state.col_maps.get("Sellout", {})
                             _sfuv_col = _cmap_sellout.get("SFU_v") or _cmap_sellout.get("SKU")
                             if _sfuv_col and _sfuv_col in _df_src.columns:
@@ -2816,6 +2864,7 @@ def step4_salience():
 
                 # ── Helper: compute basis value for one SFU from a source df ─
                 def _sfu_basis_with_reason(sfu_ver: str, src_role: str, mode_key: str, sel_months: list[str]) -> tuple[float, str]:
+                    src_role = _role_from_display_name(str(src_role))
                     src_df = _get_df(src_role)
                     if src_df is None:
                         return float("nan"), "source not loaded"
@@ -2826,7 +2875,7 @@ def step4_salience():
                         cmap_sellout = st.session_state.col_maps.get("Sellout", {})
                         sfuv_col = cmap_sellout.get("SFU_v") or cmap_sellout.get("SKU")
                         if not sfuv_col or sfuv_col not in src_df.columns:
-                            return float("nan"), "Sellout SFU column missing"
+                            return float("nan"), "Retailing (Sellout) SFU column missing"
                         sfu_col = sfuv_col
                     else:
                         if MONTHLY_SFU_VERSION_COL not in src_df.columns:
@@ -2868,6 +2917,7 @@ def step4_salience():
 
                 # ── Helper: get preview month value for one SFU ──────────────
                 def _sfu_month_val(sfu_ver: str, src_role: str, month_col: str) -> float:
+                    src_role = _role_from_display_name(str(src_role))
                     src_df = _get_df(src_role)
                     if src_df is None or month_col not in src_df.columns:
                         return float("nan")
@@ -2898,6 +2948,7 @@ def step4_salience():
                     "Set **Basis / Metric** and **Basis Window** directly in this table. "
                     "The table shows actual historical values for the **last 6 months** (P6M→P1M) "
                     "pulled from the selected Basis / Metric sheet for each SFU Version, "
+                    "plus computed **P3M Basis** and **P6M Basis** (averages using the selected Basis / Metric), "
                     "plus the **Final Basis** (avg over the chosen window) and the resulting **Salience %**. "
                     "Edit **Remarks** directly in the table. "
                     "When Basis / Metric is **Final Fcst to Finance (FFF)**, specific-month selection uses **future months**."
@@ -2912,7 +2963,7 @@ def step4_salience():
                     if isinstance(cfg, str):
                         cfg = {"source": cfg, "mode": "last_3", "selected": []}
                     default_src = "Shipments" if "Shipments" in available_basis_sources else available_basis_sources[0]
-                    src = str(cfg.get("source", default_src))
+                    src = _role_from_display_name(str(cfg.get("source", default_src)))
                     if src not in available_basis_sources:
                         src = default_src
                     mode_val = str(cfg.get("mode", "last_3"))
@@ -2953,11 +3004,13 @@ def step4_salience():
                         "SFU_SFU Version": v,
                         "Brand": meta_row.get("Brand", ""),
                         "Form": meta_row.get("Form", ""),
-                        "Basis / Metric": src_role,
+                        "Basis / Metric": _role_display_name(src_role),
                         "Basis Window": next(
                             (k for k, mv in basis_window_mode_map.items() if mv == cfg_p["mode"]),
                             cfg_p["mode"],
                         ),
+                        "P3M Basis": _sfu_basis_value(v, src_role, "last_3", []),
+                        "P6M Basis": _sfu_basis_value(v, src_role, "last_6", []),
                     }
                     for lbl, actual_col in preview_col_map.items():
                         row_p[lbl] = _sfu_month_val(v, src_role, actual_col)
@@ -2976,7 +3029,7 @@ def step4_salience():
                             basis_status = f"specific months [{sel_txt}] | {basis_status}"
                     row_p["Basis Status"] = basis_status
                     sal_pct = (float(final_b) / total_basis * 100) if (total_basis > 0 and not pd.isna(final_b)) else 0.0
-                    row_p["Salience %"] = round(sal_pct, 2)
+                    row_p["Salience %"] = round(sal_pct, 3)
                     row_p["Remarks"] = saved_remarks.get(v, "")
                     preview_rows.append(row_p)
 
@@ -2987,6 +3040,8 @@ def step4_salience():
                     "Form",
                     "Basis / Metric",
                     "Basis Window",
+                    "P3M Basis",
+                    "P6M Basis",
                     "Final Basis",
                     "Basis Status",
                     "Salience %",
@@ -2994,14 +3049,14 @@ def step4_salience():
                 ] + preview_labels
                 for col in required_preview_cols:
                     if col not in preview_df.columns:
-                        preview_df[col] = np.nan if col in (preview_labels + ["Final Basis", "Salience %"]) else ""
+                        preview_df[col] = np.nan if col in (preview_labels + ["P3M Basis", "P6M Basis", "Final Basis", "Salience %"]) else ""
 
                 # Build column config for preview table
                 preview_col_cfg: dict = {
                     "SFU_SFU Version": st.column_config.TextColumn("SFU_SFU Version", disabled=True),
                     "Basis / Metric": st.column_config.SelectboxColumn(
                         "Basis / Metric ▾",
-                        options=available_basis_sources,
+                        options=available_basis_sources_display,
                         required=True,
                         help="Select which historical data sheet to use as basis for this SFU version.",
                     ),
@@ -3010,6 +3065,18 @@ def step4_salience():
                         options=basis_window_options,
                         required=True,
                         help="P3M/P6M/P9M/P12M = average over latest past months. specific months = choose exact months below.",
+                    ),
+                    "P3M Basis": st.column_config.NumberColumn(
+                        "P3M Basis",
+                        format="%.2f",
+                        disabled=True,
+                        help="Average of last 3 months from the selected Basis / Metric for this SFU version.",
+                    ),
+                    "P6M Basis": st.column_config.NumberColumn(
+                        "P6M Basis",
+                        format="%.2f",
+                        disabled=True,
+                        help="Average of last 6 months from the selected Basis / Metric for this SFU version.",
                     ),
                     "Final Basis": st.column_config.NumberColumn(
                         "Final Basis",
@@ -3021,7 +3088,7 @@ def step4_salience():
                         disabled=True,
                         help="Reason when Final Basis is N/A (for example: no months selected, no SFU match, no valid numeric data).",
                     ),
-                    "Salience %": st.column_config.NumberColumn("Salience %", format="%.2f %%", disabled=True),
+                    "Salience %": st.column_config.NumberColumn("Salience %", format="%.3f %%", disabled=True),
                     "Remarks": st.column_config.TextColumn("Remarks", help="Add any notes about this SFU version's basis choice."),
                 }
                 for lbl in preview_labels:
@@ -3036,6 +3103,7 @@ def step4_salience():
                 preview_df = _add_product_description(preview_df)
                 ordered_cols = (
                     ["SFU_SFU Version", "Product Description", "Brand", "Form", "Basis / Metric", "Basis Window"]
+                    + ["P3M Basis", "P6M Basis"]
                     + preview_labels
                     + ["Final Basis", "Basis Status", "Salience %", "Remarks"]
                 )
@@ -3067,7 +3135,7 @@ def step4_salience():
                     window_lbl = str(r.get("Basis Window", "P3M"))
                     mode_val = basis_window_mode_map.get(window_lbl, "last_3")
                     edited_configs[v] = {
-                        "source": str(r.get("Basis / Metric", available_basis_sources[0])),
+                        "source": _role_from_display_name(str(r.get("Basis / Metric", available_basis_sources_display[0]))),
                         "mode": mode_val,
                         "selected": saved_specific.get(v, []) if mode_val == "selected" else [],
                     }
@@ -3104,9 +3172,14 @@ def step4_salience():
                 if not split_months:
                     st.info("No forecast months selected yet. Complete Step 3 month selection to edit monthly salience.")
                 else:
+                    # Load forecast boundaries (per SFU_v from Stat_DB)
+                    _fcst_bounds: dict | None = _get_forecast_date_boundaries()
+
+                    has_any_bounds = bool(_fcst_bounds)
                     st.caption(
                         "Edit month-level salience in % for each SFU Version. These values are used when BB monthly values are split in Step 6. "
                         "Within each BB-month, values are normalized across eligible SFU_v rows."
+                        + (" Months outside an SFU Version's Forecast From / Forecast To date range are shown as empty and cannot be forecasted." if has_any_bounds else "")
                     )
                     saved_monthly_salience = st.session_state.get("sfu_monthly_salience", {})
                     row_sal_map = {
@@ -3114,6 +3187,8 @@ def step4_salience():
                         for _, r in preview_df.iterrows()
                     }
                     monthly_rows: list[dict] = []
+                    # Track which (sfu_v, month) cells are out of forecast range so we can disable them.
+                    _out_of_range_cells: dict[str, set[str]] = {}
                     for _, r in preview_df.iterrows():
                         sfu_v = str(r.get("SFU_SFU Version", "") or "").strip()
                         if not sfu_v:
@@ -3126,12 +3201,32 @@ def step4_salience():
                             "Brand": r.get("Brand", ""),
                             "Form": r.get("Form", ""),
                         }
+                        # Resolve forecast boundaries for this SFU_v
+                        sfu_from: pd.Timestamp | None = None
+                        sfu_to: pd.Timestamp | None = None
+                        if _fcst_bounds:
+                            _bounds_entry = _fcst_bounds.get(sfu_v)
+                            if _bounds_entry:
+                                sfu_from, sfu_to = _bounds_entry
+                        _oor: set[str] = set()
                         for m in split_months:
-                            stored_frac = pd.to_numeric(stored_for_sfu.get(m), errors="coerce")
-                            if pd.notna(stored_frac):
-                                m_row[m] = float(stored_frac) * 100.0
+                            month_ts = parse_month_to_date(m)
+                            is_out_of_range = False
+                            if month_ts is not None and (sfu_from is not None or sfu_to is not None):
+                                if sfu_from is not None and month_ts < sfu_from:
+                                    is_out_of_range = True
+                                if sfu_to is not None and month_ts > sfu_to:
+                                    is_out_of_range = True
+                            if is_out_of_range:
+                                m_row[m] = None
+                                _oor.add(m)
                             else:
-                                m_row[m] = float(base_pct)
+                                stored_frac = pd.to_numeric(stored_for_sfu.get(m), errors="coerce")
+                                if pd.notna(stored_frac):
+                                    m_row[m] = float(stored_frac) * 100.0
+                                else:
+                                    m_row[m] = float(base_pct)
+                        _out_of_range_cells[sfu_v] = _oor
                         monthly_rows.append(m_row)
 
                     monthly_df = pd.DataFrame(monthly_rows)
@@ -3142,7 +3237,7 @@ def step4_salience():
                         "Form": st.column_config.TextColumn("Form", disabled=True),
                     }
                     for m in split_months:
-                        monthly_col_cfg[m] = st.column_config.NumberColumn(f"{m} Salience %", format="%.2f")
+                        monthly_col_cfg[m] = st.column_config.NumberColumn(f"{m} Salience %", format="%.3f")
 
                     monthly_editor_cols = [
                         c for c in ["SFU_SFU Version", "Product Description", "Brand", "Form"] + split_months
@@ -3167,8 +3262,11 @@ def step4_salience():
                         sfu_v = str(mr.get("SFU_SFU Version", "") or "").strip()
                         if not sfu_v:
                             continue
+                        oor_for_sfu = _out_of_range_cells.get(sfu_v, set())
                         month_map: dict[str, float] = {}
                         for m in split_months:
+                            if m in oor_for_sfu:
+                                continue  # Skip out-of-range months — not forecasted for this SFU_v
                             pct = pd.to_numeric(mr.get(m), errors="coerce")
                             if pd.notna(pct):
                                 month_map[m] = max(0.0, float(pct)) / 100.0
@@ -3202,7 +3300,7 @@ def step4_salience():
                     new_specific: dict = {}
                     for r in specific_sfu_rows:
                         v = r[MONTHLY_SFU_VERSION_COL]
-                        src_for_months = str(r.get("Basis / Metric", available_basis_sources[0]))
+                        src_for_months = _role_from_display_name(str(r.get("Basis / Metric", available_basis_sources_display[0])))
                         src_df_m = _get_df(src_for_months)
                         if src_df_m is not None:
                             cmap_m = st.session_state.col_maps.get(src_for_months, {})
@@ -3223,7 +3321,7 @@ def step4_salience():
                             src_months = all_past_months_sorted
                         prev_sel = saved_specific.get(v, [])
                         valid_prev = [m for m in prev_sel if m in src_months]
-                        with st.expander(f"📅 {v}  ({src_for_months})", expanded=(not valid_prev)):
+                        with st.expander(f"📅 {v}  ({_role_display_name(src_for_months)})", expanded=(not valid_prev)):
                             chosen = st.multiselect(
                                 f"Months for **{v}**:",
                                 src_months,
@@ -3257,7 +3355,7 @@ def step4_salience():
                         window_lbl = str(pr.get("Basis Window", "P3M"))
                         mode_val = basis_window_mode_map.get(window_lbl, "last_3")
                         new_sfu_configs[v] = {
-                            "source": str(pr.get("Basis / Metric", available_basis_sources[0])),
+                            "source": _role_from_display_name(str(pr.get("Basis / Metric", available_basis_sources_display[0]))),
                             "mode": mode_val,
                             "selected": new_specific.get(v, []) if mode_val == "selected" else [],
                         }
@@ -3292,8 +3390,9 @@ def step4_salience():
                         if inconsistent:
                             st.error("Mixed Basis / Metric detected within the same Form. Please align these rows.")
                             for form_v, srcs, sfu_list in inconsistent:
+                                srcs_display = [_role_display_name(s) for s in srcs]
                                 st.error(
-                                    f"Form '{form_v}' uses multiple Basis / Metric values: {', '.join(srcs)}. "
+                                    f"Form '{form_v}' uses multiple Basis / Metric values: {', '.join(srcs_display)}. "
                                     f"Impacted SFU_v count: {len(sfu_list)}."
                                 )
 
@@ -3350,7 +3449,7 @@ def step4_salience():
             _ctx_cols = [c for c in override_rows.columns if c not in ("basis", "flag")]
             # Show salience as % for editing; convert back on save
             override_edit = override_rows[_ctx_cols].assign(
-                **{"Salience %": (pd.to_numeric(override_rows["salience"].fillna(0.0), errors="coerce") * 100).round(2)}
+                **{"Salience %": (pd.to_numeric(override_rows["salience"].fillna(0.0), errors="coerce") * 100).round(3)}
             ).drop(columns=["salience"], errors="ignore")
             _override_disabled = [c for c in override_edit.columns if c != "Salience %"]
             edited = st.data_editor(
@@ -3359,7 +3458,7 @@ def step4_salience():
                 key="sal_override_editor",
                 num_rows="fixed",
                 disabled=_override_disabled,
-                column_config={"Salience %": st.column_config.NumberColumn("Salience %", format="%.2f %%")},
+                column_config={"Salience %": st.column_config.NumberColumn("Salience %", format="%.3f %%")},
             )
             if st.button("Apply Overrides"):
                 _group_cols = [c for c in override_rows.columns if c not in (sku_col_sal, "basis", "salience", "flag")]
@@ -3427,6 +3526,382 @@ def _split_sas_last_ff_rows(sas_df: pd.DataFrame, sas_cmap: dict[str, str]) -> t
     alloc_df = sas_df.loc[~last_ff_mask].copy()
     ref_df = sas_df.loc[last_ff_mask].copy()
     return alloc_df, ref_df, plan_col
+
+
+def _extract_bop_cycle_token(plan_name: object) -> str | None:
+    """Extract cycle token like JUN'26 from a Plan Name value if present."""
+    text = str(plan_name or "").strip()
+    if not text:
+        return None
+    m = re.search(r"bop\s*cycle\s*\(\s*([A-Za-z]{3})\s*'\s*(\d{2})\s*\)", text, flags=re.IGNORECASE)
+    if not m:
+        return None
+    mon = m.group(1).upper()
+    yy = m.group(2)
+    return f"{mon}'{yy}"
+
+
+def _infer_active_bop_cycle_token(sas_months: list[str]) -> str:
+    """Infer the active BOP cycle token as previous month of earliest selected SAS month."""
+    parsed = [parse_month_to_date(m) for m in (sas_months or [])]
+    parsed = [p for p in parsed if p is not None]
+    if parsed:
+        first_month = min(parsed).replace(day=1)
+        active = first_month - pd.DateOffset(months=1)
+    else:
+        active = pd.Timestamp.now().normalize().replace(day=1)
+    return active.strftime("%b").upper() + "'" + active.strftime("%y")
+
+
+def _prepare_sas_split_and_topline_scopes(
+    sas_df: pd.DataFrame,
+    sas_cmap: dict[str, str],
+    sas_months: list[str],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, str | None, str]:
+    """Return split scope, topline scope, Last FF reference rows, prior-cycle excluded rows, and active token."""
+    plan_col = _detect_plan_name_col(sas_df, sas_cmap)
+    active_token = _infer_active_bop_cycle_token(sas_months)
+    work_df = sas_df.copy()
+    prior_cycle_df = sas_df.iloc[0:0].copy()
+
+    if plan_col and plan_col in work_df.columns:
+        plan_series = work_df[plan_col].astype(str)
+        cycle_tokens = plan_series.map(_extract_bop_cycle_token)
+        has_cycle = cycle_tokens.notna()
+        in_active = cycle_tokens.fillna("").str.upper() == active_token.upper()
+        prior_mask = has_cycle & (~in_active)
+        prior_cycle_df = work_df.loc[prior_mask].copy()
+        work_df = work_df.loc[~prior_mask].copy()
+
+    alloc_df, last_ff_df, _ = _split_sas_last_ff_rows(work_df, sas_cmap)
+    if not plan_col or plan_col not in alloc_df.columns:
+        return alloc_df.copy(), alloc_df.iloc[0:0].copy(), last_ff_df.copy(), prior_cycle_df, plan_col, active_token
+
+    plan_vals = alloc_df[plan_col].astype(str).str.strip().str.lower()
+    topline_mask = plan_vals.str.contains("topline base", na=False)
+    topline_df = alloc_df.loc[topline_mask].copy()
+    split_df = alloc_df.loc[~topline_mask].copy()
+    return split_df, topline_df, last_ff_df.copy(), prior_cycle_df, plan_col, active_token
+
+
+def _resolve_monthly_hierarchy_columns(role: str) -> tuple[str | None, str | None, str | None]:
+    """Resolve SKU/Country/Category columns for a monthly role DataFrame."""
+    df = _get_df(role)
+    if df is None or df.empty:
+        return None, None, None
+    cmap = st.session_state.col_maps.get(role, {})
+    sku_col = next(
+        (c for c in [cmap.get("SFU_v"), MONTHLY_SFU_VERSION_COL, "SFU_v", "SKU"] if c and c in df.columns),
+        None,
+    )
+    country_col = next(
+        (c for c in [cmap.get("Country"), "Country", "Reporting Country"] if c and c in df.columns),
+        None,
+    )
+    category_col = next(
+        (c for c in [cmap.get("SMO Category"), cmap.get("Category"), "SMO Category", "Category"] if c and c in df.columns),
+        None,
+    )
+    return sku_col, country_col, category_col
+
+
+def _build_country_category_lookup() -> dict[str, tuple[str, str]]:
+    """Build SKU -> (Country, SMO Category) lookup using monthly sources."""
+    role_order = [
+        "Final Fcst to Finance",
+        "Shipments",
+        "Statistical Forecast",
+        "Retailing",
+        "Consumption",
+    ]
+    lookup: dict[str, tuple[str, str]] = {}
+    for role in role_order:
+        df = _get_df(role)
+        if df is None or df.empty:
+            continue
+        sku_col, country_col, category_col = _resolve_monthly_hierarchy_columns(role)
+        if not sku_col:
+            continue
+        sub_cols = [sku_col]
+        if country_col:
+            sub_cols.append(country_col)
+        if category_col:
+            sub_cols.append(category_col)
+        sub = df[sub_cols].copy()
+        sub[sku_col] = sub[sku_col].astype(str).str.strip()
+        sub = sub[sub[sku_col] != ""]
+        if country_col:
+            sub[country_col] = sub[country_col].fillna("").astype(str).str.strip()
+        if category_col:
+            sub[category_col] = sub[category_col].fillna("").astype(str).str.strip()
+        sub = sub.drop_duplicates(subset=[sku_col])
+        for _, row in sub.iterrows():
+            sku = str(row.get(sku_col, "")).strip()
+            if not sku:
+                continue
+            if sku in lookup and lookup[sku] != ("", ""):
+                continue
+            lookup[sku] = (
+                str(row.get(country_col, "")).strip() if country_col else "",
+                str(row.get(category_col, "")).strip() if category_col else "",
+            )
+    return lookup
+
+
+def _compute_bop_gap_artifacts(
+    sas_topline_df: pd.DataFrame,
+    output_wide: pd.DataFrame,
+    sas_months: list[str],
+    hcm: dict[str, str],
+    salience_df: pd.DataFrame | None,
+    fff_df: pd.DataFrame | None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Compute country-category monthly gap and SKU-level gap/final matched artifacts."""
+    if output_wide is None or output_wide.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    month_cols = [m for m in (sas_months or []) if m in output_wide.columns]
+    if not month_cols:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    sfu_col = next((c for c in [MONTHLY_SFU_VERSION_COL, hcm.get("SFU_v"), "SFU_v", "SKU"] if c and c in output_wide.columns), None)
+    if not sfu_col:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    split_rows = output_wide.copy()
+    split_rows[sfu_col] = split_rows[sfu_col].astype(str).str.strip()
+    split_rows = split_rows[split_rows[sfu_col] != ""]
+
+    out_country_col = hcm.get("Country") if hcm.get("Country") in split_rows.columns else None
+    out_category_col = hcm.get("SMO Category") if hcm.get("SMO Category") in split_rows.columns else None
+    cc_lookup = _build_country_category_lookup()
+
+    if out_country_col:
+        split_rows["Country"] = split_rows[out_country_col].fillna("").astype(str).str.strip()
+    else:
+        split_rows["Country"] = ""
+    if out_category_col:
+        split_rows["SMO Category"] = split_rows[out_category_col].fillna("").astype(str).str.strip()
+    else:
+        split_rows["SMO Category"] = ""
+
+    missing_cc = (split_rows["Country"] == "") | (split_rows["SMO Category"] == "")
+    if missing_cc.any():
+        fill_rows = split_rows.loc[missing_cc, [sfu_col]].copy()
+        fill_rows[["Country", "SMO Category"]] = fill_rows[sfu_col].map(
+            lambda s: cc_lookup.get(str(s).strip(), ("", ""))
+        ).apply(pd.Series)
+        split_rows.loc[missing_cc, "Country"] = fill_rows["Country"].fillna("")
+        split_rows.loc[missing_cc, "SMO Category"] = fill_rows["SMO Category"].fillna("")
+
+    split_by_sku = split_rows[[sfu_col, "Country", "SMO Category"] + month_cols].copy()
+    for m in month_cols:
+        split_by_sku[m] = pd.to_numeric(split_by_sku[m], errors="coerce").fillna(0.0)
+    split_by_sku = split_by_sku.groupby([sfu_col, "Country", "SMO Category"], dropna=False)[month_cols].sum().reset_index()
+    split_cc = split_by_sku.groupby(["Country", "SMO Category"], dropna=False)[month_cols].sum().reset_index()
+
+    fff_by_sku = pd.DataFrame(columns=[sfu_col, "Country", "SMO Category"] + month_cols)
+    fff_cc = pd.DataFrame(columns=["Country", "SMO Category"] + month_cols)
+    if fff_df is not None and not fff_df.empty:
+        fff_sku_col = next((c for c in [MONTHLY_SFU_VERSION_COL, hcm.get("SFU_v"), "SFU_v", "SKU"] if c and c in fff_df.columns), None)
+        fff_country_col = next((c for c in [hcm.get("Country"), "Country", "Reporting Country"] if c and c in fff_df.columns), None)
+        fff_cat_col = next((c for c in [hcm.get("SMO Category"), "SMO Category", "Category"] if c and c in fff_df.columns), None)
+        if fff_sku_col:
+            fff_cols = [fff_sku_col]
+            if fff_country_col:
+                fff_cols.append(fff_country_col)
+            if fff_cat_col:
+                fff_cols.append(fff_cat_col)
+            fff_cols += [m for m in month_cols if m in fff_df.columns]
+            fff_work = fff_df[fff_cols].copy()
+            fff_work[fff_sku_col] = fff_work[fff_sku_col].astype(str).str.strip()
+            fff_work = fff_work[fff_work[fff_sku_col] != ""]
+            if fff_country_col:
+                fff_work["Country"] = fff_work[fff_country_col].fillna("").astype(str).str.strip()
+            else:
+                fff_work["Country"] = fff_work[fff_sku_col].map(lambda s: cc_lookup.get(str(s).strip(), ("", ""))[0])
+            if fff_cat_col:
+                fff_work["SMO Category"] = fff_work[fff_cat_col].fillna("").astype(str).str.strip()
+            else:
+                fff_work["SMO Category"] = fff_work[fff_sku_col].map(lambda s: cc_lookup.get(str(s).strip(), ("", ""))[1])
+            for m in month_cols:
+                if m in fff_work.columns:
+                    fff_work[m] = pd.to_numeric(fff_work[m], errors="coerce").fillna(0.0)
+                else:
+                    fff_work[m] = 0.0
+            fff_by_sku = (
+                fff_work[[fff_sku_col, "Country", "SMO Category"] + month_cols]
+                .groupby([fff_sku_col, "Country", "SMO Category"], dropna=False)[month_cols]
+                .sum()
+                .reset_index()
+                .rename(columns={fff_sku_col: sfu_col})
+            )
+            fff_cc = fff_by_sku.groupby(["Country", "SMO Category"], dropna=False)[month_cols].sum().reset_index()
+
+    topline_cc = pd.DataFrame(columns=["Country", "SMO Category"] + month_cols)
+    if sas_topline_df is not None and not sas_topline_df.empty:
+        sas_country = st.session_state.col_maps.get("SAS", {}).get("Country") or "Country"
+        sas_cat = st.session_state.col_maps.get("SAS", {}).get("SMO Category") or "SMO Category"
+        if sas_country in sas_topline_df.columns and sas_cat in sas_topline_df.columns:
+            top_cols = [sas_country, sas_cat] + [m for m in month_cols if m in sas_topline_df.columns]
+            top = sas_topline_df[top_cols].copy()
+            top["Country"] = top[sas_country].fillna("").astype(str).str.strip()
+            top["SMO Category"] = top[sas_cat].fillna("").astype(str).str.strip()
+            for m in month_cols:
+                if m in top.columns:
+                    top[m] = pd.to_numeric(top[m], errors="coerce").fillna(0.0)
+                else:
+                    top[m] = 0.0
+            topline_cc = top[["Country", "SMO Category"] + month_cols].groupby(["Country", "SMO Category"], dropna=False)[month_cols].sum().reset_index()
+
+    ccm_base = topline_cc.merge(fff_cc, on=["Country", "SMO Category"], how="outer", suffixes=("_topline", "_fff"))
+    ccm_base = ccm_base.merge(split_cc, on=["Country", "SMO Category"], how="outer", suffixes=("", "_split"))
+    ccm_base = ccm_base.fillna(0.0)
+
+    gap_ccm_rows: list[dict] = []
+    for _, row in ccm_base.iterrows():
+        country = str(row.get("Country", "")).strip()
+        category = str(row.get("SMO Category", "")).strip()
+        for m in month_cols:
+            topline_val = float(pd.to_numeric(row.get(f"{m}_topline", 0.0), errors="coerce") or 0.0)
+            fff_val = float(pd.to_numeric(row.get(f"{m}_fff", 0.0), errors="coerce") or 0.0)
+            split_val = float(pd.to_numeric(row.get(m, 0.0), errors="coerce") or 0.0)
+            gap_val = topline_val - (fff_val + split_val)
+            gap_ccm_rows.append(
+                {
+                    "Country": country,
+                    "SMO Category": category,
+                    "month": m,
+                    "topline": topline_val,
+                    "fff": fff_val,
+                    "split": split_val,
+                    "gap": gap_val,
+                }
+            )
+    gap_ccm_df = pd.DataFrame(gap_ccm_rows)
+
+    sal_sku_col = next((c for c in [MONTHLY_SFU_VERSION_COL, hcm.get("SFU_v"), "SFU_v", "SKU"] if salience_df is not None and c and c in salience_df.columns), None)
+    sal_country_col = next((c for c in [hcm.get("Country"), "Country", "Reporting Country"] if salience_df is not None and c and c in salience_df.columns), None)
+    sal_cat_col = next((c for c in [hcm.get("SMO Category"), "SMO Category", "Category"] if salience_df is not None and c and c in salience_df.columns), None)
+    sal_lookup: dict[tuple[str, str, str], float] = {}
+    if salience_df is not None and not salience_df.empty and sal_sku_col:
+        sal_work = salience_df.copy()
+        sal_work["__sku"] = sal_work[sal_sku_col].astype(str).str.strip()
+        sal_work["__country"] = sal_work[sal_country_col].fillna("").astype(str).str.strip() if sal_country_col else ""
+        sal_work["__cat"] = sal_work[sal_cat_col].fillna("").astype(str).str.strip() if sal_cat_col else ""
+        sal_work["__sal"] = pd.to_numeric(sal_work.get("salience", 0.0), errors="coerce").fillna(0.0)
+        sal_grouped = sal_work.groupby(["__country", "__cat", "__sku"], dropna=False)["__sal"].sum().reset_index()
+        for _, r in sal_grouped.iterrows():
+            sal_lookup[(str(r["__country"]), str(r["__cat"]), str(r["__sku"]))] = float(r["__sal"])
+
+    gap_by_sku_rows: list[dict] = []
+    final_rows: dict[tuple[str, str, str], dict] = {}
+
+    split_long = split_by_sku.melt(
+        id_vars=[sfu_col, "Country", "SMO Category"],
+        value_vars=month_cols,
+        var_name="month",
+        value_name="split",
+    )
+    fff_long = fff_by_sku.melt(
+        id_vars=[sfu_col, "Country", "SMO Category"],
+        value_vars=month_cols,
+        var_name="month",
+        value_name="fff",
+    ) if not fff_by_sku.empty else pd.DataFrame(columns=[sfu_col, "Country", "SMO Category", "month", "fff"])
+
+    split_idx = {
+        (str(r[sfu_col]), str(r["Country"]), str(r["SMO Category"]), str(r["month"])): float(pd.to_numeric(r["split"], errors="coerce") or 0.0)
+        for _, r in split_long.iterrows()
+    }
+    fff_idx = {
+        (str(r[sfu_col]), str(r["Country"]), str(r["SMO Category"]), str(r["month"])): float(pd.to_numeric(r["fff"], errors="coerce") or 0.0)
+        for _, r in fff_long.iterrows()
+    }
+
+    for _, ccm in gap_ccm_df.iterrows():
+        country = str(ccm.get("Country", "")).strip()
+        category = str(ccm.get("SMO Category", "")).strip()
+        month = str(ccm.get("month", "")).strip()
+        gap_val = float(pd.to_numeric(ccm.get("gap", 0.0), errors="coerce") or 0.0)
+
+        cc_skus = split_by_sku[
+            (split_by_sku["Country"].astype(str).str.strip() == country)
+            & (split_by_sku["SMO Category"].astype(str).str.strip() == category)
+        ][sfu_col].astype(str).str.strip().unique().tolist()
+        if not cc_skus:
+            continue
+
+        weights = []
+        for sku in cc_skus:
+            w = sal_lookup.get((country, category, sku), sal_lookup.get(("", "", sku), 0.0))
+            weights.append(max(float(w), 0.0))
+        w_sum = float(sum(weights))
+        if w_sum > 0:
+            shares = [w / w_sum for w in weights]
+        else:
+            shares = [1.0 / len(cc_skus)] * len(cc_skus)
+
+        for sku, share in zip(cc_skus, shares):
+            gap_sku_val = float(gap_val * share)
+            split_val = split_idx.get((sku, country, category, month), 0.0)
+            fff_val = fff_idx.get((sku, country, category, month), 0.0)
+            final_val = fff_val + split_val + gap_sku_val
+            gap_by_sku_rows.append(
+                {
+                    sfu_col: sku,
+                    "Country": country,
+                    "SMO Category": category,
+                    "month": month,
+                    "gap": gap_sku_val,
+                }
+            )
+            final_rows[(sku, country, category, month)] = {
+                sfu_col: sku,
+                "Country": country,
+                "SMO Category": category,
+                "month": month,
+                "fff": fff_val,
+                "split": split_val,
+                "gap": gap_sku_val,
+                "final_matched": final_val,
+            }
+
+    gap_sku_long = pd.DataFrame(gap_by_sku_rows)
+    final_long = pd.DataFrame(final_rows.values()) if final_rows else pd.DataFrame()
+    if gap_sku_long.empty:
+        return gap_ccm_df, pd.DataFrame(), pd.DataFrame()
+
+    gap_sku_wide = (
+        gap_sku_long.pivot_table(
+            index=[sfu_col, "Country", "SMO Category"],
+            columns="month",
+            values="gap",
+            aggfunc="sum",
+            fill_value=0.0,
+        )
+        .reset_index()
+    )
+    final_wide = pd.DataFrame()
+    if not final_long.empty:
+        final_wide = (
+            final_long.pivot_table(
+                index=[sfu_col, "Country", "SMO Category"],
+                columns="month",
+                values="final_matched",
+                aggfunc="sum",
+                fill_value=0.0,
+            )
+            .reset_index()
+        )
+
+    ordered_gap_cols = [c for c in [sfu_col, "Country", "SMO Category"] + month_cols if c in gap_sku_wide.columns]
+    gap_sku_wide = gap_sku_wide[ordered_gap_cols]
+    if not final_wide.empty:
+        ordered_final_cols = [c for c in [sfu_col, "Country", "SMO Category"] + month_cols if c in final_wide.columns]
+        final_wide = final_wide[ordered_final_cols]
+
+    return gap_ccm_df, gap_sku_wide, final_wide
 
 
 def _build_last_bop_matching_tables(
@@ -3628,8 +4103,10 @@ def _apply_planner_redistribution(
 def render_exceptions_panel():
     st.markdown("#### Step 4 Exception Controls")
     exc_store: ExceptionStore = st.session_state.exc_store
+    exc_store_sal = exc_store  # Alias for compatibility with moved code
     hcm = hier_col_map_from_state()
     sku_col = hcm.get("SFU_v") or hcm.get("SKU") or MONTHLY_SFU_VERSION_COL
+    sku_col_excl = hcm.get("SFU_v", MONTHLY_SFU_VERSION_COL)  # For compatibility with moved code
     sas_cmap = st.session_state.col_maps.get("SAS", {})
     bb_split_levels = st.session_state.get("bb_split_levels", {})
     split_level_default = st.session_state.get("split_level", "Form")
@@ -3889,6 +4366,11 @@ def render_exceptions_panel():
         st.info("No exceptions logged yet.")
     else:
         log_df = log_df.copy()
+        if "sku" in log_df.columns:
+            desc_map_log = _latest_product_description_map()
+            log_df["Product Description"] = (
+                log_df["sku"].astype(str).str.strip().map(desc_map_log).fillna("")
+            )
         log_remarks = st.session_state.get("exception_log_remarks", {})
         log_df["Remarks"] = log_df.apply(
             lambda row: log_remarks.get(_exception_log_key(row), ""),
@@ -3912,6 +4394,289 @@ def render_exceptions_panel():
             _exception_log_key(row): str(edited_log.iloc[idx].get("Remarks", ""))
             for idx, (_, row) in enumerate(log_df.iterrows())
         }
+
+    # ═════════════════════════════════════════════════════════════════════════════════
+    # BLOCK 2: UPLOAD & CONFIGURE EXCLUSION VOLUMES
+    # ═════════════════════════════════════════════════════════════════════════════════
+    st.divider()
+    st.subheader("📤 Upload & Configure Exclusion Volumes")
+    st.caption("Configure volumes for excluded SFU_v values using upload or direct input.")
+    
+    # Sub-tabs for upload methods
+    tab_upload_file, tab_direct_input = st.tabs(["📤 Upload File", "✏️ Direct Input"])
+    
+    # ═════════════════════════════════════════════════════════════════════════════════
+    # TAB 1: UPLOAD FILE
+    # ═════════════════════════════════════════════════════════════════════════════════
+    with tab_upload_file:
+        st.markdown(
+            "Upload an **Excel file** with excluded SFU_v values and their volumes. "
+            "The file must have:\n"
+            "- A column named **`SFU_v`** (or the mapped SFU_v column name for your data)\n"
+            "- Month columns in `Mmm-YY` format (e.g. `Jan-26`, `Feb-26`) with the volumes to allocate"
+        )
+        st.download_button(
+            label="📥 Download template",
+            data=_build_exclusion_upload_template(sku_col_excl, st.session_state.get("sas_months_selected", [])),
+            file_name="exclusions_template.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        excl_upload_file = st.file_uploader(
+            "Upload exclusions Excel",
+            type=["xlsx", "xls"],
+            key="excl_upload_file",
+        )
+        
+        if excl_upload_file is not None:
+            try:
+                excl_up_df = pd.read_excel(excl_upload_file)
+                sku_col_candidates = [sku_col_excl, MONTHLY_SFU_VERSION_COL, "SFU_v", "SKU"]
+                found_sku_col = next((c for c in sku_col_candidates if c in excl_up_df.columns), None)
+                if found_sku_col is None:
+                    st.error(f"Could not find a SKU column in the uploaded file. Expected one of: {sku_col_candidates}")
+                else:
+                    month_cols_up = [
+                        c for c in excl_up_df.columns
+                        if c != found_sku_col and parse_month_to_date(c) is not None
+                    ]
+                    if not month_cols_up:
+                        st.warning("No month columns detected in the uploaded file. Ensure columns are in `Mmm-YY` format.")
+                    else:
+                        st.success(
+                            f"Detected **{len(excl_up_df)} SKU row(s)** and "
+                            f"**{len(month_cols_up)} month column(s)**: {', '.join(month_cols_up)}"
+                        )
+                        
+                        # ═══════════════════════════════════════════════════════════════════
+                        # REVIEW EXCLUSION VOLUMES BLOCK
+                        # ═══════════════════════════════════════════════════════════════════
+                        st.divider()
+                        st.subheader("🔍 Review Exclusion Volumes")
+                        st.markdown(
+                            "Below are the SFU values and their allocated volumes for exclusion. "
+                            "Review the details and confirm before applying."
+                        )
+                        
+                        # Build review DataFrame with SFU, Product Description, and volumes
+                        review_cols = [found_sku_col] + month_cols_up
+                        review_df = excl_up_df[review_cols].copy()
+                        review_df = _add_product_description(review_df)
+                        
+                        # Calculate total volume per SFU for quick review
+                        review_df["Total Volume"] = review_df[month_cols_up].sum(axis=1)
+                        
+                        # Reorder columns: SFU_v, Product Description, months, Total Volume
+                        display_cols = [found_sku_col, "Product Description"] + month_cols_up + ["Total Volume"]
+                        display_cols = [c for c in display_cols if c in review_df.columns]
+                        review_display = review_df[display_cols]
+                        
+                        # Configure column display
+                        col_config_review = {
+                            found_sku_col: st.column_config.TextColumn("SFU_v", disabled=True),
+                            "Product Description": st.column_config.TextColumn("Product Description", disabled=True),
+                            "Total Volume": st.column_config.NumberColumn("Total Volume", format="%.2f", disabled=True),
+                        }
+                        for mc in month_cols_up:
+                            col_config_review[mc] = st.column_config.NumberColumn(f"{mc}", format="%.2f", disabled=True)
+                        
+                        st.dataframe(
+                            review_display.head(20),
+                            column_config=col_config_review,
+                            width='stretch',
+                            height=min(450, 60 + len(review_display) * 35),
+                        )
+
+                        if st.button("✅ Apply Uploaded Exclusions + Volumes", key="apply_excl_upload"):
+                            applied_skus = set()
+                            for _, urow in excl_up_df.iterrows():
+                                sku_v = str(urow[found_sku_col])
+                                if not sku_v or sku_v == "nan":
+                                    continue
+                                exc_store_sal.add_global_exclusion(
+                                    sku_v,
+                                    notes="Excluded via uploaded exclusions Excel (Step 4)"
+                                )
+                                applied_skus.add(sku_v)
+                                for mc in month_cols_up:
+                                    qty_val = pd.to_numeric(urow.get(mc, 0), errors="coerce")
+                                    if not pd.isna(qty_val) and qty_val != 0:
+                                        exc_store_sal.set_fixed_qty(
+                                            "__uploaded__",
+                                            sku_v,
+                                            mc,
+                                            float(qty_val),
+                                            notes="Volume from uploaded exclusions Excel",
+                                        )
+                            st.session_state.exc_store = exc_store_sal
+                            applied_display = ", ".join(_format_sku_excl(v) for v in sorted(applied_skus))
+                            st.success(
+                                f"✅ {len(applied_skus)} SKU(s) excluded and volumes loaded: "
+                                f"{applied_display}"
+                            )
+                            st.rerun()
+            except Exception as _exc_up_err:
+                st.error(f"Error reading uploaded file: {_exc_up_err}")
+    
+    # ═════════════════════════════════════════════════════════════════════════════════
+    # TAB 2: DIRECT INPUT
+    # ═════════════════════════════════════════════════════════════════════════════════
+    with tab_direct_input:
+        st.markdown(
+            "Enter exclusion volumes directly for each excluded SFU_v. "
+            "Volumes will be saved as fixed allocations in the exception store."
+        )
+        
+        excluded_skus_list = sorted(exc_store_sal.global_exclusions)
+        sas_months_for_excl = st.session_state.get("sas_months_selected", [])
+        
+        if excluded_skus_list and sas_months_for_excl:
+            # Build editable DataFrame with excluded SKUs and months
+            excl_edit_data = []
+            for sku in excluded_skus_list:
+                row = {"SFU_v": sku}
+                for month in sas_months_for_excl:
+                    # Get existing fixed quantity for __uploaded__ or default to 0
+                    existing_qty = exc_store_sal.get_fixed_qty("__uploaded__", sku, month)
+                    row[month] = existing_qty if existing_qty is not None else 0.0
+                excl_edit_data.append(row)
+            
+            excl_edit_df = pd.DataFrame(excl_edit_data)
+            excl_edit_df = _add_product_description(excl_edit_df)
+            
+            # Reorder: SFU_v, Product Description, months
+            month_cols_edit = sas_months_for_excl
+            display_cols_edit = ["SFU_v", "Product Description"] + month_cols_edit
+            display_cols_edit = [c for c in display_cols_edit if c in excl_edit_df.columns]
+            
+            # Configure columns for editing
+            col_config_edit = {
+                "SFU_v": st.column_config.TextColumn("SFU_v", disabled=True),
+                "Product Description": st.column_config.TextColumn("Product Description", disabled=True),
+            }
+            for mc in month_cols_edit:
+                col_config_edit[mc] = st.column_config.NumberColumn(
+                    f"{mc}",
+                    format="%.2f",
+                    min_value=0.0,
+                    help=f"Volume for {mc}",
+                )
+            
+            # Editable data editor
+            edited_excl_vols = st.data_editor(
+                excl_edit_df[display_cols_edit],
+                column_config=col_config_edit,
+                disabled=["SFU_v", "Product Description"],
+                width='stretch',
+                key="excl_direct_volume_editor",
+                height=min(450, 60 + len(excl_edit_df) * 35),
+                num_rows="fixed",
+            )
+            
+            # Save button for direct input
+            if st.button("💾 Save Direct Volume Input", key="save_direct_excl_volumes"):
+                for _, erow in edited_excl_vols.iterrows():
+                    sku_v = str(erow.get("SFU_v", "")).strip()
+                    if not sku_v:
+                        continue
+                    for month in month_cols_edit:
+                        qty_val = pd.to_numeric(erow.get(month, 0), errors="coerce")
+                        qty_val = float(qty_val) if not pd.isna(qty_val) else 0.0
+                        if qty_val != 0:
+                            exc_store_sal.set_fixed_qty(
+                                "__uploaded__",
+                                sku_v,
+                                month,
+                                qty_val,
+                                notes="Direct volume input in Step 4",
+                            )
+                st.session_state.exc_store = exc_store_sal
+                st.success(f"✅ Exclusion volumes saved for {len(excluded_skus_list)} SFU_v value(s)")
+                st.rerun()
+        elif excluded_skus_list and not sas_months_for_excl:
+            st.info("No SAS months selected yet — complete Step 3 to select months for volume input.")
+        elif not excluded_skus_list:
+            st.info("No excluded SKUs yet — exclude SFU_v values from the table above first.")
+
+    # ═════════════════════════════════════════════════════════════════════════════════
+    # EXCLUSION VOLUMES REVIEW
+    # ═════════════════════════════════════════════════════════════════════════════════
+    st.divider()
+    st.markdown("#### 📊 Exclusion Volumes Review")
+    st.caption("Review the SFU values, product descriptions, and allocated volumes across months before moving to Step 5.")
+    
+    # Collect all fixed quantities from exception store
+    excl_volumes_data = []
+    for bb_id, bb_exc in exc_store.bb_exceptions.items():
+        fixed_qty_dict = bb_exc.get("fixed_qty", {})
+        for sku, month_dict in fixed_qty_dict.items():
+            row_data = {"SFU_v": sku}
+            for month, qty in month_dict.items():
+                if qty != 0:  # Only include non-zero volumes
+                    row_data[month] = qty
+            if len(row_data) > 1:  # Only add if there's at least one volume
+                excl_volumes_data.append(row_data)
+    
+    if excl_volumes_data:
+        # Create DataFrame and fill NaN with 0 for display
+        excl_vol_df = pd.DataFrame(excl_volumes_data).fillna(0.0)
+        
+        # Add product descriptions
+        desc_map_excl = _latest_product_description_map()
+        excl_vol_df["Product Description"] = excl_vol_df["SFU_v"].astype(str).str.strip().map(desc_map_excl).fillna("")
+        
+        # Identify month columns
+        month_cols_excl = [c for c in excl_vol_df.columns if c not in ["SFU_v", "Product Description"] and parse_month_to_date(c) is not None]
+        month_cols_excl = sorted(month_cols_excl, key=lambda x: parse_month_to_date(x) if parse_month_to_date(x) else datetime.datetime.min)
+        
+        # Calculate total volume
+        excl_vol_df["Total Volume"] = excl_vol_df[month_cols_excl].sum(axis=1)
+        
+        # Reorder columns: SFU_v, Product Description, months, Total Volume
+        display_cols_excl = ["SFU_v", "Product Description"] + month_cols_excl + ["Total Volume"]
+        display_cols_excl = [c for c in display_cols_excl if c in excl_vol_df.columns]
+        excl_vol_display = excl_vol_df[display_cols_excl]
+        
+        # Configure columns
+        col_config_excl_vol = {
+            "SFU_v": st.column_config.TextColumn("SFU_v", disabled=True),
+            "Product Description": st.column_config.TextColumn("Product Description", disabled=True),
+            "Total Volume": st.column_config.NumberColumn("Total Volume", format="%.2f", disabled=True),
+        }
+        for mc in month_cols_excl:
+            col_config_excl_vol[mc] = st.column_config.NumberColumn(f"{mc}", format="%.2f", disabled=True)
+        
+        st.dataframe(
+            excl_vol_display,
+            column_config=col_config_excl_vol,
+            width='stretch',
+            height=min(450, 60 + len(excl_vol_display) * 35),
+        )
+    else:
+        st.info("No exclusion volumes configured yet.")
+    
+    # ═════════════════════════════════════════════════════════════════════════════════
+    # VALIDATION: CHECK FOR EXCLUDED SKUs WITHOUT VOLUMES
+    # ═════════════════════════════════════════════════════════════════════════════════
+    if exc_store.global_exclusions:
+        # Collect all SKUs with fixed quantities
+        skus_with_volumes = set()
+        for bb_exc in exc_store.bb_exceptions.values():
+            fixed_qty_dict = bb_exc.get("fixed_qty", {})
+            for sku, month_dict in fixed_qty_dict.items():
+                if any(qty != 0 for qty in month_dict.values()):
+                    skus_with_volumes.add(sku)
+        
+        # Find excluded SKUs without any volumes
+        excluded_without_volumes = exc_store.global_exclusions - skus_with_volumes
+        
+        if excluded_without_volumes:
+            st.divider()
+            excl_no_vol_list = ", ".join(_format_sku_excl(v) for v in sorted(excluded_without_volumes))
+            st.warning(
+                f"⚠️ **{len(excluded_without_volumes)} SFU_v value(s) are excluded but have NO volumes configured:**\n\n"
+                f"{excl_no_vol_list}\n\n"
+                f"**Action required:** Upload exclusion volumes for these SFU_v values OR remove them from exclusions before proceeding to Step 5."
+            )
 
 # ──────────────────────────────────────────────────────────────────────────────
 # STEP 6 – Run Split
@@ -3945,7 +4710,14 @@ def step6_run():
     exc_store = st.session_state.exc_store
     hcm = hier_col_map_from_state()
     sas_cmap = st.session_state.col_maps.get("SAS", {})
-    sas_df_alloc, sas_df_last_ff, plan_name_col = _split_sas_last_ff_rows(sas_df, sas_cmap)
+    (
+        sas_df_alloc,
+        sas_df_topline,
+        sas_df_last_ff,
+        sas_df_prior_cycle,
+        plan_name_col,
+        active_cycle_token,
+    ) = _prepare_sas_split_and_topline_scopes(sas_df, sas_cmap, sas_months)
 
     if plan_name_col is None:
         st.info("Plan Name column not detected in SAS. Last FF reference rows cannot be separated.")
@@ -3957,6 +4729,18 @@ def step6_run():
             "These rows will be ignored for split allocation and shown in reasonability reference checks."
         )
 
+    if plan_name_col and not sas_df_prior_cycle.empty:
+        st.info(
+            f"Excluded {len(sas_df_prior_cycle)} prior-cycle row(s) from split/topline scope using active cycle token "
+            f"{active_cycle_token}."
+        )
+
+    if plan_name_col:
+        st.caption(
+            f"Topline rows detected by Plan Name containing 'Topline Base': {len(sas_df_topline)} "
+            f"(used only for topline matching)."
+        )
+
     if sas_df_alloc.empty:
         st.error("No allocatable SAS rows remain after excluding Last FF reference rows.")
         return
@@ -3966,10 +4750,11 @@ def step6_run():
     st.markdown(f"""
 | Parameter | Value |
 |---|---|
-| Building Blocks | {len(sas_df_alloc)} allocatable ({len(sas_df_last_ff)} Last FF reference) |
+| Building Blocks | {len(sas_df_alloc)} allocatable ({len(sas_df_topline)} Topline Base, {len(sas_df_last_ff)} Last FF reference, {len(sas_df_prior_cycle)} prior-cycle excluded) |
 | SKU rows | {len(sku_df)} |
 | Split level | **{per_bb_note}** |
 | SAS months | {', '.join(sas_months)} |
+| Active BOP cycle | **{active_cycle_token}** |
 | Global exclusions | {len(exc_store.global_exclusions)} |
 | BB-specific exceptions | {len(exc_store.bb_exceptions)} |
     """)
@@ -4336,17 +5121,31 @@ def step6_run():
                     output_wide,
                     sas_months,
                 )
+                gap_ccm_df, gap_sku_df, final_matched_df = _compute_bop_gap_artifacts(
+                    sas_topline_df=sas_df_topline,
+                    output_wide=output_wide,
+                    sas_months=sas_months,
+                    hcm=hcm,
+                    salience_df=sal_df,
+                    fff_df=fff_df,
+                )
 
                 st.session_state.output_wide = output_wide
                 st.session_state.output_wide_final = None
                 st.session_state.validation_df = validation_df
                 st.session_state.split_trace_df = split_trace_df
                 st.session_state.sas_df_split_input = sas_df_alloc.copy()
+                st.session_state.sas_df_topline_scope = sas_df_topline.copy()
+                st.session_state.sas_df_prior_cycle_excluded = sas_df_prior_cycle.copy()
+                st.session_state.bop_cycle_active_token = active_cycle_token
                 st.session_state.last_ff_reference_df = sas_df_last_ff.copy()
                 st.session_state.last_ff_plan_col = plan_name_col
                 st.session_state.matching_last_bop_df = lb_agg
                 st.session_state.matching_split_adj_df = adj_agg
                 st.session_state.matching_new_total_df = new_total_df
+                st.session_state.bop_gap_ccm_df = gap_ccm_df
+                st.session_state.bop_gap_sku_df = gap_sku_df
+                st.session_state.bop_final_matched_sku_df = final_matched_df
                 st.session_state.planner_adjustment_audit_df = None
                 st.session_state.planner_residual_df = None
                 st.session_state.run_settings = {
@@ -4357,9 +5156,13 @@ def step6_run():
                     "sas_months": ", ".join(sas_months),
                     "global_exclusions": ", ".join(exc_store.global_exclusions),
                     "n_bb": len(sas_df_alloc),
+                    "n_topline_rows": len(sas_df_topline),
                     "n_last_ff_refs": len(sas_df_last_ff),
+                    "n_prior_cycle_excluded": len(sas_df_prior_cycle),
+                    "active_bop_cycle": active_cycle_token,
                     "n_sku_rows_input": len(sku_df),
                     "n_sku_rows_output": len(output_wide),
+                    "n_bop_gap_sku_rows": len(gap_sku_df),
                 }
             except Exception as e:
                 st.error(f"Split failed: {e}")
@@ -4383,166 +5186,6 @@ def step6_run():
         output_wide = st.session_state.output_wide
         st.subheader("Output Preview (first 20 rows)")
         st.dataframe(_add_product_description(output_wide).head(20), width='stretch')
-
-        # ── Reasonability Check 1: Last BOP FFF + Split → New Total (SKU-month) ──
-        st.subheader("Reasonability Check 1 — SKU-Month New Total (Last BOP FFF + Split)")
-        st.caption(
-            "For each SFU_v and forecast month: **Last BOP FFF** (previous-week Final Fcst to Finance) "
-            "plus the **Split** generated in this session equals the **New Total** for review."
-        )
-        last_bop_df = _get_df("Last BOP")
-        if last_bop_df is None or last_bop_df.empty:
-            st.warning("Last BOP sheet not loaded — cannot display New Total. Upload a file that contains a 'Last BOP' sheet.")
-        elif MONTHLY_SFU_VERSION_COL not in last_bop_df.columns:
-            st.warning(f"'{MONTHLY_SFU_VERSION_COL}' column not found in Last BOP sheet.")
-        else:
-            # Filter Last BOP to FFF measure rows only
-            _fff_measure = "Final Fcst to Finance"
-            if MONTHLY_MEASURE_COL in last_bop_df.columns:
-                lb_fff = last_bop_df[last_bop_df[MONTHLY_MEASURE_COL] == _fff_measure].copy()
-            else:
-                lb_fff = last_bop_df.copy()
-
-            if lb_fff.empty:
-                st.warning(f"No '{_fff_measure}' rows found in Last BOP sheet.")
-            else:
-                _lb_months = detect_month_columns(lb_fff)
-                _shared = [m for m in sas_months if m in _lb_months and m in output_wide.columns]
-
-                if not _shared:
-                    st.warning(
-                        "No overlapping forecast months between Last BOP and the split output. "
-                        f"Last BOP months: {', '.join(_lb_months[:6])}{'…' if len(_lb_months) > 6 else ''}."
-                    )
-                else:
-                    # Aggregate Last BOP FFF per SFU_v
-                    lb_copy = lb_fff[[MONTHLY_SFU_VERSION_COL] + _shared].copy()
-                    for _m in _shared:
-                        lb_copy[_m] = pd.to_numeric(lb_copy[_m], errors="coerce").fillna(0)
-                    lb_agg = (
-                        lb_copy.groupby(MONTHLY_SFU_VERSION_COL, dropna=False)[_shared]
-                        .sum()
-                        .reset_index()
-                    )
-                    lb_agg.columns = [MONTHLY_SFU_VERSION_COL] + [f"{m}_lb" for m in _shared]
-
-                    # Aggregate split per SFU_v
-                    adj_copy = output_wide[[MONTHLY_SFU_VERSION_COL] + _shared].copy()
-                    for _m in _shared:
-                        adj_copy[_m] = pd.to_numeric(adj_copy[_m], errors="coerce").fillna(0)
-                    adj_agg = (
-                        adj_copy.groupby(MONTHLY_SFU_VERSION_COL, dropna=False)[_shared]
-                        .sum()
-                        .reset_index()
-                    )
-                    adj_agg.columns = [MONTHLY_SFU_VERSION_COL] + [f"{m}_adj" for m in _shared]
-
-                    # Merge and build display with triplet columns per month
-                    _merged1 = lb_agg.merge(adj_agg, on=MONTHLY_SFU_VERSION_COL, how="outer").fillna(0)
-                    _display_data: dict = {MONTHLY_SFU_VERSION_COL: _merged1[MONTHLY_SFU_VERSION_COL]}
-                    for _m in _shared:
-                        _lb_v = _merged1.get(f"{_m}_lb", pd.Series(0, index=_merged1.index))
-                        _adj_v = _merged1.get(f"{_m}_adj", pd.Series(0, index=_merged1.index))
-                        _display_data[f"{_m} Last BOP"] = _lb_v
-                        _display_data[f"{_m} Split"] = _adj_v
-                        _display_data[f"{_m} New Total"] = _lb_v + _adj_v
-                    _check1_df = pd.DataFrame(_display_data)
-                    st.dataframe(
-                        _add_product_description(_check1_df),
-                        width="stretch",
-                        height=min(600, 60 + len(_check1_df) * 35),
-                    )
-                    st.caption(
-                        f"Showing {len(_check1_df)} SFU_v(s) across {len(_shared)} month(s): "
-                        + ", ".join(_shared)
-                    )
-
-        # ── Reasonability Check 2: Balance — Split Total vs SAS Total (per Country per month) ──
-        st.subheader("Reasonability Check 2 — Balance: Split Total vs SAS BB Total (per Country per month)")
-        st.caption(
-            "The monthly split total, summed across all SKUs per Country, must equal "
-            "the corresponding monthly SAS Building Block total per Country."
-        )
-        _sas_df_check = st.session_state.sas_df_filtered
-        _country_col_sas = st.session_state.col_maps.get("SAS", {}).get("Country", "Country")
-        _country_col_out = hcm.get("Country", "Country")
-
-        if _sas_df_check is None or _sas_df_check.empty:
-            st.warning("SAS data not available for balance check.")
-        elif _country_col_sas not in _sas_df_check.columns:
-            st.warning(f"Country column '{_country_col_sas}' not found in SAS data — cannot run balance check.")
-        elif _country_col_out not in output_wide.columns:
-            st.warning(f"Country column '{_country_col_out}' not found in split output — cannot run balance check.")
-        else:
-            _sas_months_avail = [m for m in sas_months if m in _sas_df_check.columns]
-            _out_months_avail = [m for m in sas_months if m in output_wide.columns]
-            _balance_months = [m for m in _sas_months_avail if m in _out_months_avail]
-
-            if not _balance_months:
-                st.warning("No shared month columns between SAS data and split output for balance check.")
-            else:
-                # SAS total per Country per month
-                _sas_c = _sas_df_check[[_country_col_sas] + _balance_months].copy()
-                for _m in _balance_months:
-                    _sas_c[_m] = pd.to_numeric(_sas_c[_m], errors="coerce").fillna(0)
-                _sas_by_country = (
-                    _sas_c.groupby(_country_col_sas, dropna=False)[_balance_months]
-                    .sum()
-                    .reset_index()
-                    .rename(columns={_country_col_sas: "Country"})
-                )
-
-                # Split total per Country per month
-                _out_c = output_wide[[_country_col_out] + _balance_months].copy()
-                for _m in _balance_months:
-                    _out_c[_m] = pd.to_numeric(_out_c[_m], errors="coerce").fillna(0)
-                _out_by_country = (
-                    _out_c.groupby(_country_col_out, dropna=False)[_balance_months]
-                    .sum()
-                    .reset_index()
-                    .rename(columns={_country_col_out: "Country"})
-                )
-
-                _merged2 = _sas_by_country.merge(
-                    _out_by_country, on="Country", how="outer", suffixes=("_sas", "_split")
-                ).fillna(0)
-
-                _balance_rows = []
-                for _, _row in _merged2.iterrows():
-                    for _m in _balance_months:
-                        _sas_val = float(_row.get(f"{_m}_sas", 0))
-                        _split_val = float(_row.get(f"{_m}_split", 0))
-                        _diff = _split_val - _sas_val
-                        _balance_rows.append({
-                            "Country": _row["Country"],
-                            "Month": _m,
-                            "SAS Total": _sas_val,
-                            "Split Total": _split_val,
-                            "Difference": _diff,
-                            "✓": "✅" if abs(_diff) < 0.01 else "❌",
-                        })
-
-                _balance_df = pd.DataFrame(_balance_rows)
-                _n_bad = (_balance_df["✓"] == "❌").sum()
-
-                if _n_bad == 0:
-                    st.success("✅ All Country-Month totals balance between the SAS Building Blocks and the split output.")
-                else:
-                    st.error(
-                        f"❌ **{_n_bad}** Country-Month combination(s) have a non-zero difference between "
-                        "the SAS total and the split total. Review the rows marked ❌ below."
-                    )
-
-                st.dataframe(
-                    _balance_df,
-                    width="stretch",
-                    height=min(600, 60 + len(_balance_df) * 35),
-                    column_config={
-                        "SAS Total": st.column_config.NumberColumn(format="%.2f"),
-                        "Split Total": st.column_config.NumberColumn(format="%.2f"),
-                        "Difference": st.column_config.NumberColumn(format="%.2f"),
-                    },
-                )
 
         if st.button("Proceed to Reasonability Check →", type="primary"):
             st.session_state.step = max(st.session_state.step, 7)
@@ -4628,20 +5271,63 @@ def step7_reasonability():
         st.warning("No future month columns found in the split output.")
         return
 
-    pivot_cols = [MONTHLY_SFU_VERSION_COL] + available_future
-    pivot_df = (
-        output_wide[[c for c in pivot_cols if c in output_wide.columns]]
-        .groupby(MONTHLY_SFU_VERSION_COL, dropna=False)[available_future]
-        .sum()
-        .reset_index()
-    )
-    pivot_df["_baseline_avg"] = pivot_df[MONTHLY_SFU_VERSION_COL].map(baseline_avg_map).fillna(0)
     lower_mult = lower_pct / 100.0
     upper_mult = upper_pct / 100.0
+
+    # ── Build FFF pivot table ─────────────────────────────────────────────────
+    fff_df_rb = _get_df("Final Fcst to Finance")
+    if fff_df_rb is not None and not fff_df_rb.empty and MONTHLY_SFU_VERSION_COL in fff_df_rb.columns:
+        fff_months_avail = [m for m in available_future if m in fff_df_rb.columns]
+    else:
+        fff_months_avail = []
+
+    if fff_months_avail:
+        fff_agg_rb = (
+            fff_df_rb[[MONTHLY_SFU_VERSION_COL] + fff_months_avail]
+            .copy()
+            .assign(**{m: lambda df, m=m: pd.to_numeric(df[m], errors="coerce").fillna(0.0) for m in fff_months_avail})
+            .groupby(MONTHLY_SFU_VERSION_COL, dropna=False)[fff_months_avail]
+            .sum()
+            .reset_index()
+        )
+        fff_agg_rb["_baseline_avg"] = fff_agg_rb[MONTHLY_SFU_VERSION_COL].map(baseline_avg_map).fillna(0)
+        pivot_df = fff_agg_rb
+        display_months = fff_months_avail
+    else:
+        # Fallback to split output when FFF is not available
+        pivot_df = (
+            output_wide[[c for c in [MONTHLY_SFU_VERSION_COL] + available_future if c in output_wide.columns]]
+            .groupby(MONTHLY_SFU_VERSION_COL, dropna=False)[available_future]
+            .sum()
+            .reset_index()
+        )
+        pivot_df["_baseline_avg"] = pivot_df[MONTHLY_SFU_VERSION_COL].map(baseline_avg_map).fillna(0)
+        display_months = available_future
+
+    display_pivot = pivot_df.set_index(MONTHLY_SFU_VERSION_COL)
+    baseline_series = display_pivot.pop("_baseline_avg")
+
+    # ── Add hierarchy labels (Form, Brand, Product Description) ───────────────
+    label_cols: list[str] = []
+    sku_ref = st.session_state.get("sku_df_filtered")
+    if sku_ref is not None and not sku_ref.empty and MONTHLY_SFU_VERSION_COL in sku_ref.columns:
+        for hier_col in ["Form", "Brand"]:
+            if hier_col in sku_ref.columns:
+                lookup = sku_ref[[MONTHLY_SFU_VERSION_COL, hier_col]].drop_duplicates(subset=MONTHLY_SFU_VERSION_COL).set_index(MONTHLY_SFU_VERSION_COL)[hier_col]
+                display_pivot.insert(len(label_cols), hier_col, display_pivot.index.map(lookup).fillna(""))
+                label_cols.append(hier_col)
+    desc_map = _latest_product_description_map()
+    if desc_map:
+        display_pivot.insert(len(label_cols), "Product Description", display_pivot.index.map(desc_map).fillna(""))
+        label_cols.append("Product Description")
+
+    numeric_cols = [c for c in display_pivot.columns if c not in label_cols]
 
     # ── Apply conditional styling ─────────────────────────────────────────────
     def _style_cell(val, baseline):
         if pd.isna(val) or baseline == 0:
+            return ""
+        if not isinstance(val, (int, float)):
             return ""
         if val > baseline * upper_mult:
             return "background-color: #cce5ff; color: #003366"  # blue
@@ -4649,14 +5335,15 @@ def step7_reasonability():
             return "background-color: #fff3cd; color: #664d00"  # yellow
         return ""
 
-    display_pivot = pivot_df.set_index(MONTHLY_SFU_VERSION_COL)
-    baseline_series = display_pivot.pop("_baseline_avg")
-
     def _style_row(row):
         bl = baseline_series.get(row.name, 0)
         return [_style_cell(v, bl) for v in row]
 
-    styled = display_pivot.style.apply(_style_row, axis=1).format("{:,.1f}")
+    styled = (
+        display_pivot.style
+        .apply(_style_row, axis=1)
+        .format("{:,.1f}", subset=numeric_cols)
+    )
 
     st.caption(
         f"Baseline: **{baseline_metric}** avg over **{len(selected_baseline_months)} months** "
@@ -4672,13 +5359,13 @@ def step7_reasonability():
 
     n_high = sum(
         1 for sfu in display_pivot.index
-        for m in available_future
-        if (bl := baseline_series.get(sfu, 0)) > 0 and display_pivot.at[sfu, m] > bl * upper_mult
+        for m in display_months
+        if m in display_pivot.columns and (bl := baseline_series.get(sfu, 0)) > 0 and display_pivot.at[sfu, m] > bl * upper_mult
     )
     n_low = sum(
         1 for sfu in display_pivot.index
-        for m in available_future
-        if (bl := baseline_series.get(sfu, 0)) > 0 and display_pivot.at[sfu, m] < bl * lower_mult
+        for m in display_months
+        if m in display_pivot.columns and (bl := baseline_series.get(sfu, 0)) > 0 and display_pivot.at[sfu, m] < bl * lower_mult
     )
 
     if n_high or n_low:
@@ -4691,7 +5378,8 @@ def step7_reasonability():
 
     if enable_zscore and not display_pivot.empty:
         z_outliers = 0
-        for _, row in display_pivot.iterrows():
+        split_only_cols = [m for m in display_months if m in display_pivot.columns]
+        for _, row in display_pivot[split_only_cols].iterrows():
             vals = pd.to_numeric(row, errors="coerce").dropna().astype(float)
             if len(vals) < 2:
                 continue
@@ -4704,9 +5392,255 @@ def step7_reasonability():
         if z_outliers > 0:
             st.warning(f"{z_outliers} cell(s) flagged by z-score outlier check (non-blocking warning).")
 
+    # ── BOP topline matching (FFF + split + gap) ───────────────────────────
+    gap_ccm_df = st.session_state.get("bop_gap_ccm_df")
+    gap_sku_df = st.session_state.get("bop_gap_sku_df")
+    final_matched_df = st.session_state.get("bop_final_matched_sku_df")
+    if gap_ccm_df is not None and not gap_ccm_df.empty:
+        st.markdown("#### BOP Topline Matching (Country + Category + Month)")
+        bal_view = gap_ccm_df.copy()
+        for c in ["topline", "fff", "split", "gap"]:
+            if c in bal_view.columns:
+                bal_view[c] = pd.to_numeric(bal_view[c], errors="coerce").fillna(0.0)
+        bal_view["final_matched"] = bal_view["fff"] + bal_view["split"] + bal_view["gap"]
+        bal_view["closure_delta"] = bal_view["topline"] - bal_view["final_matched"]
+
+        tol = 1e-6
+        bad_cells = int((bal_view["closure_delta"].abs() > tol).sum())
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Country-Category-Month rows", len(bal_view))
+        c2.metric("Rows balanced", int((bal_view["closure_delta"].abs() <= tol).sum()))
+        c3.metric("Rows with mismatch", bad_cells)
+
+        with st.expander("BOP Closure Table (topline vs FFF + split + gap)", expanded=(bad_cells > 0)):
+            st.dataframe(
+                bal_view[["Country", "SMO Category", "month", "topline", "fff", "split", "gap", "final_matched", "closure_delta"]]
+                .sort_values(["Country", "SMO Category", "month"]),
+                width="stretch",
+                height=350,
+            )
+
+        if bad_cells > 0:
+            st.warning("BOP closure mismatch detected for some Country + Category + Month rows. Review DA type 9 gap values before download.")
+        else:
+            st.success("BOP closure check passed: topline equals FFF + split + gap for all Country + Category + Month rows.")
+
+        if gap_sku_df is not None and not gap_sku_df.empty:
+            with st.expander("DA Type 9 Payload Preview (SKU-level gap only)", expanded=False):
+                st.caption("These are the gap-only values that will be exported as Level 1 = 9. BOP Adjustment.")
+                st.dataframe(gap_sku_df.head(300), width="stretch", height=300)
+
+        if final_matched_df is not None and not final_matched_df.empty:
+            with st.expander("Final Matched SKU View (FFF + split + gap)", expanded=False):
+                st.dataframe(final_matched_df.head(300), width="stretch", height=300)
+
     # ── Last BOP + adjustments view ───────────────────────────────────────────
     last_bop_df = _get_df("Last BOP")
     lb_agg, adj_agg, new_total_df, shared_months = _build_last_bop_matching_tables(last_bop_df, output_wide, available_future)
+
+    # ── Metric trend chart (SKU-level time series) ───────────────────────────
+    st.markdown("#### SKU Metric Trend (Monthly Time Series)")
+    st.caption(
+        "Compare historical and current-plan signals for a selected SKU (SFU_v). "
+        "Choose one SKU and any combination of metrics."
+    )
+
+    def _metric_long_from_df(metric_df: pd.DataFrame | None, metric_name: str) -> pd.DataFrame:
+        if metric_df is None or metric_df.empty or MONTHLY_SFU_VERSION_COL not in metric_df.columns:
+            return pd.DataFrame(columns=[MONTHLY_SFU_VERSION_COL, "month", "value", "metric"])
+
+        month_cols = [m for m in detect_month_columns(metric_df) if m in metric_df.columns]
+        if not month_cols:
+            return pd.DataFrame(columns=[MONTHLY_SFU_VERSION_COL, "month", "value", "metric"])
+
+        metric_agg = metric_df[[MONTHLY_SFU_VERSION_COL] + month_cols].copy()
+        for m in month_cols:
+            metric_agg[m] = pd.to_numeric(metric_agg[m], errors="coerce").fillna(0.0)
+        metric_agg = (
+            metric_agg
+            .groupby(MONTHLY_SFU_VERSION_COL, dropna=False)[month_cols]
+            .sum()
+            .reset_index()
+        )
+
+        metric_long = metric_agg.melt(
+            id_vars=[MONTHLY_SFU_VERSION_COL],
+            value_vars=month_cols,
+            var_name="month",
+            value_name="value",
+        )
+        metric_long["metric"] = metric_name
+        return metric_long
+
+    metric_sources: dict[str, pd.DataFrame] = {}
+    retailing_ts = _metric_long_from_df(_get_df("Retailing"), "Retailing")
+    sellout_ts = _metric_long_from_df(_get_df("Sellout"), "Retailing")
+    shipments_ts = _metric_long_from_df(_get_df("Shipments"), "Shipments")
+    stat_ts = _metric_long_from_df(_get_df("Statistical Forecast"), "Stat")
+
+    retailing_frames: list[pd.DataFrame] = []
+    if not retailing_ts.empty:
+        retailing_frames.append(retailing_ts)
+    if not sellout_ts.empty:
+        retailing_frames.append(sellout_ts)
+    if retailing_frames:
+        # Retailing and Sellout represent the same metric; merge into one series.
+        retailing_merged = pd.concat(retailing_frames, ignore_index=True)
+        retailing_merged = retailing_merged.drop_duplicates(
+            subset=[MONTHLY_SFU_VERSION_COL, "month", "value"]
+        )
+        retailing_merged = (
+            retailing_merged
+            .groupby([MONTHLY_SFU_VERSION_COL, "month", "metric"], dropna=False)["value"]
+            .sum()
+            .reset_index()
+        )
+        metric_sources["Retailing"] = retailing_merged
+    if not shipments_ts.empty:
+        metric_sources["Shipments"] = shipments_ts
+    if not stat_ts.empty:
+        metric_sources["Stat"] = stat_ts
+
+    old_fff_source_df = pd.DataFrame()
+    new_fff_source_df = pd.DataFrame()
+    old_new_months = list(shared_months)
+
+    if not lb_agg.empty and not new_total_df.empty and shared_months:
+        old_fff_source_df = lb_agg.copy()
+        new_fff_source_df = new_total_df.copy()
+    else:
+        # Fallback: derive Old/New FFF from input FFF + split adjustment when Last BOP is not used.
+        if fff_df_rb is not None and not fff_df_rb.empty and MONTHLY_SFU_VERSION_COL in fff_df_rb.columns:
+            old_new_months = [m for m in available_future if m in fff_df_rb.columns and m in output_wide.columns]
+            if old_new_months:
+                old_fff_source_df = (
+                    fff_df_rb[[MONTHLY_SFU_VERSION_COL] + old_new_months]
+                    .copy()
+                    .assign(**{m: lambda df, m=m: pd.to_numeric(df[m], errors="coerce").fillna(0.0) for m in old_new_months})
+                    .groupby(MONTHLY_SFU_VERSION_COL, dropna=False)[old_new_months]
+                    .sum()
+                    .reset_index()
+                )
+                # Use Planner Final values if they were applied; otherwise use original split output
+                output_for_adjustment = (
+                    st.session_state.output_wide_final 
+                    if st.session_state.output_wide_final is not None 
+                    else output_wide
+                )
+                split_adj_df = (
+                    output_for_adjustment[[MONTHLY_SFU_VERSION_COL] + old_new_months]
+                    .copy()
+                    .assign(**{m: lambda df, m=m: pd.to_numeric(df[m], errors="coerce").fillna(0.0) for m in old_new_months})
+                    .groupby(MONTHLY_SFU_VERSION_COL, dropna=False)[old_new_months]
+                    .sum()
+                    .reset_index()
+                )
+                old_new_merged = old_fff_source_df.merge(
+                    split_adj_df,
+                    on=MONTHLY_SFU_VERSION_COL,
+                    how="outer",
+                    suffixes=("_old", "_adj"),
+                ).fillna(0.0)
+
+                new_fff_source_df = pd.DataFrame({MONTHLY_SFU_VERSION_COL: old_new_merged[MONTHLY_SFU_VERSION_COL]})
+                for m in old_new_months:
+                    new_fff_source_df[m] = old_new_merged.get(f"{m}_old", 0.0) + old_new_merged.get(f"{m}_adj", 0.0)
+
+    if not old_fff_source_df.empty and old_new_months:
+        old_fff_long = old_fff_source_df[[MONTHLY_SFU_VERSION_COL] + old_new_months].melt(
+            id_vars=[MONTHLY_SFU_VERSION_COL],
+            value_vars=old_new_months,
+            var_name="month",
+            value_name="value",
+        )
+        old_fff_long["metric"] = "Old FFF"
+        metric_sources["Old FFF"] = old_fff_long
+
+    if not new_fff_source_df.empty and old_new_months:
+        new_fff_long = new_fff_source_df[[MONTHLY_SFU_VERSION_COL] + old_new_months].melt(
+            id_vars=[MONTHLY_SFU_VERSION_COL],
+            value_vars=old_new_months,
+            var_name="month",
+            value_name="value",
+        )
+        new_fff_long["metric"] = "New FFF"
+        metric_sources["New FFF"] = new_fff_long
+
+    if metric_sources:
+        trend_df = pd.concat(metric_sources.values(), ignore_index=True)
+        trend_df[MONTHLY_SFU_VERSION_COL] = trend_df[MONTHLY_SFU_VERSION_COL].astype(str)
+        desc_map = _latest_product_description_map()
+
+        sku_options = sorted(
+            s for s in trend_df[MONTHLY_SFU_VERSION_COL].dropna().unique().tolist()
+            if str(s).strip()
+        )
+        default_metrics = [m for m in ["Retailing", "Old FFF", "New FFF", "Shipments", "Stat"] if m in metric_sources]
+        if not default_metrics:
+            default_metrics = list(metric_sources.keys())
+        sku_display_map = {
+            s: (f"{s} - {str(desc_map.get(s, '')).strip()}" if str(desc_map.get(s, "")).strip() else s)
+            for s in sku_options
+        }
+
+        trend_col1, trend_col2 = st.columns([1, 2])
+        selected_sku = trend_col1.selectbox(
+            "Select SKU (SFU_v)",
+            sku_options,
+            format_func=lambda s: sku_display_map.get(s, s),
+            key="step7_trend_sku",
+        )
+        selected_metrics = trend_col2.multiselect(
+            "Select metrics",
+            options=list(metric_sources.keys()),
+            default=default_metrics,
+            key="step7_trend_metrics",
+        )
+
+        missing_fff_metrics = [m for m in ["Old FFF", "New FFF"] if m not in metric_sources]
+        if missing_fff_metrics:
+            st.caption(
+                "FFF trend lines are unavailable because no usable FFF month overlap was found with the Step 3 forecast months."
+            )
+
+        if selected_metrics:
+            sku_trend = trend_df[
+                (trend_df[MONTHLY_SFU_VERSION_COL] == selected_sku)
+                & (trend_df["metric"].isin(selected_metrics))
+            ].copy()
+            sku_trend["month_dt"] = sku_trend["month"].map(parse_month_to_date)
+            sku_trend["month_sort"] = sku_trend["month_dt"].fillna(pd.Timestamp.max)
+            sku_trend = sku_trend.sort_values(["month_sort", "month", "metric"])
+
+            if sku_trend.empty:
+                st.info("No trend data found for the selected SKU/metric combination.")
+            else:
+                plot_df = (
+                    sku_trend
+                    .pivot_table(index="month", columns="metric", values="value", aggfunc="sum")
+                    .fillna(0.0)
+                )
+
+                ordered_months = (
+                    sku_trend[["month", "month_sort"]]
+                    .drop_duplicates()
+                    .sort_values(["month_sort", "month"]) ["month"]
+                    .tolist()
+                )
+                plot_df = plot_df.reindex(ordered_months)
+
+                st.line_chart(plot_df, height=360)
+                st.caption(
+                    f"Showing {', '.join(selected_metrics)} for SKU {sku_display_map.get(selected_sku, selected_sku)}."
+                )
+        else:
+            st.info("Select at least one metric to render the line chart.")
+    else:
+        st.info(
+            "No metric time-series data is available yet. "
+            "Load Retailing/Shipments/Statistical Forecast or Last BOP data to enable this chart."
+        )
+
     if not new_total_df.empty:
         with st.expander("📋 Last BOP + Split Adjustments → New Total", expanded=False):
             st.caption(
@@ -4753,15 +5687,26 @@ def step7_reasonability():
             if n_missing_adj:
                 st.caption(f"ℹ️ {n_missing_adj} SFU_v(s) have zero adjustment (not touched by current split).")
 
-        st.markdown("#### Planner Final Number Adjustment")
-        st.caption(
-            "Edit Final Number at SFU_v × month. Gap to SAS BB topline will be redistributed to remaining SKUs "
-            "within each BB-month proportionally to existing split share."
-        )
+    # ── Planner Final Number Adjustment (always shown, with or without Last BOP) ──
+    st.markdown("#### Planner Final Number Adjustment")
+    st.caption(
+        "Edit Final Number at SFU_v × month. Gap to SAS BB topline will be redistributed to remaining SKUs "
+        "within each BB-month proportionally to existing split share."
+    )
+    
+    # Use Last BOP-derived data if available; otherwise fall back to output_wide
+    planner_months = shared_months if shared_months else available_future
+    if not new_total_df.empty:
         planner_input = new_total_df.copy()
-        for m in shared_months:
+    else:
+        # Fallback: create from output_wide when Last BOP unavailable
+        planner_input = output_wide[[MONTHLY_SFU_VERSION_COL] + planner_months].copy() if output_wide is not None else pd.DataFrame()
+    
+    for m in planner_months:
+        if m in planner_input.columns:
             planner_input[m] = pd.to_numeric(planner_input[m], errors="coerce").fillna(0.0)
 
+    if not planner_input.empty:
         planner_edited = st.data_editor(
             planner_input,
             width="stretch",
@@ -4781,7 +5726,7 @@ def step7_reasonability():
                 allocation_trace_df=trace_df,
                 sas_df_split_input=sas_input,
                 bb_id_col=bb_id_col,
-                sas_months=shared_months,
+                sas_months=planner_months,
             )
             st.session_state.output_wide_final = final_output
             st.session_state.planner_adjustment_audit_df = audit_df
@@ -4836,10 +5781,18 @@ def build_da_csv_export(
     bb_split_levels: dict,
     hcm: dict,
     gbb_types: dict,
+    bop_gap_sku_df: pd.DataFrame | None = None,
 ) -> bytes:
-    """Build DA CSV export in the required format (one row per SFU_v)."""
+    """Build DA CSV export in the required format.
+    
+    Exports:
+    - Split output rows (FFF + split) with original GBB type mappings
+    - Gap-only rows as DA type 9 (BOP Adjustment) when gap artifact is provided
+    """
     if output_wide is None or output_wide.empty or sas_df is None or sas_df.empty:
         return b""
+
+    has_gap_artifact = bop_gap_sku_df is not None and not bop_gap_sku_df.empty
 
     sfu_col = next(
         (c for c in [MONTHLY_SFU_VERSION_COL, "SFU_v", "SKU"] if c in output_wide.columns),
@@ -4983,6 +5936,9 @@ def build_da_csv_export(
 
     country_out_col = hcm.get("Country") if hcm.get("Country") in output_wide.columns else None
     category_out_col = hcm.get("SMO Category") if hcm.get("SMO Category") in output_wide.columns else None
+    if export_gap_only:
+        country_out_col = "Country" if "Country" in export_df.columns else country_out_col
+        category_out_col = "SMO Category" if "SMO Category" in export_df.columns else category_out_col
 
     def _lookup_country_category(sfuv: str, fallback_country: str, fallback_category: str) -> tuple[str, str]:
         out_country = fallback_country
@@ -5092,6 +6048,7 @@ def build_da_csv_export(
     next_fm_no_by_da: dict[tuple[str, str], int] = {}
     da_rows: list[dict[str, str]] = []
 
+    # Export split rows first with original GBB type mappings
     for _, out_row in output_wide.iterrows():
         sfuv = _norm(out_row.get(sfu_col, ""))
         if not sfuv:
@@ -5174,6 +6131,96 @@ def build_da_csv_export(
 
         da_rows.append(row)
 
+    # Export gap rows as DA type 9 (BOP Adjustment)
+    if has_gap_artifact:
+        gap_sfu_col = next(
+            (c for c in [MONTHLY_SFU_VERSION_COL, "SFU_v", "SKU"] if c in bop_gap_sku_df.columns),
+            None,
+        )
+        if gap_sfu_col:
+            gap_country_col = "Country" if "Country" in bop_gap_sku_df.columns else None
+            gap_cat_col = "SMO Category" if "SMO Category" in bop_gap_sku_df.columns else None
+
+            for _, gap_row in bop_gap_sku_df.iterrows():
+                gap_sfuv = _norm(gap_row.get(gap_sfu_col, ""))
+                if not gap_sfuv:
+                    continue
+
+                gap_country = _norm(gap_row.get(gap_country_col, "")) if gap_country_col else ""
+                gap_category = _norm(gap_row.get(gap_cat_col, "")) if gap_cat_col else ""
+                if not gap_country or not gap_category:
+                    gap_country, gap_category = _lookup_country_category(gap_sfuv, gap_country, gap_category)
+
+                level1_gap = "BOP Adjustment"
+                fm_desc_gap = "BOP Gap Adjustment"
+
+                da_key_gap = (gap_country, level1_gap)
+                fm_key_gap = (gap_country, level1_gap, fm_desc_gap)
+                if fm_key_gap not in fm_numbers_by_group:
+                    next_fm_no_gap = next_fm_no_by_da.get(da_key_gap, 1001)
+                    fm_numbers_by_group[fm_key_gap] = next_fm_no_gap
+                    next_fm_no_by_da[da_key_gap] = next_fm_no_gap + 1
+                fm_no_gap = fm_numbers_by_group[fm_key_gap]
+
+                level1_number_gap = _level1_number_only(level1_gap)
+                da_name_gap = f"BOP {gap_country} {today_mmyy} {level1_number_gap}".strip()
+                da_description_gap = f"BOP Upload for the {desc_month_label}".strip()
+
+                gap_period_vals: dict[int, float] = {}
+                for i in range(1, 25):
+                    if i <= len(month_cols):
+                        raw_gap = pd.to_numeric(gap_row.get(month_cols[i - 1], 0), errors="coerce")
+                        gap_period_vals[i] = round(float(raw_gap) if not pd.isna(raw_gap) else 0.0, 2)
+                    else:
+                        gap_period_vals[i] = 0.0
+
+                gap_total_volume = round(sum(gap_period_vals.values()), 2)
+
+                gap_row_dict = {
+                    "Action type": "NEW",
+                    "DA Name": da_name_gap,
+                    "DA Status": "In Forecast",
+                    "DA Grouping ID": "",
+                    "DA Description": da_description_gap,
+                    "DA Long Description": "",
+                    "FM #": str(fm_no_gap),
+                    "FM Description": fm_desc_gap,
+                    "Customization ID": "",
+                    "Level 1": _to_numbered_level1(level1_gap),
+                    "Level 2": "",
+                    "Level 3": "",
+                    "Periodicity": "Monthly",
+                    "Category": gap_category,
+                    "Country": gap_country,
+                    "Org": "R",
+                    "Product Dimension": "SFU",
+                    "Product": gap_sfuv,
+                    "GTIN Split": "",
+                    "GTIN UoM": "",
+                    "Customer Dimension": "Customer Group",
+                    "Customer Name": "ALL OTHERS",
+                    "Location": "",
+                    "Vol Preserved": "",
+                    "TL Flag": "",
+                    "TL Exception": "",
+                    "SFU Aggreg Flag": "",
+                    "GC Loc Split Flag": "",
+                    "Start Date": start_ts.strftime("%d-%m-%y"),
+                    "End Date": end_ts.strftime("%d-%m-%y"),
+                    "No. of periods": str(n_periods),
+                    "Customer Start Date": "",
+                    "Customer End Date": "",
+                    "UoM": "SU",
+                    "Total Volume": f"{gap_total_volume:.2f}",
+                    "DA Comments": "",
+                    "FM Comments": "",
+                }
+
+                for i in range(1, 25):
+                    gap_row_dict[f"Tot Period {i}"] = f"{gap_period_vals[i]:.2f}"
+
+                da_rows.append(gap_row_dict)
+
     if not da_rows:
         return b""
 
@@ -5227,10 +6274,9 @@ def step7_download():
     run_settings = st.session_state.run_settings
     planner_residual_df = st.session_state.get("planner_residual_df")
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     col1.metric("Output SFU_v rows", len(output_wide))
-    col2.metric("Salience rows", len(sal_df))
-    col3.metric("Validation issues", len(val_df))
+    col2.metric("Validation issues", len(val_df))
     if planner_residual_df is not None and not planner_residual_df.empty:
         st.warning(f"Planner redistribution has {len(planner_residual_df)} unresolved BB-month residual(s).")
 
@@ -5281,6 +6327,7 @@ def step7_download():
                 bb_split_levels=bb_split_levels,
                 hcm=hcm,
                 gbb_types=gbb_types,
+                bop_gap_sku_df=st.session_state.get("bop_gap_sku_df"),
             )
 
         if da_csv_bytes:
@@ -5300,25 +6347,10 @@ def step7_download():
         )
 
     st.divider()
-    tab_out, tab_sal, tab_exc, tab_val = st.tabs(["Split Forecast", "Salience Table", "Exception Log", "Validation"])
+    tab_out, tab_exc, tab_val = st.tabs(["Split Forecast", "Exception Log", "Validation"])
 
     with tab_out:
         st.dataframe(_add_product_description(output_wide), width='stretch', height=400)
-    with tab_sal:
-        # Always show salience as % — drop raw fraction column, add Salience %
-        sal_display = sal_df.copy()
-        if not sal_display.empty and "salience" in sal_display.columns:
-            sal_display["Salience %"] = (pd.to_numeric(sal_display["salience"], errors="coerce") * 100).round(2)
-            sal_display = sal_display.drop(columns=["salience"])
-            # Move Salience % right after the last hierarchy / ID column
-            non_sal_cols = [c for c in sal_display.columns if c != "Salience %"]
-            sal_display = sal_display[non_sal_cols + ["Salience %"]]
-        st.dataframe(
-            _add_product_description(sal_display),
-            width='stretch',
-            height=400,
-            column_config={"Salience %": st.column_config.NumberColumn("Salience %", format="%.2f %%")},
-        )
     with tab_exc:
         if exc_log.empty:
             st.info("No exceptions logged.")
@@ -5336,18 +6368,6 @@ def step7_download():
 # ──────────────────────────────────────────────────────────────────────────────
 def main():
     step = st.session_state.step
-
-    # Allow jumping back via sidebar nav
-    with st.sidebar:
-        st.divider()
-        st.subheader("Jump to Step")
-        max_step = st.session_state.max_step
-        jump = st.radio("Navigate to step", STEPS[:max_step], index=min(step - 1, max_step - 1), label_visibility="collapsed")
-        if jump:
-            target = STEPS.index(jump) + 1
-            if target != step:
-                st.session_state.step = target
-                st.rerun()
 
     if step == 1:
         step1_upload()
